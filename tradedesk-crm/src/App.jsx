@@ -152,19 +152,19 @@ const moneyDec = (n) => "$" + (Number(n) || 0).toLocaleString("en-US", { minimum
 const pct = (n) => Math.round((Number(n) || 0) * 100) + "%";
 
 const fmtDate = (iso) => {
-  if (!iso) return "\u2014";
+  if (!iso) return "—";
   const d = new Date(iso);
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 };
 
 const fmtDateShort = (iso) => {
-  if (!iso) return "\u2014";
+  if (!iso) return "—";
   const d = new Date(iso);
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 };
 
 const timeAgo = (iso) => {
-  if (!iso) return "\u2014";
+  if (!iso) return "—";
   const diff = Date.now() - new Date(iso).getTime();
   const mins = Math.floor(diff / 60000);
   if (mins < 60) return mins <= 1 ? "just now" : mins + "m ago";
@@ -687,7 +687,7 @@ export default function App() {
       <div className="td-root td-loading-screen">
         <GlobalStyle />
         <RefreshCw size={22} className="td-spin" />
-        <div>Loading TradeDesk\u2026</div>
+        <div>Loading TradeDesk…</div>
       </div>
     );
   }
@@ -751,7 +751,7 @@ export default function App() {
             <div className="td-topbar-title">{NAV.find((n) => n.key === view)?.label}</div>
             <div className="td-topbar-search">
               <Search size={14} />
-              <input placeholder="Search jobs by customer, address, job #\u2026" value={search} onChange={(e) => setSearch(e.target.value)} />
+              <input placeholder="Search jobs by customer, address, job #…" value={search} onChange={(e) => setSearch(e.target.value)} />
             </div>
             <button className="td-btn td-btn-primary" onClick={() => setShowAddJob(true)}>
               <Plus size={15} /> New job
@@ -818,8 +818,8 @@ function DashboardView({ ctx, setView }) {
 
   const activity = [];
   jobs.forEach((j) => {
-    (j.clientPayments || []).forEach((p) => activity.push({ kind: "client", jobId: j.id, jobLabel: jobNo(j.number) + " \u00b7 " + j.customerName, amount: p.amount, date: p.date, note: p.note }));
-    (j.vendorPayments || []).forEach((p) => activity.push({ kind: "vendor", jobId: j.id, jobLabel: jobNo(j.number) + " \u00b7 " + j.customerName, amount: p.amount, date: p.date, note: p.vendorName, status: p.status }));
+    (j.clientPayments || []).forEach((p) => activity.push({ kind: "client", jobId: j.id, jobLabel: jobNo(j.number) + " · " + j.customerName, amount: p.amount, date: p.date, note: p.note }));
+    (j.vendorPayments || []).forEach((p) => activity.push({ kind: "vendor", jobId: j.id, jobLabel: jobNo(j.number) + " · " + j.customerName, amount: p.amount, date: p.date, note: p.vendorName, status: p.status }));
   });
   activity.sort((a, b) => new Date(b.date) - new Date(a.date));
   const recentActivity = activity.slice(0, 6);
@@ -853,7 +853,7 @@ function DashboardView({ ctx, setView }) {
                   <TradeBadge trade={j.trade} size="sm" />
                   <div className="td-list-row-main">
                     <div className="td-list-row-title">{j.customerName}</div>
-                    <div className="td-list-row-sub">{jobNo(j.number)} \u00b7 target was {fmtDateShort(j.targetDate)}</div>
+                    <div className="td-list-row-sub">{jobNo(j.number)} · target was {fmtDateShort(j.targetDate)}</div>
                   </div>
                   <StatusPill tone="red">{Math.abs(daysBetween(j.targetDate, new Date())) + "d late"}</StatusPill>
                 </button>
@@ -875,7 +875,7 @@ function DashboardView({ ctx, setView }) {
                     <div className="td-list-row-title">
                       {a.kind === "client" ? "Received " + money(a.amount) + " from client" : (a.status === "paid" ? "Paid " : "Bill logged: ") + money(a.amount) + " to " + a.note}
                     </div>
-                    <div className="td-list-row-sub">{a.jobLabel}{a.kind === "client" && a.note ? " \u00b7 " + a.note : ""}</div>
+                    <div className="td-list-row-sub">{a.jobLabel}{a.kind === "client" && a.note ? " · " + a.note : ""}</div>
                   </div>
                   <div className="td-list-row-end">{timeAgo(a.date)}</div>
                 </button>
@@ -1017,7 +1017,7 @@ function JobsView({ ctx }) {
                       <td className={bal > 0 ? "td-text-red" : "td-text-green"}>
                         {isPaidInFull(j) ? "Paid in full" : money(bal)}
                       </td>
-                      <td className={owed > 0 ? "td-text-red" : "td-cell-sub"}>{owed > 0 ? money(owed) : "\u2014"}</td>
+                      <td className={owed > 0 ? "td-text-red" : "td-cell-sub"}>{owed > 0 ? money(owed) : "—"}</td>
                       <td className="td-mono">{fmtDateShort(j.targetDate)}</td>
                     </tr>
                   );
@@ -1185,7 +1185,7 @@ function JobDetailModal({ ctx, job, onClose }) {
   };
 
   return (
-    <Modal title={jobNo(job.number) + " \u00b7 " + job.customerName} onClose={onClose} wide
+    <Modal title={jobNo(job.number) + " · " + job.customerName} onClose={onClose} wide
       footer={<>
         <button className="td-btn td-btn-danger" onClick={() => { if (confirm("Delete this job? This can't be undone.")) deleteJob(job.id); }}><Trash2 size={13} /> Delete job</button>
         <div style={{ flex: 1 }} />
@@ -1227,7 +1227,7 @@ function JobDetailModal({ ctx, job, onClose }) {
         </div>
 
         <div className="td-info-row"><Building2 size={14} /> {job.customerAddress}</div>
-        <div className="td-info-row"><Phone size={14} /> {job.customerPhone || "\u2014"}<Mail size={14} style={{ marginLeft: 14 }} /> {job.customerEmail || "\u2014"}</div>
+        <div className="td-info-row"><Phone size={14} /> {job.customerPhone || "—"}<Mail size={14} style={{ marginLeft: 14 }} /> {job.customerEmail || "—"}</div>
 
         <div className="td-payment-summary">
           <div className="td-payment-summary-item">
@@ -1258,7 +1258,7 @@ function JobDetailModal({ ctx, job, onClose }) {
                   <div key={p.id} className="td-payment-row">
                     <div className="td-payment-row-main">
                       <div className="td-payment-row-top"><span className="td-payment-amount td-text-green">{moneyDec(p.amount)}</span><span className="td-cell-sub">{p.method}</span></div>
-                      <div className="td-cell-sub">{fmtDate(p.date)}{p.note ? " \u00b7 " + p.note : ""}</div>
+                      <div className="td-cell-sub">{fmtDate(p.date)}{p.note ? " · " + p.note : ""}</div>
                     </div>
                     <button className="td-iconbtn td-iconbtn-danger" onClick={() => { if (confirm("Delete this " + money(p.amount) + " client payment? The balance due will go back up.")) deleteClientPayment(job.id, p.id); }} aria-label="Delete payment"><Trash2 size={12} /></button>
                   </div>
@@ -1297,7 +1297,7 @@ function JobDetailModal({ ctx, job, onClose }) {
                         <span className="td-payment-amount">{moneyDec(p.amount)}</span>
                         <span className="td-cell-sub">{p.vendorName}</span>
                       </div>
-                      <div className="td-cell-sub">{p.category} \u00b7 {fmtDate(p.date)}{p.note ? " \u00b7 " + p.note : ""}</div>
+                      <div className="td-cell-sub">{p.category} · {fmtDate(p.date)}{p.note ? " · " + p.note : ""}</div>
                     </div>
                     <button className={cls("td-toggle-chip", p.status === "paid" && "active")} style={{ padding: "4px 8px", fontSize: 11 }}
                       onClick={() => updateVendorPayment(job.id, p.id, { status: p.status === "paid" ? "pending" : "paid" })}>
@@ -1341,7 +1341,7 @@ function JobDetailModal({ ctx, job, onClose }) {
         </div>
 
         <Field label="Job notes">
-          <textarea className="td-textarea" rows={3} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Site access notes, material changes, punch list items\u2026" />
+          <textarea className="td-textarea" rows={3} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Site access notes, material changes, punch list items…" />
         </Field>
       </div>
     </Modal>
@@ -1376,10 +1376,10 @@ function VendorsView({ ctx }) {
                   <tr key={v.id} className="td-table-row" onClick={() => setShowVendorForm(v)}>
                     <td className="td-cell-name">{v.name}</td>
                     <td className="td-cell-sub">{v.category}</td>
-                    <td className="td-cell-sub">{v.phone || "\u2014"}</td>
+                    <td className="td-cell-sub">{v.phone || "—"}</td>
                     <td>{spend.jobCount}</td>
                     <td>{money(spend.paid)}</td>
-                    <td className={spend.pending > 0 ? "td-text-red" : "td-cell-sub"}>{spend.pending > 0 ? money(spend.pending) : "\u2014"}</td>
+                    <td className={spend.pending > 0 ? "td-text-red" : "td-cell-sub"}>{spend.pending > 0 ? money(spend.pending) : "—"}</td>
                     <td onClick={(e) => e.stopPropagation()}>
                       <button className="td-iconbtn td-iconbtn-danger" onClick={() => { if (confirm("Remove " + v.name + " from your vendor directory? Past payments logged on jobs stay untouched.")) deleteVendor(v.id); }} aria-label="Delete vendor"><Trash2 size={13} /></button>
                     </td>
@@ -1417,7 +1417,7 @@ function VendorFormModal({ initial, onClose, onSave }) {
         <Field label="Phone"><input className="td-input" value={form.phone} onChange={set("phone")} placeholder="412-555-0100" /></Field>
         <Field label="Email"><input className="td-input" value={form.email} onChange={set("email")} placeholder="orders@vendor.example" /></Field>
         <div style={{ gridColumn: "1 / -1" }}>
-          <Field label="Notes"><textarea className="td-textarea" rows={2} value={form.notes} onChange={set("notes")} placeholder="Lead times, account number, terms\u2026" /></Field>
+          <Field label="Notes"><textarea className="td-textarea" rows={2} value={form.notes} onChange={set("notes")} placeholder="Lead times, account number, terms…" /></Field>
         </div>
       </div>
     </Modal>
@@ -1498,7 +1498,7 @@ function ReportsView({ ctx }) {
             <div className="td-source-list">
               {arAging.map(({ j, balance, days }) => (
                 <div key={j.id} className="td-source-row">
-                  <span className="td-source-label">{j.customerName} \u00b7 {jobNo(j.number)}</span>
+                  <span className="td-source-label">{j.customerName} · {jobNo(j.number)}</span>
                   <span className="td-source-count">{days}d since start</span>
                   <span className="td-source-won td-text-red">{money(balance)}</span>
                 </div>
@@ -1513,7 +1513,7 @@ function ReportsView({ ctx }) {
             <div className="td-source-list">
               {apAging.map(({ job, payment }) => (
                 <div key={payment.id} className="td-source-row">
-                  <span className="td-source-label">{payment.vendorName} \u00b7 {jobNo(job.number)}</span>
+                  <span className="td-source-label">{payment.vendorName} · {jobNo(job.number)}</span>
                   <span className="td-source-count">{payment.category}</span>
                   <span className="td-source-won td-text-red">{money(payment.amount)}</span>
                 </div>
@@ -1573,7 +1573,14 @@ function GlobalStyle() {
          to drag the board's horizontal scrollbar off the bottom of the screen. */
       html, body { margin: 0; padding: 0; height: 100%; }
       #root { height: 100%; }
-      .td-shell { display: flex; height: 100vh; min-height: 560px; }
+      /* 100dvh rather than 100vh: on mobile, vh is the tallest possible
+         viewport, so with the browser chrome showing the board's scrollbar
+         ends up just off the bottom of the screen. dvh tracks the real one.
+         The safe-area insets keep content clear of the notch and the home
+         indicator when the app is installed and running standalone. */
+      .td-shell { display: flex; height: 100vh; height: 100dvh; min-height: 560px;
+        box-sizing: border-box;
+        padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
       .td-sidebar { width: 216px; flex: none; background: var(--td-ink); color: var(--td-ink-text); display: flex; flex-direction: column; padding: 18px 14px; border-right: 1px solid var(--td-ink-border); }
       .td-brand { display: flex; align-items: center; gap: 10px; padding: 4px 6px 20px; }
       .td-brand-mark { width: 30px; height: 30px; border-radius: 4px; background: var(--td-accent); color: #fff; display: flex; align-items: center; justify-content: center; flex: none; }
