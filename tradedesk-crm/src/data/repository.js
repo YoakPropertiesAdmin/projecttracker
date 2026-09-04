@@ -38,6 +38,13 @@ const jobFromRow = (r) => ({
   customerAddress: r.customer_address || "",
   trade: r.trade,
   stage: r.stage,
+  // Stage is the board column; substage and onHold are facts about the job
+  // that the column cannot express. See map_ghl_inbound in the database.
+  substage: r.substage || "",
+  onHold: Boolean(r.on_hold),
+  ghlProjectDisplayId: r.ghl_project_display_id || null,
+  expectedFinalPayment: r.expected_final_payment === null || r.expected_final_payment === undefined
+    ? null : Number(r.expected_final_payment),
   contractAmount: Number(r.contract_amount || 0),
   startDate: toIso(r.start_date),
   targetDate: toIso(r.target_date),
@@ -55,6 +62,8 @@ const jobToRow = (j) => {
   if (j.customerAddress !== undefined) row.customer_address = j.customerAddress || "";
   if (j.trade !== undefined) row.trade = j.trade;
   if (j.stage !== undefined) row.stage = j.stage;
+  if (j.substage !== undefined) row.substage = j.substage || null;
+  if (j.onHold !== undefined) row.on_hold = Boolean(j.onHold);
   if (j.contractAmount !== undefined) row.contract_amount = Number(j.contractAmount) || 0;
   if (j.startDate !== undefined) row.start_date = toIso(j.startDate);
   if (j.targetDate !== undefined) row.target_date = toIso(j.targetDate);

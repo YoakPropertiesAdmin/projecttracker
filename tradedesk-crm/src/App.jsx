@@ -102,6 +102,9 @@ const vendorTotal = (job) => vendorPaid(job) + vendorPending(job);
 const jobMargin = (job) => Number(job.contractAmount || 0) - vendorTotal(job);
 const jobMarginPct = (job) => (job.contractAmount ? jobMargin(job) / job.contractAmount : 0);
 const paidPct = (job) => (job.contractAmount ? Math.min(1, clientReceived(job) / job.contractAmount) : 0);
+// Collected in full. Guarded on a non-zero contract so a $0 placeholder job
+// doesn't read as paid the moment it is created.
+const isPaidInFull = (job) => Number(job.contractAmount || 0) > 0 && clientBalance(job) <= 0;
 
 /* =========================================================================
    SEED DATA
@@ -868,13 +871,23 @@ function JobsView({ ctx }) {
                     <tr key={j.id} className="td-table-row" onClick={() => setSelectedJobId(j.id)}>
                       <td className="td-mono">{jobNo(j.number)}</td>
                       <td>
-                        <div className="td-cell-name">{j.customerName}</div>
+                        <div className="td-cell-name">
+                          {j.onHold && <AlertTriangle size={12} className="td-hold-icon" aria-label="On hold" />}
+                          {j.customerName}
+                        </div>
                         <div className="td-cell-sub"><MapPin size={11} /> {j.customerAddress}</div>
                       </td>
                       <td><TradeBadge trade={j.trade} size="sm" /></td>
-                      <td><StatusPill tone={j.stage === "closed" ? "green" : "neutral"}>{STAGES.find((s) => s.key === j.stage)?.label}</StatusPill></td>
+                      <td>
+                        <StatusPill tone={j.onHold ? "amber" : j.stage === "closed" ? "green" : "neutral"}>
+                          {j.onHold ? "On hold" : STAGES.find((s) => s.key === j.stage)?.label}
+                        </StatusPill>
+                        {j.substage && <div className="td-cell-sub">{j.substage}</div>}
+                      </td>
                       <td>{money(j.contractAmount)}</td>
-                      <td className={bal > 0 ? "td-text-red" : "td-text-green"}>{money(bal)}</td>
+                      <td className={bal > 0 ? "td-text-red" : "td-text-green"}>
+                        {isPaidInFull(j) ? "Paid in full" : money(bal)}
+                      </td>
                       <td className={owed > 0 ? "td-text-red" : "td-cell-sub"}>{owed > 0 ? money(owed) : "\u2014"}</td>
                       <td className="td-mono">{fmtDateShort(j.targetDate)}</td>
                     </tr>
@@ -893,24 +906,38 @@ function JobTicket({ job, ctx, dragging, onDragStart, onDragEnd }) {
   const t = TRADES[job.trade];
   const bal = clientBalance(job);
   const owed = vendorPending(job);
+  const paid = isPaidInFull(job);
+  // A held job keeps its column and gets a marker — a hold is a fact about the
+  // job, not a step backwards, so it must not read as a fresh contract.
   return (
-    <div className={cls("td-ticket", dragging && "td-ticket-dragging")}
+    <div className={cls("td-ticket", dragging && "td-ticket-dragging",
+                        paid && "td-ticket-paid", job.onHold && "td-ticket-hold")}
       style={{ "--tc": t ? t.color : "#8A8478" }}
       draggable onDragStart={onDragStart} onDragEnd={onDragEnd}
       onClick={() => ctx.setSelectedJobId(job.id)}>
+      {job.onHold && (
+        <span className="td-ticket-holdmark" title="Contract on hold">
+          <AlertTriangle size={13} strokeWidth={2.6} />
+        </span>
+      )}
       <div className="td-ticket-head">
         <span className="td-ticket-no">{jobNo(job.number)}</span>
         <TradeBadge trade={job.trade} size="sm" />
       </div>
       <div className="td-ticket-title">{job.customerName}</div>
       <div className="td-ticket-contact">{job.customerAddress}</div>
+      {/* The GHL stage as sent. The board column is coarse on purpose; this is
+          where "Ordered" stops looking identical to "Materials In". */}
+      {job.substage && <div className="td-ticket-substage">{job.substage}</div>}
       <div className="td-ticket-foot">
         <span className="td-ticket-value">{money(job.contractAmount)}</span>
         <span className="td-ticket-date">{fmtDateShort(job.targetDate)}</span>
       </div>
-      {(bal > 0 || owed > 0) && (
+      {(paid || bal > 0 || owed > 0) && (
         <div className="td-ticket-flags">
-          {bal > 0 && <span className="td-ticket-flag td-ticket-flag-red"><Wallet size={10} /> {money(bal)} due</span>}
+          {paid
+            ? <span className="td-ticket-flag td-ticket-flag-green"><Check size={10} /> Paid in full</span>
+            : bal > 0 && <span className="td-ticket-flag td-ticket-flag-red"><Wallet size={10} /> {money(bal)} due</span>}
           {owed > 0 && <span className="td-ticket-flag td-ticket-flag-amber"><HandCoins size={10} /> {money(owed)} owed</span>}
         </div>
       )}
@@ -1031,6 +1058,13 @@ function JobDetailModal({ ctx, job, onClose }) {
           <select className="td-select" value={job.stage} onChange={(e) => updateJob(job.id, { stage: e.target.value })}>
             {STAGES.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
           </select>
+          {job.substage && <span className="td-substage-chip" title="Stage name from GoHighLevel">{job.substage}</span>}
+          <button type="button"
+            className={cls("td-hold-toggle", job.onHold && "active")}
+            onClick={() => updateJob(job.id, { onHold: !job.onHold })}
+            title="A held job keeps its stage and shows a warning on the board">
+            <AlertTriangle size={13} /> {job.onHold ? "On hold" : "Mark on hold"}
+          </button>
           <div style={{ marginLeft: "auto", textAlign: "right" }}>
             <div className="td-field-label" style={{ marginBottom: 3 }}>Contract amount</div>
             <input className="td-input td-input-num" style={{ width: 130, fontWeight: 700 }} type="number"
@@ -1522,7 +1556,7 @@ function GlobalStyle() {
       .td-kanban-col-total { font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 600; padding: 4px 2px 10px; color: var(--td-text); }
       .td-kanban-col-body { display: flex; flex-direction: column; gap: 8px; min-height: 40px; }
 
-      .td-ticket { background: var(--td-card); border: 1px solid var(--td-border); border-left: 3px solid var(--tc); border-radius: 4px; padding: 10px 11px; cursor: grab; box-shadow: 0 1px 2px rgba(20,16,8,0.06); }
+      .td-ticket { position: relative; background: var(--td-card); border: 1px solid var(--td-border); border-left: 3px solid var(--tc); border-radius: 4px; padding: 10px 11px; cursor: grab; box-shadow: 0 1px 2px rgba(20,16,8,0.06); }
       .td-ticket:active { cursor: grabbing; }
       .td-ticket-dragging { opacity: 0.5; }
       .td-ticket-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 7px; }
@@ -1536,6 +1570,24 @@ function GlobalStyle() {
       .td-ticket-flag { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 3px; width: fit-content; }
       .td-ticket-flag-red { background: #F4DBD6; color: var(--td-red); }
       .td-ticket-flag-amber { background: #F3E7C9; color: #8A6A0B; }
+      .td-ticket-flag-green { background: #DCE9DA; color: #3E6B3A; }
+      .td-ticket-substage { font-size: 10.5px; font-weight: 600; color: #8A8478; letter-spacing: .01em;
+        text-transform: uppercase; margin-top: 6px; }
+      /* Collected in full: the card stops asking for attention. */
+      .td-ticket-paid { background: #F6FAF5; border-color: #CBDFC7; }
+      /* On hold outranks paid — a stalled job should look stalled. */
+      .td-ticket-hold { background: #FDF7EA; border-color: #E6D3A6; }
+      .td-ticket-holdmark { position: absolute; top: 7px; right: 7px; color: #B07D12;
+        display: inline-flex; pointer-events: none; }
+      .td-ticket-hold .td-ticket-head { padding-right: 20px; }
+      .td-hold-icon { color: #B07D12; vertical-align: -2px; margin-right: 5px; }
+      .td-substage-chip { font-size: 10.5px; font-weight: 700; text-transform: uppercase;
+        letter-spacing: .02em; color: #8A8478; background: #F0EBE1; border-radius: 4px; padding: 4px 8px; }
+      .td-hold-toggle { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px;
+        border: 1px solid #DCD5C9; background: #FDFCFA; color: #6B6459; border-radius: 7px;
+        font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; }
+      .td-hold-toggle:hover { border-color: #C6BCA9; }
+      .td-hold-toggle.active { background: #FDF3E3; border-color: #E6D3A6; color: #8A5A12; }
 
       .td-deal-modal-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
 
