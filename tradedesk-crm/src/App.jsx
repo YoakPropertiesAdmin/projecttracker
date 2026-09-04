@@ -86,9 +86,9 @@ const FLAG_ICONS = {
 };
 
 const JOB_FLAGS = {
-  on_hold:       { label: "On hold",       icon: AlertTriangle, color: "#B07D12", tint: "#FDF7EA" },
-  materials_in:  { label: "Materials in",  icon: PackageCheck,  color: "#3E6B3A", tint: null },
-  needs_ordered: { label: "Needs ordered", icon: ShoppingCart,  color: "#4A5480", tint: null },
+  on_hold:       { label: "On hold",       icon: AlertTriangle, color: "#B07D12", tint: "#FDF7EA", demote: true },
+  materials_in:  { label: "Materials in",  icon: PackageCheck,  color: "#3E6B3A", tint: null, demote: false },
+  needs_ordered: { label: "Needs ordered", icon: ShoppingCart,  color: "#4A5480", tint: null, demote: false },
 };
 
 function applyJobFlags(rows) {
@@ -100,12 +100,27 @@ function applyJobFlags(rows) {
       icon: FLAG_ICONS[String(r.icon || "tag").toLowerCase()] || Tag,
       color: r.color || "#8A8478",
       tint: r.tint || null,
+      demote: Boolean(r.demote),
     };
   });
 }
 
 const flagKeys = () => Object.keys(JOB_FLAGS);
 const jobFlag = (job) => (job && job.flag ? JOB_FLAGS[job.flag] : null);
+
+/**
+ * Column ordering. A held contract is still a contract, so it keeps its column
+ * — but it is not work in motion, and leaving it interleaved with live jobs
+ * makes a column of five look busier than it is. Markers whose registry row
+ * sets `demote` sink to the bottom; everything else holds its existing order.
+ */
+const byColumnOrder = (a, b) => {
+  const fa = jobFlag(a), fb = jobFlag(b);
+  const da = fa && fa.demote ? 1 : 0;
+  const db = fb && fb.demote ? 1 : 0;
+  if (da !== db) return da - db;
+  return (b.number || 0) - (a.number || 0);
+};
 
 // Job progress stages, start to finish. Rename/reorder these freely.
 const STAGES = [
@@ -947,7 +962,7 @@ function JobsView({ ctx }) {
                   </div>
                   <div className="td-kanban-col-total">{money(total)}</div>
                   <div className="td-kanban-col-body">
-                    {stageJobs.map((j) => (
+                    {[...stageJobs].sort(byColumnOrder).map((j) => (
                       <JobTicket key={j.id} job={j} ctx={ctx} dragging={draggingId === j.id}
                         onDragStart={(e) => { e.dataTransfer.setData("text/plain", j.id); setDraggingId(j.id); }}
                         onDragEnd={() => setDraggingId(null)} />
