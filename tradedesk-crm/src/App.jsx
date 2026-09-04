@@ -593,6 +593,7 @@ export default function App() {
       <style>{`
         .td-overage-hint{display:flex;align-items:center;gap:7px;margin:8px 0 2px;padding:7px 10px;
           border-radius:7px;background:#FDF3E3;color:#8A5A12;font-size:12px;line-height:1.35;}
+        .td-overage-hint-loss{background:#FBEDE9;color:#9B3A20;}
         .td-sync-banner{display:flex;align-items:center;gap:9px;margin:0 20px;padding:10px 13px;border-radius:9px;
           background:#FBEDE9;color:#9B3A20;font-size:12.5px;line-height:1.4;}
         .td-sync-banner span{flex:1;}
@@ -997,9 +998,22 @@ function JobDetailModal({ ctx, job, onClose }) {
     setCpForm({ amount: "", date: new Date().toISOString().slice(0, 10), method: cpForm.method, note: "" });
   };
 
+  // Mirror of the client-payment guard, on the cost side. Margin counts paid
+  // and pending together, so this is what the job would actually earn once
+  // this cost is booked — pending or not.
+  const vpAmount = Number(vpForm.amount) || 0;
+  const vpMarginAfter = Number(job.contractAmount || 0) - (vendorTotal(job) + vpAmount);
+
   const submitVendorPayment = () => {
-    if (!vpForm.vendorName.trim() || !vpForm.amount || Number(vpForm.amount) <= 0) return;
-    addVendorPayment(job.id, { vendorName: vpForm.vendorName.trim(), category: vpForm.category, amount: Number(vpForm.amount), date: new Date(vpForm.date).toISOString(), status: vpForm.status, note: vpForm.note.trim() });
+    if (!vpForm.vendorName.trim() || !vpForm.amount || vpAmount <= 0) return;
+    if (vpMarginAfter < 0 && !confirm(
+      "This cost puts " + jobNo(job.number) + " " + money(-vpMarginAfter) +
+      " underwater — total costs of " + money(vendorTotal(job) + vpAmount) +
+      " against a " + money(job.contractAmount) + " contract.\n\n" +
+      "If a change order raised the price, update the contract amount first so " +
+      "the margin reports stay honest.\n\nLog the cost anyway?"
+    )) return;
+    addVendorPayment(job.id, { vendorName: vpForm.vendorName.trim(), category: vpForm.category, amount: vpAmount, date: new Date(vpForm.date).toISOString(), status: vpForm.status, note: vpForm.note.trim() });
     setVpForm({ vendorName: "", category: vpForm.category, amount: "", date: new Date().toISOString().slice(0, 10), status: "pending", note: "" });
   };
 
@@ -1127,6 +1141,12 @@ function JobDetailModal({ ctx, job, onClose }) {
                 </select>
                 <input className="td-input" placeholder="Note (optional)" value={vpForm.note} onChange={(e) => setVpForm((f) => ({ ...f, note: e.target.value }))} />
               </div>
+              {vpAmount > 0 && vpMarginAfter < 0 && (
+                <div className="td-overage-hint td-overage-hint-loss">
+                  <AlertTriangle size={13} />
+                  <span>Costs would reach {money(vendorTotal(job) + vpAmount)} against a {money(job.contractAmount)} contract — a {money(-vpMarginAfter)} loss.</span>
+                </div>
+              )}
               <button className="td-btn td-btn-primary td-btn-sm" onClick={submitVendorPayment}><Plus size={13} /> Log vendor cost</button>
             </div>
           </div>
