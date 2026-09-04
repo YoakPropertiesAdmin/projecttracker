@@ -7,7 +7,8 @@ import {
   Plus, X, Search, Phone, Mail, MapPin, DollarSign, Check,
   ChevronDown, ChevronRight, Trash2, Pencil,
   AlertTriangle, Tag, Building2, Menu, ClipboardList, RefreshCw,
-  Wallet, HandCoins, Percent, Calendar as CalendarIcon, LogOut
+  Wallet, HandCoins, Percent, Calendar as CalendarIcon, LogOut,
+  Hammer, Wrench, PaintBucket, Droplets, Thermometer
 } from "lucide-react";
 
 /* =========================================================================
@@ -16,13 +17,59 @@ import {
 
 // Home-exterior trades only. If this company also does gutters, decking,
 // painting, etc. just say so and this list grows — nothing else changes.
+// Icons are stored in the database by name; this is the resolver. An
+// unrecognised name falls back to a generic tag rather than crashing a render.
+const TRADE_ICONS = {
+  home: Home, layers: Layers, appwindow: AppWindow, dooropen: DoorOpen,
+  hammer: Hammer, wrench: Wrench, paintbucket: PaintBucket,
+  droplets: Droplets, thermometer: Thermometer, tag: Tag,
+};
+
+/**
+ * Project types live in the `trades` table — adding gutters or decking is one
+ * row, not a code change and a redeploy.
+ *
+ * This object is the in-memory view of it, seeded with the four the app
+ * shipped with so a cold start (and the localStorage dev fallback) still
+ * renders. It is rewritten in place rather than held in React state because
+ * TradeBadge and the report builders read it from module scope in a dozen
+ * places; threading it through as a prop would be a much larger change for no
+ * behavioural gain. applyTrades() runs immediately before the setState that
+ * triggers a render, so no render sees a half-updated registry.
+ */
 const TRADES = {
   roofing: { label: "Roofing", icon: Home, color: "#C1440E" },
   siding: { label: "Siding", icon: Layers, color: "#5B7B9A" },
   windows: { label: "Windows", icon: AppWindow, color: "#3F8EA6" },
   doors: { label: "Doors", icon: DoorOpen, color: "#8A6D3B" },
 };
-const TRADE_KEYS = Object.keys(TRADES);
+
+function applyTrades(rows) {
+  if (!rows || !rows.length) return;
+  Object.keys(TRADES).forEach((k) => delete TRADES[k]);
+  rows.forEach((r) => {
+    TRADES[r.key] = {
+      label: r.label,
+      color: r.color || "#8A8478",
+      icon: TRADE_ICONS[String(r.icon || "tag").toLowerCase()] || Tag,
+    };
+  });
+}
+
+// Assignable types: what the registry offers.
+const tradeKeys = () => Object.keys(TRADES);
+
+// Everything worth filtering by: the registry, plus any trade actually sitting
+// on a job. A project type GHL sent that nobody has mapped yet stays visible
+// and filterable instead of quietly disappearing from the board controls.
+const tradeKeysFor = (jobs) => {
+  const keys = Object.keys(TRADES);
+  (jobs || []).forEach((j) => { if (j.trade && !keys.includes(j.trade)) keys.push(j.trade); });
+  return keys;
+};
+
+// A trade on a job with no registry entry — surfaced in the UI so it gets fixed.
+const isUnknownTrade = (trade) => Boolean(trade) && !TRADES[trade];
 
 // Job progress stages, start to finish. Rename/reorder these freely.
 const STAGES = [
@@ -249,6 +296,9 @@ function useJobTrackerData() {
     try {
       const loaded = await repo.loadAll();
       if (loaded) {
+        // Rewrite the trade registry before the state update that renders it,
+        // so no render observes a half-applied list.
+        applyTrades(loaded.trades);
         setDataState(loaded);
       } else {
         // Nothing stored at all. Only reachable in the localStorage dev
@@ -634,7 +684,7 @@ export default function App() {
             )}
             <div className="td-trade-legend-title">Trades served</div>
             <div className="td-trade-legend">
-              {TRADE_KEYS.map((k) => {
+              {tradeKeys().map((k) => {
                 const t = TRADES[k];
                 const Icon = t.icon;
                 return <span key={k} className="td-legend-chip" title={t.label} style={{ "--tc": t.color }}><Icon size={12} /></span>;
@@ -824,7 +874,9 @@ function JobsView({ ctx }) {
           </div>
           <select value={tradeFilter} onChange={(e) => setTradeFilter(e.target.value)} className="td-select">
             <option value="all">All trades</option>
-            {TRADE_KEYS.map((k) => <option key={k} value={k}>{TRADES[k].label}</option>)}
+            {tradeKeysFor(jobs).map((k) => (
+              <option key={k} value={k}>{TRADES[k] ? TRADES[k].label : k + " (unmapped)"}</option>
+            ))}
           </select>
         </div>
       </div>
@@ -969,7 +1021,7 @@ function JobFormModal({ onClose, onSave }) {
         <Field label="Email"><input className="td-input" value={form.customerEmail} onChange={set("customerEmail")} placeholder="jane@example.com" /></Field>
         <Field label="Trade">
           <select className="td-select td-select-full" value={form.trade} onChange={set("trade")}>
-            {TRADE_KEYS.map((k) => <option key={k} value={k}>{TRADES[k].label}</option>)}
+            {tradeKeys().map((k) => <option key={k} value={k}>{TRADES[k].label}</option>)}
           </select>
         </Field>
         <div style={{ gridColumn: "1 / -1" }}>
@@ -1057,6 +1109,13 @@ function JobDetailModal({ ctx, job, onClose }) {
           <TradeBadge trade={job.trade} />
           <select className="td-select" value={job.stage} onChange={(e) => updateJob(job.id, { stage: e.target.value })}>
             {STAGES.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
+          </select>
+          <select className="td-select" value={job.trade}
+            onChange={(e) => updateJob(job.id, { trade: e.target.value })}
+            title={isUnknownTrade(job.trade) ? "This project type came from GoHighLevel and isn't in your list yet" : "Project type"}>
+            {tradeKeysFor([job]).map((k) => (
+              <option key={k} value={k}>{TRADES[k] ? TRADES[k].label : k + " (unmapped)"}</option>
+            ))}
           </select>
           {job.substage && <span className="td-substage-chip" title="Stage name from GoHighLevel">{job.substage}</span>}
           <button type="button"
@@ -1283,20 +1342,25 @@ function ReportsView({ ctx }) {
   const totalAP = jobs.reduce((s, j) => s + vendorPending(j), 0);
   const totalMargin = jobs.reduce((s, j) => s + jobMargin(j), 0);
 
-  const contractByTrade = TRADE_KEYS.map((k) => ({
-    label: TRADES[k].label,
+  const contractByTrade = tradeKeysFor(jobs).map((k) => ({
+    label: TRADES[k] ? TRADES[k].label : k,
     value: jobs.filter((j) => j.trade === k).reduce((s, j) => s + Number(j.contractAmount || 0), 0),
-    color: TRADES[k].color,
+    color: TRADES[k] ? TRADES[k].color : "#8A8478",
   })).filter((d) => d.value > 0);
 
   const jobsByStage = STAGES.map((s) => ({ label: s.label, value: jobs.filter((j) => j.stage === s.key).length, color: "#3F8EA6" }));
 
-  const marginByTrade = TRADE_KEYS.map((k) => {
+  const marginByTrade = tradeKeysFor(jobs).map((k) => {
     const tradeJobs = jobs.filter((j) => j.trade === k);
+    if (!tradeJobs.length) return null;
     const rev = tradeJobs.reduce((s, j) => s + Number(j.contractAmount || 0), 0);
     const marg = tradeJobs.reduce((s, j) => s + jobMargin(j), 0);
-    return { label: TRADES[k].label, value: rev ? Math.round((marg / rev) * 100) : 0, color: TRADES[k].color };
-  }).filter((d) => jobs.some((j) => j.trade === TRADE_KEYS.find((k) => TRADES[k].label === d.label)));
+    return {
+      label: TRADES[k] ? TRADES[k].label : k,
+      value: rev ? Math.round((marg / rev) * 100) : 0,
+      color: TRADES[k] ? TRADES[k].color : "#8A8478",
+    };
+  }).filter(Boolean);
 
   const arAging = jobs.filter((j) => clientBalance(j) > 0)
     .map((j) => ({ j, balance: clientBalance(j), days: daysBetween(j.startDate, new Date()) }))

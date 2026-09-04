@@ -140,11 +140,14 @@ const supabaseRepo = {
   mode: "supabase",
 
   async loadAll() {
-    const [jobRows, vendorRows, cpRows, vpRows] = await Promise.all([
+    const [jobRows, vendorRows, cpRows, vpRows, tradeRows] = await Promise.all([
       supabase.from("jobs").select("*").order("number", { ascending: false }).then(unwrap),
       supabase.from("vendors").select("*").order("name", { ascending: true }).then(unwrap),
       supabase.from("client_payments").select("*").order("payment_date", { ascending: false }).then(unwrap),
       supabase.from("vendor_payments").select("*").order("payment_date", { ascending: false }).then(unwrap),
+      // Project types are configuration, not job data: read once per load and
+      // handed to applyTrades() before the first render.
+      supabase.from("trades").select("*").eq("active", true).order("sort_order").then(unwrap),
     ]);
 
     const jobs = jobRows.map(jobFromRow);
@@ -152,7 +155,7 @@ const supabaseRepo = {
     cpRows.forEach((r) => byId.get(r.job_id)?.clientPayments.push(clientPaymentFromRow(r)));
     vpRows.forEach((r) => byId.get(r.job_id)?.vendorPayments.push(vendorPaymentFromRow(r)));
 
-    return { jobs, vendors: vendorRows.map(vendorFromRow) };
+    return { jobs, vendors: vendorRows.map(vendorFromRow), trades: tradeRows };
   },
 
   // Seeding is a database concern in Supabase mode, not something the browser
