@@ -37,11 +37,16 @@ const jobFromRow = (r) => ({
   customerEmail: r.customer_email || "",
   customerAddress: r.customer_address || "",
   trade: r.trade,
+  // Component trades when the project type mentioned more than one. Always
+  // populated (a single-trade job gets a one-element array) so reporting never
+  // has to special-case combo.
+  trades: Array.isArray(r.trades) && r.trades.length ? r.trades : (r.trade ? [r.trade] : []),
+  isRepair: Boolean(r.is_repair),
   stage: r.stage,
-  // Stage is the board column; substage and onHold are facts about the job
-  // that the column cannot express. See map_ghl_inbound in the database.
+  // Stage is the board column; substage and flag are facts about the job that
+  // the column cannot express. See map_ghl_inbound in the database.
   substage: r.substage || "",
-  onHold: Boolean(r.on_hold),
+  flag: r.flag || "",
   ghlProjectDisplayId: r.ghl_project_display_id || null,
   expectedFinalPayment: r.expected_final_payment === null || r.expected_final_payment === undefined
     ? null : Number(r.expected_final_payment),
@@ -60,10 +65,17 @@ const jobToRow = (j) => {
   if (j.customerPhone !== undefined) row.customer_phone = j.customerPhone || "";
   if (j.customerEmail !== undefined) row.customer_email = j.customerEmail || "";
   if (j.customerAddress !== undefined) row.customer_address = j.customerAddress || "";
-  if (j.trade !== undefined) row.trade = j.trade;
+  if (j.trade !== undefined) {
+    row.trade = j.trade;
+    // Assigning a single trade by hand replaces any combo breakdown — the
+    // person picking from the dropdown is stating what the job actually is.
+    if (j.trades === undefined) row.trades = j.trade ? [j.trade] : [];
+  }
+  if (j.trades !== undefined) row.trades = j.trades;
+  if (j.isRepair !== undefined) row.is_repair = Boolean(j.isRepair);
   if (j.stage !== undefined) row.stage = j.stage;
   if (j.substage !== undefined) row.substage = j.substage || null;
-  if (j.onHold !== undefined) row.on_hold = Boolean(j.onHold);
+  if (j.flag !== undefined) row.flag = j.flag || null;
   if (j.contractAmount !== undefined) row.contract_amount = Number(j.contractAmount) || 0;
   if (j.startDate !== undefined) row.start_date = toIso(j.startDate);
   if (j.targetDate !== undefined) row.target_date = toIso(j.targetDate);
@@ -140,7 +152,7 @@ const supabaseRepo = {
   mode: "supabase",
 
   async loadAll() {
-    const [jobRows, vendorRows, cpRows, vpRows, tradeRows] = await Promise.all([
+    const [jobRows, vendorRows, cpRows, vpRows, tradeRows, flagRows] = await Promise.all([
       supabase.from("jobs").select("*").order("number", { ascending: false }).then(unwrap),
       supabase.from("vendors").select("*").order("name", { ascending: true }).then(unwrap),
       supabase.from("client_payments").select("*").order("payment_date", { ascending: false }).then(unwrap),
@@ -148,6 +160,7 @@ const supabaseRepo = {
       // Project types are configuration, not job data: read once per load and
       // handed to applyTrades() before the first render.
       supabase.from("trades").select("*").eq("active", true).order("sort_order").then(unwrap),
+      supabase.from("job_flags").select("*").order("sort_order").then(unwrap),
     ]);
 
     const jobs = jobRows.map(jobFromRow);
@@ -155,7 +168,7 @@ const supabaseRepo = {
     cpRows.forEach((r) => byId.get(r.job_id)?.clientPayments.push(clientPaymentFromRow(r)));
     vpRows.forEach((r) => byId.get(r.job_id)?.vendorPayments.push(vendorPaymentFromRow(r)));
 
-    return { jobs, vendors: vendorRows.map(vendorFromRow), trades: tradeRows };
+    return { jobs, vendors: vendorRows.map(vendorFromRow), trades: tradeRows, jobFlags: flagRows };
   },
 
   // Seeding is a database concern in Supabase mode, not something the browser

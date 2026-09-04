@@ -8,7 +8,7 @@ import {
   ChevronDown, ChevronRight, Trash2, Pencil,
   AlertTriangle, Tag, Building2, Menu, ClipboardList, RefreshCw,
   Wallet, HandCoins, Percent, Calendar as CalendarIcon, LogOut,
-  Hammer, Wrench, PaintBucket, Droplets, Thermometer
+  Hammer, Wrench, PaintBucket, Droplets, Thermometer, PackageCheck, ShoppingCart
 } from "lucide-react";
 
 /* =========================================================================
@@ -70,6 +70,42 @@ const tradeKeysFor = (jobs) => {
 
 // A trade on a job with no registry entry — surfaced in the UI so it gets fixed.
 const isUnknownTrade = (trade) => Boolean(trade) && !TRADES[trade];
+
+/**
+ * Corner markers. A job sits in a stage and may additionally carry one marker:
+ * on hold, materials in, needs ordered. They come from the `job_flags` table
+ * and are set either by the GHL stage on arrival or by hand in the job detail.
+ *
+ * Only a marker with a `tint` washes the whole card — that is reserved for
+ * states that should stop the eye. The rest are a corner icon and nothing more,
+ * or the board turns into a colour riot.
+ */
+const FLAG_ICONS = {
+  alerttriangle: AlertTriangle, packagecheck: PackageCheck, shoppingcart: ShoppingCart,
+  wrench: Wrench, clipboardlist: ClipboardList, tag: Tag,
+};
+
+const JOB_FLAGS = {
+  on_hold:       { label: "On hold",       icon: AlertTriangle, color: "#B07D12", tint: "#FDF7EA" },
+  materials_in:  { label: "Materials in",  icon: PackageCheck,  color: "#3E6B3A", tint: null },
+  needs_ordered: { label: "Needs ordered", icon: ShoppingCart,  color: "#4A5480", tint: null },
+};
+
+function applyJobFlags(rows) {
+  if (!rows || !rows.length) return;
+  Object.keys(JOB_FLAGS).forEach((k) => delete JOB_FLAGS[k]);
+  rows.forEach((r) => {
+    JOB_FLAGS[r.key] = {
+      label: r.label,
+      icon: FLAG_ICONS[String(r.icon || "tag").toLowerCase()] || Tag,
+      color: r.color || "#8A8478",
+      tint: r.tint || null,
+    };
+  });
+}
+
+const flagKeys = () => Object.keys(JOB_FLAGS);
+const jobFlag = (job) => (job && job.flag ? JOB_FLAGS[job.flag] : null);
 
 // Job progress stages, start to finish. Rename/reorder these freely.
 const STAGES = [
@@ -299,6 +335,7 @@ function useJobTrackerData() {
         // Rewrite the trade registry before the state update that renders it,
         // so no render observes a half-applied list.
         applyTrades(loaded.trades);
+        applyJobFlags(loaded.jobFlags);
         setDataState(loaded);
       } else {
         // Nothing stored at all. Only reachable in the localStorage dev
@@ -844,11 +881,16 @@ function JobsView({ ctx }) {
   const { jobs, search, setSelectedJobId, updateJob } = ctx;
   const [mode, setMode] = useState("board");
   const [tradeFilter, setTradeFilter] = useState("all");
+  const [repairsOnly, setRepairsOnly] = useState(false);
   const [dragOverStage, setDragOverStage] = useState(null);
   const [draggingId, setDraggingId] = useState(null);
 
   const matches = (j) => {
-    if (tradeFilter !== "all" && j.trade !== tradeFilter) return false;
+    // Combo jobs answer to each of their component trades, so filtering by
+    // Roofing includes a roof-and-siding job rather than hiding it under Combo.
+    if (tradeFilter !== "all" && j.trade !== tradeFilter &&
+        !(j.trades || []).includes(tradeFilter)) return false;
+    if (repairsOnly && !j.isRepair) return false;
     if (!search) return true;
     const q = search.toLowerCase();
     return j.customerName.toLowerCase().includes(q) || j.customerAddress.toLowerCase().includes(q) || jobNo(j.number).toLowerCase().includes(q);
@@ -878,6 +920,12 @@ function JobsView({ ctx }) {
               <option key={k} value={k}>{TRADES[k] ? TRADES[k].label : k + " (unmapped)"}</option>
             ))}
           </select>
+          <button type="button"
+            className={cls("td-repair-filter", repairsOnly && "active")}
+            onClick={() => setRepairsOnly((v) => !v)}
+            title="Show only repair work">
+            <Wrench size={13} /> Repairs
+          </button>
         </div>
       </div>
 
@@ -924,15 +972,18 @@ function JobsView({ ctx }) {
                       <td className="td-mono">{jobNo(j.number)}</td>
                       <td>
                         <div className="td-cell-name">
-                          {j.onHold && <AlertTriangle size={12} className="td-hold-icon" aria-label="On hold" />}
+                          {jobFlag(j) && React.createElement(jobFlag(j).icon, {
+                            size: 12, className: "td-flag-icon",
+                            style: { color: jobFlag(j).color }, "aria-label": jobFlag(j).label })}
+                          {j.isRepair && <Wrench size={12} className="td-repair-icon" aria-label="Repair" />}
                           {j.customerName}
                         </div>
                         <div className="td-cell-sub"><MapPin size={11} /> {j.customerAddress}</div>
                       </td>
                       <td><TradeBadge trade={j.trade} size="sm" /></td>
                       <td>
-                        <StatusPill tone={j.onHold ? "amber" : j.stage === "closed" ? "green" : "neutral"}>
-                          {j.onHold ? "On hold" : STAGES.find((s) => s.key === j.stage)?.label}
+                        <StatusPill tone={j.flag === "on_hold" ? "amber" : j.stage === "closed" ? "green" : "neutral"}>
+                          {jobFlag(j) ? jobFlag(j).label : STAGES.find((s) => s.key === j.stage)?.label}
                         </StatusPill>
                         {j.substage && <div className="td-cell-sub">{j.substage}</div>}
                       </td>
@@ -963,13 +1014,14 @@ function JobTicket({ job, ctx, dragging, onDragStart, onDragEnd }) {
   // job, not a step backwards, so it must not read as a fresh contract.
   return (
     <div className={cls("td-ticket", dragging && "td-ticket-dragging",
-                        paid && "td-ticket-paid", job.onHold && "td-ticket-hold")}
-      style={{ "--tc": t ? t.color : "#8A8478" }}
+                        paid && "td-ticket-paid")}
+      style={{ "--tc": t ? t.color : "#8A8478",
+               ...(jobFlag(job) && jobFlag(job).tint ? { background: jobFlag(job).tint, borderColor: "#E6D3A6" } : {}) }}
       draggable onDragStart={onDragStart} onDragEnd={onDragEnd}
       onClick={() => ctx.setSelectedJobId(job.id)}>
-      {job.onHold && (
-        <span className="td-ticket-holdmark" title="Contract on hold">
-          <AlertTriangle size={13} strokeWidth={2.6} />
+      {jobFlag(job) && (
+        <span className="td-ticket-flagmark" style={{ color: jobFlag(job).color }} title={jobFlag(job).label}>
+          {React.createElement(jobFlag(job).icon, { size: 13, strokeWidth: 2.6 })}
         </span>
       )}
       <div className="td-ticket-head">
@@ -980,13 +1032,23 @@ function JobTicket({ job, ctx, dragging, onDragStart, onDragEnd }) {
       <div className="td-ticket-contact">{job.customerAddress}</div>
       {/* The GHL stage as sent. The board column is coarse on purpose; this is
           where "Ordered" stops looking identical to "Materials In". */}
-      {job.substage && <div className="td-ticket-substage">{job.substage}</div>}
+      {(job.substage || (job.trades && job.trades.length > 1)) && (
+        <div className="td-ticket-substage">
+          {job.trades && job.trades.length > 1 && (
+            <span className="td-combo-parts">
+              {job.trades.map((k) => (TRADES[k] ? TRADES[k].label : k)).join(" + ")}
+            </span>
+          )}
+          {job.substage && <span>{job.substage}</span>}
+        </div>
+      )}
       <div className="td-ticket-foot">
         <span className="td-ticket-value">{money(job.contractAmount)}</span>
         <span className="td-ticket-date">{fmtDateShort(job.targetDate)}</span>
       </div>
-      {(paid || bal > 0 || owed > 0) && (
+      {(paid || bal > 0 || owed > 0 || job.isRepair) && (
         <div className="td-ticket-flags">
+          {job.isRepair && <span className="td-ticket-flag td-ticket-flag-repair"><Wrench size={10} /> Repair</span>}
           {paid
             ? <span className="td-ticket-flag td-ticket-flag-green"><Check size={10} /> Paid in full</span>
             : bal > 0 && <span className="td-ticket-flag td-ticket-flag-red"><Wallet size={10} /> {money(bal)} due</span>}
@@ -1119,11 +1181,18 @@ function JobDetailModal({ ctx, job, onClose }) {
           </select>
           {job.substage && <span className="td-substage-chip" title="Stage name from GoHighLevel">{job.substage}</span>}
           <button type="button"
-            className={cls("td-hold-toggle", job.onHold && "active")}
-            onClick={() => updateJob(job.id, { onHold: !job.onHold })}
-            title="A held job keeps its stage and shows a warning on the board">
-            <AlertTriangle size={13} /> {job.onHold ? "On hold" : "Mark on hold"}
+            className={cls("td-hold-toggle", job.isRepair && "active")}
+            onClick={() => updateJob(job.id, { isRepair: !job.isRepair })}
+            title="Repair work rather than a full replacement">
+            <Wrench size={13} /> {job.isRepair ? "Repair" : "Mark as repair"}
           </button>
+          <select className={cls("td-select", "td-flag-select", job.flag && "active")}
+            value={job.flag || ""}
+            onChange={(e) => updateJob(job.id, { flag: e.target.value || null })}
+            title="A marker sits alongside the stage and shows in the card corner">
+            <option value="">No marker</option>
+            {flagKeys().map((k) => <option key={k} value={k}>{JOB_FLAGS[k].label}</option>)}
+          </select>
           <div style={{ marginLeft: "auto", textAlign: "right" }}>
             <div className="td-field-label" style={{ marginBottom: 3 }}>Contract amount</div>
             <input className="td-input td-input-num" style={{ width: 130, fontWeight: 700 }} type="number"
@@ -1635,16 +1704,24 @@ function GlobalStyle() {
       .td-ticket-flag-red { background: #F4DBD6; color: var(--td-red); }
       .td-ticket-flag-amber { background: #F3E7C9; color: #8A6A0B; }
       .td-ticket-flag-green { background: #DCE9DA; color: #3E6B3A; }
+      .td-ticket-flag-repair { background: #E2E4EE; color: #4A5480; }
+      .td-combo-parts { display: block; color: #7A6A93; }
+      .td-repair-icon { color: #4A5480; vertical-align: -2px; margin-right: 5px; }
+      .td-repair-filter { display: inline-flex; align-items: center; gap: 6px; padding: 7px 11px;
+        border: 1px solid #DCD5C9; background: #FDFCFA; color: #6B6459; border-radius: 7px;
+        font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
+      .td-repair-filter:hover { border-color: #C6BCA9; }
+      .td-repair-filter.active { background: #E2E4EE; border-color: #B9BFD6; color: #4A5480; }
       .td-ticket-substage { font-size: 10.5px; font-weight: 600; color: #8A8478; letter-spacing: .01em;
         text-transform: uppercase; margin-top: 6px; }
       /* Collected in full: the card stops asking for attention. */
       .td-ticket-paid { background: #F6FAF5; border-color: #CBDFC7; }
       /* On hold outranks paid — a stalled job should look stalled. */
-      .td-ticket-hold { background: #FDF7EA; border-color: #E6D3A6; }
-      .td-ticket-holdmark { position: absolute; top: 7px; right: 7px; color: #B07D12;
+      .td-ticket-flagmark { position: absolute; top: 7px; right: 7px;
         display: inline-flex; pointer-events: none; }
-      .td-ticket-hold .td-ticket-head { padding-right: 20px; }
-      .td-hold-icon { color: #B07D12; vertical-align: -2px; margin-right: 5px; }
+      .td-ticket-flagmark + .td-ticket-head { padding-right: 20px; }
+      .td-flag-icon { vertical-align: -2px; margin-right: 5px; }
+      .td-flag-select.active { background: #FDF3E3; border-color: #E6D3A6; }
       .td-substage-chip { font-size: 10.5px; font-weight: 700; text-transform: uppercase;
         letter-spacing: .02em; color: #8A8478; background: #F0EBE1; border-radius: 4px; padding: 4px 8px; }
       .td-hold-toggle { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px;
