@@ -534,7 +534,21 @@ export default function App() {
     return v;
   };
   const updateVendor = (id, patch) => {
-    setData((prev) => ({ ...prev, vendors: prev.vendors.map((v) => (v.id === id ? { ...v, ...patch } : v)) }));
+    const previousName = (safeData.vendors.find((v) => v.id === id) || {}).name;
+    const renamed = patch.name !== undefined && patch.name !== previousName;
+    setData((prev) => ({
+      ...prev,
+      vendors: prev.vendors.map((v) => (v.id === id ? { ...v, ...patch } : v)),
+      // Vendor spend is rolled up by name, so a rename has to carry the
+      // payments with it or this vendor's history splits in two on screen.
+      jobs: renamed
+        ? prev.jobs.map((j) => ({
+            ...j,
+            vendorPayments: (j.vendorPayments || []).map((p) =>
+              p.vendorName === previousName ? { ...p, vendorName: patch.name } : p),
+          }))
+        : prev.jobs,
+    }));
     persist(() => repo.updateVendor(id, patch), "The vendor update");
   };
   const deleteVendor = (id) => {
@@ -1030,7 +1044,7 @@ function JobDetailModal({ ctx, job, onClose }) {
                       <div className="td-payment-row-top"><span className="td-payment-amount td-text-green">{moneyDec(p.amount)}</span><span className="td-cell-sub">{p.method}</span></div>
                       <div className="td-cell-sub">{fmtDate(p.date)}{p.note ? " \u00b7 " + p.note : ""}</div>
                     </div>
-                    <button className="td-iconbtn td-iconbtn-danger" onClick={() => deleteClientPayment(job.id, p.id)} aria-label="Delete payment"><Trash2 size={12} /></button>
+                    <button className="td-iconbtn td-iconbtn-danger" onClick={() => { if (confirm("Delete this " + money(p.amount) + " client payment? The balance due will go back up.")) deleteClientPayment(job.id, p.id); }} aria-label="Delete payment"><Trash2 size={12} /></button>
                   </div>
                 ))}
               </div>
@@ -1067,7 +1081,7 @@ function JobDetailModal({ ctx, job, onClose }) {
                       onClick={() => updateVendorPayment(job.id, p.id, { status: p.status === "paid" ? "pending" : "paid" })}>
                       {p.status === "paid" ? <><Check size={11} /> Paid</> : "Pending"}
                     </button>
-                    <button className="td-iconbtn td-iconbtn-danger" onClick={() => deleteVendorPayment(job.id, p.id)} aria-label="Delete"><Trash2 size={12} /></button>
+                    <button className="td-iconbtn td-iconbtn-danger" onClick={() => { if (confirm("Delete this " + money(p.amount) + " payment to " + p.vendorName + "?")) deleteVendorPayment(job.id, p.id); }} aria-label="Delete"><Trash2 size={12} /></button>
                   </div>
                 ))}
               </div>

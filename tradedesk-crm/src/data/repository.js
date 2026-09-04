@@ -104,8 +104,26 @@ const vendorPaymentFromRow = (r) => ({
    Supabase implementation
    --------------------------------------------------------------------------- */
 
+// Postgres error codes turned into something an office manager can act on.
+// Without this, a duplicate vendor name reaches the UI as
+// 'duplicate key value violates unique constraint "vendors_name_unique"'.
+const friendly = (error) => {
+  const code = error.code || "";
+  const msg = error.message || "";
+  if (code === "23505" && msg.includes("vendors_name_unique")) return "a vendor with that name already exists";
+  if (code === "23505") return "that record already exists";
+  if (code === "23503") return "the job or vendor it belongs to no longer exists — someone may have just deleted it";
+  if (code === "23514") return "the amount is not valid (it cannot be negative)";
+  if (code === "42501" || code === "PGRST301") return "your sign-in has expired — sign in again";
+  return msg || "the database rejected the change";
+};
+
 const unwrap = ({ data, error }) => {
-  if (error) throw new Error(error.message || "Supabase request failed");
+  if (error) {
+    const e = new Error(friendly(error));
+    e.code = error.code;
+    throw e;
+  }
   return data;
 };
 
@@ -219,6 +237,19 @@ const supabaseRepo = {
 
   async updateVendor(id, patch) {
     await supabase.from("vendors").update(vendorToRow(patch)).eq("id", id).then(unwrap);
+
+    // The Vendors screen rolls spend up by name. If a rename only touched the
+    // directory row, that vendor's history would split into an old bucket and
+    // a new empty one, so payments linked by FK follow the rename. Payments
+    // typed against a name that was never in the directory keep theirs — they
+    // were never this vendor's rows to begin with.
+    if (patch.name !== undefined) {
+      await supabase
+        .from("vendor_payments")
+        .update({ vendor_name: patch.name })
+        .eq("vendor_id", id)
+        .then(unwrap);
+    }
   },
 
   async deleteVendor(id) {
