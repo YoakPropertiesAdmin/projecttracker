@@ -897,6 +897,7 @@ function JobsView({ ctx }) {
   const [mode, setMode] = useState("board");
   const [tradeFilter, setTradeFilter] = useState("all");
   const [repairsOnly, setRepairsOnly] = useState(false);
+  const [flagFilter, setFlagFilter] = useState("all");
   const [dragOverStage, setDragOverStage] = useState(null);
   const [draggingId, setDraggingId] = useState(null);
 
@@ -906,6 +907,10 @@ function JobsView({ ctx }) {
     if (tradeFilter !== "all" && j.trade !== tradeFilter &&
         !(j.trades || []).includes(tradeFilter)) return false;
     if (repairsOnly && !j.isRepair) return false;
+    // "none" is a real answer here — showing only the jobs carrying no marker
+    // is how you see what is actually moving.
+    if (flagFilter === "none" && j.flag) return false;
+    if (flagFilter !== "all" && flagFilter !== "none" && j.flag !== flagFilter) return false;
     if (!search) return true;
     const q = search.toLowerCase();
     return j.customerName.toLowerCase().includes(q) || j.customerAddress.toLowerCase().includes(q) || jobNo(j.number).toLowerCase().includes(q);
@@ -934,6 +939,12 @@ function JobsView({ ctx }) {
             {tradeKeysFor(jobs).map((k) => (
               <option key={k} value={k}>{TRADES[k] ? TRADES[k].label : k + " (unmapped)"}</option>
             ))}
+          </select>
+          <select value={flagFilter} onChange={(e) => setFlagFilter(e.target.value)}
+            className={cls("td-select", flagFilter !== "all" && "td-select-on")}>
+            <option value="all">All markers</option>
+            <option value="none">No marker</option>
+            {flagKeys().map((k) => <option key={k} value={k}>{JOB_FLAGS[k].label}</option>)}
           </select>
           <button type="button"
             className={cls("td-repair-filter", repairsOnly && "active")}
@@ -1557,6 +1568,11 @@ function GlobalStyle() {
       @keyframes td-spin { to { transform: rotate(360deg); } }
 
       /* ---------- Shell ---------- */
+      /* No reset existed, so the browser's default 8px body margin sat under a
+         100vh shell and gave the page 16px of scroll. Small, but it is enough
+         to drag the board's horizontal scrollbar off the bottom of the screen. */
+      html, body { margin: 0; padding: 0; height: 100%; }
+      #root { height: 100%; }
       .td-shell { display: flex; height: 100vh; min-height: 560px; }
       .td-sidebar { width: 216px; flex: none; background: var(--td-ink); color: var(--td-ink-text); display: flex; flex-direction: column; padding: 18px 14px; border-right: 1px solid var(--td-ink-border); }
       .td-brand { display: flex; align-items: center; gap: 10px; padding: 4px 6px 20px; }
@@ -1579,9 +1595,11 @@ function GlobalStyle() {
       .td-topbar-search { display: flex; align-items: center; gap: 8px; background: rgba(255,255,255,0.07); border: 1px solid var(--td-ink-border); border-radius: 4px; padding: 7px 10px; flex: 1; max-width: 380px; color: var(--td-ink-muted); }
       .td-topbar-search input { background: none; border: none; outline: none; color: var(--td-ink-text); width: 100%; }
       .td-topbar-search input::placeholder { color: var(--td-ink-muted); }
-      .td-content { flex: 1; overflow-y: auto; padding: 22px; }
+      /* min-height:0 lets a flex child actually shrink, which is what allows the
+         board below to bound itself to the viewport instead of growing the page. */
+      .td-content { flex: 1; overflow-y: auto; padding: 22px; display: flex; flex-direction: column; min-height: 0; }
       .td-view { display: flex; flex-direction: column; gap: 18px; }
-      .td-view-flush { gap: 14px; }
+      .td-view-flush { gap: 14px; flex: 1; min-height: 0; }
 
       /* ---------- Buttons / inputs ---------- */
       .td-btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 13px; border-radius: 4px; border: 1px solid var(--td-border); background: var(--td-card); color: var(--td-text); font-size: 13px; font-weight: 500; cursor: pointer; }
@@ -1675,6 +1693,10 @@ function GlobalStyle() {
       /* ---------- Tables ---------- */
       .td-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
       .td-filter-group { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      /* .td-select is width:100% for form fields, which in a flex row forces
+         every control onto its own line. Toolbar and detail-header controls
+         size to their content instead. */
+      .td-filter-group .td-select, .td-deal-modal-row .td-select { width: auto; min-width: 140px; }
       .td-table-wrap { background: var(--td-card); border: 1px solid var(--td-border); border-radius: var(--td-radius); overflow: hidden; overflow-x: auto; }
       .td-table { width: 100%; border-collapse: collapse; font-size: 13px; }
       .td-table thead th { text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--td-muted); padding: 10px 14px; background: var(--td-paper); border-bottom: 1px solid var(--td-border); white-space: nowrap; }
@@ -1696,13 +1718,31 @@ function GlobalStyle() {
       .td-segment-btn:last-child { border-right: none; }
       .td-segment-btn.active { background: var(--td-ink); color: #fff; }
 
-      .td-kanban { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 8px; align-items: flex-start; }
-      .td-kanban-col { flex: none; width: 230px; background: #EAE4D4; border: 1px solid var(--td-border); border-radius: var(--td-radius); padding: 10px; min-height: 120px; }
+      /* The board scrolls sideways within the viewport, so the horizontal
+         scrollbar is always reachable. Previously the columns grew to their
+         content, the page grew with them, and the only way to the scrollbar was
+         to scroll to the bottom of the longest column. Each column now scrolls
+         its own cards vertically instead. */
+      .td-kanban { display: flex; gap: 12px; overflow-x: auto; overflow-y: hidden;
+        align-items: stretch; flex: 1; min-height: 0; padding-bottom: 4px; overscroll-behavior-x: contain; }
+      .td-kanban-col { flex: none; width: 230px; background: #EAE4D4; border: 1px solid var(--td-border);
+        border-radius: var(--td-radius); padding: 10px; min-height: 120px;
+        display: flex; flex-direction: column; max-height: 100%; }
       .td-kanban-col-over { outline: 2px dashed var(--td-accent); outline-offset: -2px; }
       .td-kanban-col-head { display: flex; align-items: center; justify-content: space-between; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.02em; color: var(--td-muted); padding: 2px 2px 0; }
       .td-kanban-count { background: rgba(0,0,0,0.08); border-radius: 10px; padding: 1px 7px; font-size: 10.5px; }
       .td-kanban-col-total { font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 600; padding: 4px 2px 10px; color: var(--td-text); }
-      .td-kanban-col-body { display: flex; flex-direction: column; gap: 8px; min-height: 40px; }
+      .td-kanban-col-body { display: flex; flex-direction: column; gap: 8px; min-height: 40px;
+        flex: 1; overflow-y: auto; overscroll-behavior-y: contain; padding-right: 2px; }
+      /* A visible track beats an invisible one you have to hunt for. */
+      .td-kanban { scrollbar-width: auto; }
+      .td-kanban::-webkit-scrollbar { height: 12px; }
+      .td-kanban::-webkit-scrollbar-track { background: rgba(0,0,0,0.05); border-radius: 6px; }
+      .td-kanban::-webkit-scrollbar-thumb { background: #BFB6A4; border-radius: 6px; border: 3px solid transparent; background-clip: content-box; }
+      .td-kanban::-webkit-scrollbar-thumb:hover { background: #A69C88; background-clip: content-box; }
+      .td-kanban-col-body::-webkit-scrollbar { width: 8px; }
+      .td-kanban-col-body::-webkit-scrollbar-thumb { background: #C9C0AE; border-radius: 4px; }
+      .td-select-on { background: #E9EFF3; border-color: #A9C3D2; }
 
       .td-ticket { position: relative; background: var(--td-card); border: 1px solid var(--td-border); border-left: 3px solid var(--tc); border-radius: 4px; padding: 10px 11px; cursor: grab; box-shadow: 0 1px 2px rgba(20,16,8,0.06); }
       .td-ticket:active { cursor: grabbing; }
