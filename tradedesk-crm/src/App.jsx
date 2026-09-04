@@ -591,6 +591,8 @@ export default function App() {
     <div className="td-root">
       <GlobalStyle />
       <style>{`
+        .td-overage-hint{display:flex;align-items:center;gap:7px;margin:8px 0 2px;padding:7px 10px;
+          border-radius:7px;background:#FDF3E3;color:#8A5A12;font-size:12px;line-height:1.35;}
         .td-sync-banner{display:flex;align-items:center;gap:9px;margin:0 20px;padding:10px 13px;border-radius:9px;
           background:#FBEDE9;color:#9B3A20;font-size:12.5px;line-height:1.4;}
         .td-sync-banner span{flex:1;}
@@ -977,9 +979,21 @@ function JobDetailModal({ ctx, job, onClose }) {
   const margin = jobMargin(job);
   const marginPercent = jobMarginPct(job);
 
+  // Overpayment is allowed on purpose — a change order raises what the client
+  // owes without the contract amount having been updated yet. So this warns
+  // and lets you through rather than refusing the entry.
+  const cpAmount = Number(cpForm.amount) || 0;
+  const cpOverage = cpAmount - clientBalance(job);
+
   const submitClientPayment = () => {
-    if (!cpForm.amount || Number(cpForm.amount) <= 0) return;
-    addClientPayment(job.id, { amount: Number(cpForm.amount), date: new Date(cpForm.date).toISOString(), method: cpForm.method, note: cpForm.note.trim() });
+    if (!cpForm.amount || cpAmount <= 0) return;
+    if (cpOverage > 0 && !confirm(
+      "This payment puts " + job.customerName + " " + money(cpOverage) +
+      " over the " + money(job.contractAmount) + " contract.\n\n" +
+      "That's normal after a change order — but if the contract amount should be higher, " +
+      "update it first so the margin numbers stay right.\n\nLog the payment anyway?"
+    )) return;
+    addClientPayment(job.id, { amount: cpAmount, date: new Date(cpForm.date).toISOString(), method: cpForm.method, note: cpForm.note.trim() });
     setCpForm({ amount: "", date: new Date().toISOString().slice(0, 10), method: cpForm.method, note: "" });
   };
 
@@ -1060,6 +1074,12 @@ function JobDetailModal({ ctx, job, onClose }) {
                 </select>
                 <input className="td-input" placeholder="Note (optional)" value={cpForm.note} onChange={(e) => setCpForm((f) => ({ ...f, note: e.target.value }))} />
               </div>
+              {cpOverage > 0 && (
+                <div className="td-overage-hint">
+                  <AlertTriangle size={13} />
+                  <span>{money(cpOverage)} over the {money(job.contractAmount)} contract — the job would show a {money(cpOverage)} credit.</span>
+                </div>
+              )}
               <button className="td-btn td-btn-primary td-btn-sm" onClick={submitClientPayment}><Plus size={13} /> Log client payment</button>
             </div>
           </div>
