@@ -190,6 +190,16 @@ const cls = (...parts) => parts.filter(Boolean).join(" ");
 
 const jobNo = (n) => "JOB-" + String(n).padStart(4, "0");
 
+/**
+ * The GoHighLevel project number. This is the identifier the two systems
+ * share, so it leads wherever a job is identified — JOB-nnnn is TradeDesk's
+ * own sequence and means nothing to anyone looking at the CRM.
+ *
+ * Null for a job created by hand in TradeDesk, which never had one.
+ */
+const projectRef = (job) => (job && job.ghlProjectDisplayId ? "#" + job.ghlProjectDisplayId : null);
+const jobRef = (job) => projectRef(job) || jobNo(job.number);
+
 /* ---------------- job financial derivations ---------------- */
 
 const clientReceived = (job) => (job.clientPayments || []).reduce((s, p) => s + Number(p.amount || 0), 0);
@@ -751,7 +761,7 @@ export default function App() {
             <div className="td-topbar-title">{NAV.find((n) => n.key === view)?.label}</div>
             <div className="td-topbar-search">
               <Search size={14} />
-              <input placeholder="Search jobs by customer, address, job #…" value={search} onChange={(e) => setSearch(e.target.value)} />
+              <input placeholder="Search by customer, address, project # or job #…" value={search} onChange={(e) => setSearch(e.target.value)} />
             </div>
             <button className="td-btn td-btn-primary" onClick={() => setShowAddJob(true)}>
               <Plus size={15} /> New job
@@ -913,7 +923,11 @@ function JobsView({ ctx }) {
     if (flagFilter !== "all" && flagFilter !== "none" && j.flag !== flagFilter) return false;
     if (!search) return true;
     const q = search.toLowerCase();
-    return j.customerName.toLowerCase().includes(q) || j.customerAddress.toLowerCase().includes(q) || jobNo(j.number).toLowerCase().includes(q);
+    return j.customerName.toLowerCase().includes(q)
+      || j.customerAddress.toLowerCase().includes(q)
+      || jobNo(j.number).toLowerCase().includes(q)
+      // Searchable by GHL project number, with or without the leading '#'.
+      || String(j.ghlProjectDisplayId || "").toLowerCase().includes(q.replace(/^#/, ""));
   };
 
   const visible = jobs.filter(matches);
@@ -988,14 +1002,17 @@ function JobsView({ ctx }) {
         visible.length === 0 ? <EmptyState icon={LayoutGrid} title="No jobs match" sub="Try clearing filters, or start a new job." /> : (
           <div className="td-table-wrap">
             <table className="td-table">
-              <thead><tr><th>Job</th><th>Customer</th><th>Trade</th><th>Stage</th><th>Contract</th><th>Balance due</th><th>Vendor owed</th><th>Target</th></tr></thead>
+              <thead><tr><th>Project #</th><th>Customer</th><th>Trade</th><th>Stage</th><th>Contract</th><th>Balance due</th><th>Vendor owed</th><th>Target</th></tr></thead>
               <tbody>
                 {[...visible].sort((a, b) => b.number - a.number).map((j) => {
                   const bal = clientBalance(j);
                   const owed = vendorPending(j);
                   return (
                     <tr key={j.id} className="td-table-row" onClick={() => setSelectedJobId(j.id)}>
-                      <td className="td-mono">{jobNo(j.number)}</td>
+                      <td className="td-mono">
+                        {jobRef(j)}
+                        {projectRef(j) && <div className="td-cell-sub td-mono">{jobNo(j.number)}</div>}
+                      </td>
                       <td>
                         <div className="td-cell-name">
                           {jobFlag(j) && React.createElement(jobFlag(j).icon, {
@@ -1051,9 +1068,12 @@ function JobTicket({ job, ctx, dragging, onDragStart, onDragEnd }) {
         </span>
       )}
       <div className="td-ticket-head">
-        <span className="td-ticket-no">{jobNo(job.number)}</span>
+        <span className="td-ticket-no">{jobRef(job)}</span>
         <TradeBadge trade={job.trade} size="sm" />
       </div>
+      {/* Both numbers, because the office reconciles against GHL by project
+          number while vendor payments and reports still cite JOB-nnnn. */}
+      {projectRef(job) && <div className="td-ticket-jobno">{jobNo(job.number)}</div>}
       <div className="td-ticket-title">{job.customerName}</div>
       <div className="td-ticket-contact">{job.customerAddress}</div>
       {/* The GHL stage as sent. The board column is coarse on purpose; this is
@@ -1185,7 +1205,7 @@ function JobDetailModal({ ctx, job, onClose }) {
   };
 
   return (
-    <Modal title={jobNo(job.number) + " · " + job.customerName} onClose={onClose} wide
+    <Modal title={jobRef(job) + " · " + job.customerName} onClose={onClose} wide
       footer={<>
         <button className="td-btn td-btn-danger" onClick={() => { if (confirm("Delete this job? This can't be undone.")) deleteJob(job.id); }}><Trash2 size={13} /> Delete job</button>
         <div style={{ flex: 1 }} />
@@ -1193,6 +1213,10 @@ function JobDetailModal({ ctx, job, onClose }) {
       </>}>
       <div className="td-job-detail">
 
+        <div className="td-idline">
+          <span className="td-idline-item"><strong>Project #</strong> {job.ghlProjectDisplayId || "— not from GoHighLevel"}</span>
+          <span className="td-idline-item"><strong>TradeDesk</strong> {jobNo(job.number)}</span>
+        </div>
         <div className="td-deal-modal-row">
           <TradeBadge trade={job.trade} />
           <select className="td-select" value={job.stage} onChange={(e) => updateJob(job.id, { stage: e.target.value })}>
@@ -1775,6 +1799,11 @@ function GlobalStyle() {
         font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
       .td-repair-filter:hover { border-color: #C6BCA9; }
       .td-repair-filter.active { background: #E2E4EE; border-color: #B9BFD6; color: #4A5480; }
+      .td-ticket-jobno { font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #A39A88; margin-top: -4px; }
+      .td-idline { display: flex; gap: 18px; flex-wrap: wrap; padding: 0 0 14px; font-size: 12px; color: var(--td-muted); }
+      .td-idline-item { font-family: 'IBM Plex Mono', monospace; }
+      .td-idline-item strong { font-family: inherit; font-weight: 600; color: var(--td-muted); text-transform: uppercase;
+        letter-spacing: .03em; font-size: 10.5px; margin-right: 5px; }
       .td-ticket-substage { font-size: 10.5px; font-weight: 600; color: #8A8478; letter-spacing: .01em;
         text-transform: uppercase; margin-top: 6px; }
       /* Collected in full: the card stops asking for attention. */
