@@ -48,8 +48,6 @@ const jobFromRow = (r) => ({
   substage: r.substage || "",
   flag: r.flag || "",
   ghlProjectDisplayId: r.ghl_project_display_id || null,
-  expectedFinalPayment: r.expected_final_payment === null || r.expected_final_payment === undefined
-    ? null : Number(r.expected_final_payment),
   contractAmount: Number(r.contract_amount || 0),
   startDate: toIso(r.start_date),
   targetDate: toIso(r.target_date),
@@ -109,6 +107,9 @@ const clientPaymentFromRow = (r) => ({
   date: toIso(r.payment_date),
   method: r.method,
   note: r.note || "",
+  // Set when the row was created from a GoHighLevel payment field. Rows the
+  // office enters here have none, and the integration never touches them.
+  sourceRef: r.source_ref || null,
 });
 
 const vendorPaymentFromRow = (r) => ({

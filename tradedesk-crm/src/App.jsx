@@ -1281,10 +1281,24 @@ function JobDetailModal({ ctx, job, onClose }) {
                 {[...job.clientPayments].sort((a, b) => new Date(b.date) - new Date(a.date)).map((p) => (
                   <div key={p.id} className="td-payment-row">
                     <div className="td-payment-row-main">
-                      <div className="td-payment-row-top"><span className="td-payment-amount td-text-green">{moneyDec(p.amount)}</span><span className="td-cell-sub">{p.method}</span></div>
-                      <div className="td-cell-sub">{fmtDate(p.date)}{p.note ? " · " + p.note : ""}</div>
+                      <div className="td-payment-row-top">
+                        <span className="td-payment-amount td-text-green">{moneyDec(p.amount)}</span>
+                        <span className="td-cell-sub">{p.method}</span>
+                        {p.sourceRef && <span className="td-ghl-badge" title="Kept in step with the CRM — editing it here will be overwritten on the next update">ADDED BY GHL</span>}
+                      </div>
+                      <div className="td-cell-sub">
+                        {fmtDate(p.date)}
+                        {/* The badge already says it came from GHL, so the
+                            prefix the mapper writes into the note is redundant here. */}
+                        {(() => { const n = (p.note || "").replace(/^ADDED BY GHL — ?/, ""); return n ? " · " + n : ""; })()}
+                      </div>
                     </div>
-                    <button className="td-iconbtn td-iconbtn-danger" onClick={() => { if (confirm("Delete this " + money(p.amount) + " client payment? The balance due will go back up.")) deleteClientPayment(job.id, p.id); }} aria-label="Delete payment"><Trash2 size={12} /></button>
+                    <button className="td-iconbtn td-iconbtn-danger" onClick={() => {
+                      const msg = p.sourceRef
+                        ? "Delete this " + money(p.amount) + " payment? It came from GoHighLevel, so the next update for this job will put it back — clear the field in the CRM instead if it shouldn't be there."
+                        : "Delete this " + money(p.amount) + " client payment? The balance due will go back up.";
+                      if (confirm(msg)) deleteClientPayment(job.id, p.id);
+                    }} aria-label="Delete payment"><Trash2 size={12} /></button>
                   </div>
                 ))}
               </div>
@@ -1800,6 +1814,8 @@ function GlobalStyle() {
       .td-repair-filter:hover { border-color: #C6BCA9; }
       .td-repair-filter.active { background: #E2E4EE; border-color: #B9BFD6; color: #4A5480; }
       .td-ticket-jobno { font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #A39A88; margin-top: -4px; }
+      .td-ghl-badge { font-size: 9.5px; font-weight: 700; letter-spacing: .04em; padding: 2px 6px;
+        border-radius: 3px; background: #E2E4EE; color: #4A5480; white-space: nowrap; }
       .td-idline { display: flex; gap: 18px; flex-wrap: wrap; padding: 0 0 14px; font-size: 12px; color: var(--td-muted); }
       .td-idline-item { font-family: 'IBM Plex Mono', monospace; }
       .td-idline-item strong { font-family: inherit; font-weight: 600; color: var(--td-muted); text-transform: uppercase;
