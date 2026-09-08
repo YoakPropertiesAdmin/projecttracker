@@ -1368,7 +1368,7 @@ function VendorsView({ ctx }) {
       ) : (
         <div className="td-table-wrap">
           <table className="td-table">
-            <thead><tr><th>Vendor</th><th>Category</th><th>Contact</th><th>Jobs</th><th>Total paid</th><th>Still owed</th><th></th></tr></thead>
+            <thead><tr><th>Vendor</th><th>Category</th><th># of Contracts</th><th>Total Paid</th><th>Total Owed</th><th></th></tr></thead>
             <tbody>
               {filtered.map((v) => {
                 const spend = vendorSpend[v.name] || { paid: 0, pending: 0, jobCount: 0 };
@@ -1376,7 +1376,8 @@ function VendorsView({ ctx }) {
                   <tr key={v.id} className="td-table-row" onClick={() => setShowVendorForm(v)}>
                     <td className="td-cell-name">{v.name}</td>
                     <td className="td-cell-sub">{v.category}</td>
-                    <td className="td-cell-sub">{v.phone || "—"}</td>
+                    {/* Jobs this vendor has a logged payment on — a vendor in the
+                        directory with nothing booked against them yet reads 0. */}
                     <td>{spend.jobCount}</td>
                     <td>{money(spend.paid)}</td>
                     <td className={spend.pending > 0 ? "td-text-red" : "td-cell-sub"}>{spend.pending > 0 ? money(spend.pending) : "—"}</td>

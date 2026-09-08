@@ -7,3 +7,7 @@ dist
 Thumbs.db
 desktop.ini
 *.log
+# scratch build artifacts used for visual verification
+_preview_*
+_pw.*
+_v.js
