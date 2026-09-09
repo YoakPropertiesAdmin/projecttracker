@@ -1242,36 +1242,53 @@ function JobDetailModal({ ctx, job, onClose }) {
           <span className="td-idline-item"><strong>Project #</strong> {job.ghlProjectDisplayId || "— not from GoHighLevel"}</span>
           <span className="td-idline-item"><strong>TradeDesk</strong> {jobNo(job.number)}</span>
         </div>
-        <div className="td-deal-modal-row">
-          <TradeBadge trade={job.trade} />
-          <select className="td-select" value={job.stage} onChange={(e) => updateJob(job.id, { stage: e.target.value })}>
-            {STAGES.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
-          </select>
-          <select className="td-select" value={job.trade}
-            onChange={(e) => updateJob(job.id, { trade: e.target.value })}
-            title={isUnknownTrade(job.trade) ? "This project type came from GoHighLevel and isn't in your list yet" : "Project type"}>
-            {tradeKeysFor([job]).map((k) => (
-              <option key={k} value={k}>{TRADES[k] ? TRADES[k].label : k + " (unmapped)"}</option>
-            ))}
-          </select>
-          {job.substage && <span className="td-substage-chip" title="Stage name from GoHighLevel">{job.substage}</span>}
-          <button type="button"
-            className={cls("td-hold-toggle", job.isRepair && "active")}
-            onClick={() => updateJob(job.id, { isRepair: !job.isRepair })}
-            title="Repair work rather than a full replacement">
-            <Wrench size={13} /> {job.isRepair ? "Repair" : "Mark as repair"}
-          </button>
-          <select className={cls("td-select", "td-flag-select", job.flag && "active")}
-            value={job.flag || ""}
-            onChange={(e) => updateJob(job.id, { flag: e.target.value || null })}
-            title="A marker sits alongside the stage and shows in the card corner">
-            <option value="">No marker</option>
-            {flagKeys().map((k) => <option key={k} value={k}>{JOB_FLAGS[k].label}</option>)}
-          </select>
-          <div style={{ marginLeft: "auto", textAlign: "right" }}>
-            <div className="td-field-label" style={{ marginBottom: 3 }}>Contract amount</div>
-            <input className="td-input td-input-num" style={{ width: 130, fontWeight: 700 }} type="number"
-              value={job.contractAmount} onChange={(e) => updateJob(job.id, { contractAmount: Number(e.target.value) })} />
+        {/* Two tiers rather than one row: what the job IS on top as chips, what
+            you can CHANGE below as labelled fields. Seven controls in a single
+            flex row left every select truncated ("Permitting &", "Needs
+            ordere") and wrapped the repair button onto three lines. */}
+        <div className="td-deal-head">
+          <div className="td-deal-meta">
+            <TradeBadge trade={job.trade} />
+            {job.substage && <span className="td-substage-chip" title="Stage name from GoHighLevel">{job.substage}</span>}
+            <button type="button"
+              className={cls("td-hold-toggle", job.isRepair && "active")}
+              onClick={() => updateJob(job.id, { isRepair: !job.isRepair })}
+              title="Repair work rather than a full replacement">
+              <Wrench size={13} /> {job.isRepair ? "Repair" : "Mark as repair"}
+            </button>
+          </div>
+          <div className="td-deal-fields">
+            <label className="td-deal-field">
+              <span className="td-field-label">Stage</span>
+              <select className="td-select" value={job.stage} onChange={(e) => updateJob(job.id, { stage: e.target.value })}>
+                {STAGES.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
+              </select>
+            </label>
+            <label className="td-deal-field">
+              <span className="td-field-label">Project type</span>
+              <select className="td-select" value={job.trade}
+                onChange={(e) => updateJob(job.id, { trade: e.target.value })}
+                title={isUnknownTrade(job.trade) ? "This project type came from GoHighLevel and isn't in your list yet" : "Project type"}>
+                {tradeKeysFor([job]).map((k) => (
+                  <option key={k} value={k}>{TRADES[k] ? TRADES[k].label : k + " (unmapped)"}</option>
+                ))}
+              </select>
+            </label>
+            <label className="td-deal-field">
+              <span className="td-field-label">Marker</span>
+              <select className={cls("td-select", "td-flag-select", job.flag && "active")}
+                value={job.flag || ""}
+                onChange={(e) => updateJob(job.id, { flag: e.target.value || null })}
+                title="A marker sits alongside the stage and shows in the card corner">
+                <option value="">No marker</option>
+                {flagKeys().map((k) => <option key={k} value={k}>{JOB_FLAGS[k].label}</option>)}
+              </select>
+            </label>
+            <label className="td-deal-field td-deal-field-amount">
+              <span className="td-field-label">Contract amount</span>
+              <input className="td-input td-input-num" type="number"
+                value={job.contractAmount} onChange={(e) => updateJob(job.id, { contractAmount: Number(e.target.value) })} />
+            </label>
           </div>
         </div>
 
@@ -1866,6 +1883,20 @@ function GlobalStyle() {
       .td-hold-toggle.active { background: #FDF3E3; border-color: #E6D3A6; color: #8A5A12; }
 
       .td-deal-modal-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+
+      /* Job detail header. Chips on one line, editable fields on a grid that
+         reflows instead of crushing its columns. */
+      .td-deal-head { display: flex; flex-direction: column; gap: 12px; margin-bottom: 14px; }
+      .td-deal-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+      .td-deal-fields { display: grid; gap: 10px 12px; align-items: end;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+      .td-deal-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+      /* Beat the .td-deal-modal-row/.td-filter-group width:auto rule and let the
+         grid track decide the width, so nothing truncates mid-word. */
+      .td-deal-field .td-select, .td-deal-field .td-input { width: 100%; min-width: 0; }
+      .td-deal-field-amount .td-input { font-weight: 700; }
+      .td-hold-toggle { white-space: nowrap; }
+      .td-substage-chip { white-space: nowrap; }
 
       /* ---------- Job detail ---------- */
       .td-job-detail { display: flex; flex-direction: column; gap: 4px; }
