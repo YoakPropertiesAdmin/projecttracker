@@ -108,17 +108,41 @@ function applyJobFlags(rows) {
 const flagKeys = () => Object.keys(JOB_FLAGS);
 const jobFlag = (job) => (job && job.flag ? JOB_FLAGS[job.flag] : null);
 
+// Statuses that mean the job is no longer live. Kept on the board rather than
+// hidden — the history and any money already collected still matter — but they
+// stop competing for attention with work in progress.
+const DEAD_STATUSES = { lost: "Lost", abandoned: "Abandoned" };
+const deadStatus = (job) => (job && DEAD_STATUSES[job.ghlStatus]) || null;
+
 /**
  * Column ordering. A held contract is still a contract, so it keeps its column
  * — but it is not work in motion, and leaving it interleaved with live jobs
  * makes a column of five look busier than it is. Markers whose registry row
  * sets `demote` sink to the bottom; everything else holds its existing order.
  */
+/**
+ * How far down its column a job sits. Everything that still needs someone to do
+ * something floats to the top; anything settled sinks.
+ *
+ *   0  live work
+ *   1  held (flagged demote in the registry)
+ *   2  lost or abandoned in the CRM
+ *   3  collected in full — nothing left to chase, so it goes last
+ *
+ * The practical effect in Project Complete: jobs still owing money stay at the
+ * top where the office is looking, and paid-in-full drops to the bottom.
+ */
+const settledRank = (job) => {
+  if (isPaidInFull(job)) return 3;
+  if (deadStatus(job)) return 2;
+  const f = jobFlag(job);
+  if (f && f.demote) return 1;
+  return 0;
+};
+
 const byColumnOrder = (a, b) => {
-  const fa = jobFlag(a), fb = jobFlag(b);
-  const da = fa && fa.demote ? 1 : 0;
-  const db = fb && fb.demote ? 1 : 0;
-  if (da !== db) return da - db;
+  const ra = settledRank(a), rb = settledRank(b);
+  if (ra !== rb) return ra - rb;
   return (b.number || 0) - (a.number || 0);
 };
 
@@ -1004,7 +1028,7 @@ function JobsView({ ctx }) {
             <table className="td-table">
               <thead><tr><th>Project #</th><th>Customer</th><th>Trade</th><th>Stage</th><th>Contract</th><th>Balance due</th><th>Vendor owed</th><th>Target</th></tr></thead>
               <tbody>
-                {[...visible].sort((a, b) => b.number - a.number).map((j) => {
+                {[...visible].sort(byColumnOrder).map((j) => {
                   const bal = clientBalance(j);
                   const owed = vendorPending(j);
                   return (
@@ -1025,8 +1049,8 @@ function JobsView({ ctx }) {
                       </td>
                       <td><TradeBadge trade={j.trade} size="sm" /></td>
                       <td>
-                        <StatusPill tone={j.flag === "on_hold" ? "amber" : j.stage === "closed" ? "green" : "neutral"}>
-                          {jobFlag(j) ? jobFlag(j).label : STAGES.find((s) => s.key === j.stage)?.label}
+                        <StatusPill tone={deadStatus(j) ? "red" : j.flag === "on_hold" ? "amber" : j.stage === "closed" ? "green" : "neutral"}>
+                          {deadStatus(j) || (jobFlag(j) ? jobFlag(j).label : STAGES.find((s) => s.key === j.stage)?.label)}
                         </StatusPill>
                         {j.substage && <div className="td-cell-sub">{j.substage}</div>}
                       </td>
@@ -1057,7 +1081,7 @@ function JobTicket({ job, ctx, dragging, onDragStart, onDragEnd }) {
   // job, not a step backwards, so it must not read as a fresh contract.
   return (
     <div className={cls("td-ticket", dragging && "td-ticket-dragging",
-                        paid && "td-ticket-paid")}
+                        paid && "td-ticket-paid", deadStatus(job) && "td-ticket-dead")}
       style={{ "--tc": t ? t.color : "#8A8478",
                ...(jobFlag(job) && jobFlag(job).tint ? { background: jobFlag(job).tint, borderColor: "#E6D3A6" } : {}) }}
       draggable onDragStart={onDragStart} onDragEnd={onDragEnd}
@@ -1092,8 +1116,9 @@ function JobTicket({ job, ctx, dragging, onDragStart, onDragEnd }) {
         <span className="td-ticket-value">{money(job.contractAmount)}</span>
         <span className="td-ticket-date">{fmtDateShort(job.targetDate)}</span>
       </div>
-      {(paid || bal > 0 || owed > 0 || job.isRepair) && (
+      {(paid || bal > 0 || owed > 0 || job.isRepair || deadStatus(job)) && (
         <div className="td-ticket-flags">
+          {deadStatus(job) && <span className="td-ticket-flag td-ticket-flag-red"><X size={10} /> {deadStatus(job)}</span>}
           {job.isRepair && <span className="td-ticket-flag td-ticket-flag-repair"><Wrench size={10} /> Repair</span>}
           {paid
             ? <span className="td-ticket-flag td-ticket-flag-green"><Check size={10} /> Paid in full</span>
@@ -1806,6 +1831,8 @@ function GlobalStyle() {
       .td-ticket-flag-amber { background: #F3E7C9; color: #8A6A0B; }
       .td-ticket-flag-green { background: #DCE9DA; color: #3E6B3A; }
       .td-ticket-flag-repair { background: #E2E4EE; color: #4A5480; }
+      /* Lost or abandoned: still readable, visibly not live. */
+      .td-ticket-dead { opacity: .62; }
       .td-combo-parts { display: block; color: #7A6A93; }
       .td-repair-icon { color: #4A5480; vertical-align: -2px; margin-right: 5px; }
       .td-repair-filter { display: inline-flex; align-items: center; gap: 6px; padding: 7px 11px;

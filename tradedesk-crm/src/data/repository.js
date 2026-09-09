@@ -47,6 +47,9 @@ const jobFromRow = (r) => ({
   // the column cannot express. See map_ghl_inbound in the database.
   substage: r.substage || "",
   flag: r.flag || "",
+  // GoHighLevel's opportunity status, separate from the board stage. Only
+  // 'open' jobs are managed by the sync; the rest are kept as history.
+  ghlStatus: r.ghl_status || "open",
   ghlProjectDisplayId: r.ghl_project_display_id || null,
   contractAmount: Number(r.contract_amount || 0),
   startDate: toIso(r.start_date),
@@ -74,6 +77,7 @@ const jobToRow = (j) => {
   if (j.stage !== undefined) row.stage = j.stage;
   if (j.substage !== undefined) row.substage = j.substage || null;
   if (j.flag !== undefined) row.flag = j.flag || null;
+  if (j.ghlStatus !== undefined) row.ghl_status = j.ghlStatus;
   if (j.contractAmount !== undefined) row.contract_amount = Number(j.contractAmount) || 0;
   if (j.startDate !== undefined) row.start_date = toIso(j.startDate);
   if (j.targetDate !== undefined) row.target_date = toIso(j.targetDate);
