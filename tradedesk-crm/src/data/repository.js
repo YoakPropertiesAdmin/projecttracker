@@ -54,6 +54,13 @@ const jobFromRow = (r) => ({
   contractAmount: Number(r.contract_amount || 0),
   startDate: toIso(r.start_date),
   targetDate: toIso(r.target_date),
+  // Calendar dates, not instants — passed through as "YYYY-MM-DD" rather than
+  // via toIso(), which would make them timezone-sensitive and shift the day.
+  contractSignedDate: r.contract_signed_date || null,
+  materialsOrderedDate: r.materials_ordered_date || null,
+  // When the opportunity was created in GoHighLevel. Read-only here; it is what
+  // the signed date was seeded from.
+  ghlCreatedAt: toIso(r.ghl_created_at),
   notes: r.notes || "",
   createdAt: toIso(r.created_at),
   clientPayments: [],
@@ -81,6 +88,10 @@ const jobToRow = (j) => {
   if (j.contractAmount !== undefined) row.contract_amount = Number(j.contractAmount) || 0;
   if (j.startDate !== undefined) row.start_date = toIso(j.startDate);
   if (j.targetDate !== undefined) row.target_date = toIso(j.targetDate);
+  // Written as bare "YYYY-MM-DD" (or null when cleared). No toIso(): a date
+  // column has no timezone, and converting would move it a day.
+  if (j.contractSignedDate !== undefined) row.contract_signed_date = j.contractSignedDate || null;
+  if (j.materialsOrderedDate !== undefined) row.materials_ordered_date = j.materialsOrderedDate || null;
   if (j.notes !== undefined) row.notes = j.notes || "";
   return row;
 };
@@ -160,7 +171,7 @@ const supabaseRepo = {
   mode: "supabase",
 
   async loadAll() {
-    const [jobRows, vendorRows, cpRows, vpRows, tradeRows, flagRows, payTypeRows] = await Promise.all([
+    const [jobRows, vendorRows, cpRows, vpRows, tradeRows, flagRows, payTypeRows, ageRuleRows] = await Promise.all([
       supabase.from("jobs").select("*").order("number", { ascending: false }).then(unwrap),
       supabase.from("vendors").select("*").order("name", { ascending: true }).then(unwrap),
       supabase.from("client_payments").select("*").order("payment_date", { ascending: false }).then(unwrap),
@@ -170,6 +181,7 @@ const supabaseRepo = {
       supabase.from("trades").select("*").eq("active", true).order("sort_order").then(unwrap),
       supabase.from("job_flags").select("*").order("sort_order").then(unwrap),
       supabase.from("payment_types").select("*").eq("active", true).order("sort_order").then(unwrap),
+      supabase.from("job_age_rules").select("*").eq("active", true).order("sort_order").then(unwrap),
     ]);
 
     const jobs = jobRows.map(jobFromRow);
@@ -178,7 +190,7 @@ const supabaseRepo = {
     vpRows.forEach((r) => byId.get(r.job_id)?.vendorPayments.push(vendorPaymentFromRow(r)));
 
     return { jobs, vendors: vendorRows.map(vendorFromRow), trades: tradeRows, jobFlags: flagRows,
-             paymentTypes: payTypeRows };
+             paymentTypes: payTypeRows, ageRules: ageRuleRows };
   },
 
   // Seeding is a database concern in Supabase mode, not something the browser

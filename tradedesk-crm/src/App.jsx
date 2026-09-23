@@ -161,6 +161,93 @@ const DEAD_STATUSES = { lost: "Lost", abandoned: "Abandoned" };
 const deadStatus = (job) => (job && DEAD_STATUSES[job.ghlStatus]) || null;
 
 /**
+ * Ageing rules, from the `job_age_rules` registry.
+ *
+ * A job trips a rule when its milestone date is older than the threshold AND it
+ * has not yet reached the stage the clock stops at. That second half is the
+ * point: a job that took fourteen weeks to reach Scheduled is not stalled, it
+ * is scheduled. Only work that has not moved is worth shouting about.
+ */
+const AGE_RULES = {
+  signed_stale: {
+    label: "Signed over 10 weeks ago", field: "contractSignedDate", weeks: 10,
+    emoji: "🚩", stopsAt: "scheduled", sort: 10,
+    prompt: "No contract signed date — set it so this job is tracked for ageing.",
+  },
+  materials_stale: {
+    label: "Materials ordered over 16 weeks ago", field: "materialsOrderedDate", weeks: 16,
+    emoji: "🟡", stopsAt: "scheduled", sort: 20,
+    prompt: "No materials ordered date — set it once materials go on order.",
+  },
+};
+
+const AGE_FIELD_BY_COLUMN = {
+  contract_signed_date: "contractSignedDate",
+  materials_ordered_date: "materialsOrderedDate",
+};
+
+function applyAgeRules(rows) {
+  if (!rows || !rows.length) return;
+  Object.keys(AGE_RULES).forEach((k) => delete AGE_RULES[k]);
+  rows.forEach((r) => {
+    AGE_RULES[r.key] = {
+      label: r.label,
+      field: AGE_FIELD_BY_COLUMN[r.date_field] || r.date_field,
+      weeks: Number(r.weeks) || 0,
+      emoji: r.emoji || "🚩",
+      stopsAt: r.stops_at_stage || "scheduled",
+      prompt: r.missing_date_prompt || "",
+      sort: r.sort_order ?? 100,
+    };
+  });
+}
+
+const ageRuleKeys = () => Object.keys(AGE_RULES).sort((a, b) => AGE_RULES[a].sort - AGE_RULES[b].sort);
+
+/** Position in the board order, so "has it reached Scheduled yet" is a comparison. */
+const stageIndex = (key) => {
+  const i = STAGES.findIndex((s) => s.key === key);
+  return i === -1 ? 0 : i;
+};
+
+/** Whole weeks since a date. null when there is no usable date to count from. */
+const weeksSince = (v) => {
+  const d = parseDate(v);
+  if (!d) return null;
+  const ms = Date.now() - d.getTime();
+  if (ms < 0) return 0;
+  return Math.floor(ms / 604800000);
+};
+
+/** Which rules this job is currently in breach of. */
+function ageFlags(job) {
+  if (!job || deadStatus(job)) return [];
+  const here = stageIndex(job.stage);
+  const out = [];
+  ageRuleKeys().forEach((k) => {
+    const r = AGE_RULES[k];
+    if (here >= stageIndex(r.stopsAt)) return;
+    const w = weeksSince(job[r.field]);
+    if (w === null || w < r.weeks) return;
+    out.push({ key: k, weeksElapsed: w, ...r });
+  });
+  return out;
+}
+
+/**
+ * Rules that cannot be evaluated because the date is missing, while the job is
+ * still at a stage where the rule would apply. This is what makes the gap
+ * visible rather than letting an undated job quietly pass as "not late".
+ */
+function ageDateGaps(job) {
+  if (!job || deadStatus(job)) return [];
+  const here = stageIndex(job.stage);
+  return ageRuleKeys()
+    .map((k) => ({ key: k, ...AGE_RULES[k] }))
+    .filter((r) => here < stageIndex(r.stopsAt) && !r.field.startsWith("__") && !job[r.field]);
+}
+
+/**
  * Column ordering. A held contract is still a contract, so it keeps its column
  * — but it is not work in motion, and leaving it interleaved with live jobs
  * makes a column of five look busier than it is. Markers whose registry row
@@ -420,6 +507,15 @@ function useJobTrackerData() {
   const [data, setDataState] = useState(null);
   const [status, setStatus] = useState("loading"); // loading | ready
   const [loadError, setLoadError] = useState("");
+  // The ageing counters are derived from the clock, not from state, so a board
+  // left open overnight would keep showing yesterday's week count and could sit
+  // one day short of a flag indefinitely. One timer for the whole app rather
+  // than one per card.
+  const [, setAgeTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setAgeTick((n) => n + 1), 30 * 60 * 1000);
+    return () => clearInterval(t);
+  }, []);
 
   // One read of the four tables, assembled by the repository into the nested
   // shape the views already expect. Also used to re-sync after a failed write.
@@ -432,6 +528,7 @@ function useJobTrackerData() {
         applyTrades(loaded.trades);
         applyJobFlags(loaded.jobFlags);
         applyPaymentTypes(loaded.paymentTypes);
+        applyAgeRules(loaded.ageRules);
         setDataState(loaded);
       } else {
         // Nothing stored at all. Only reachable in the localStorage dev
@@ -1124,18 +1221,33 @@ function JobTicket({ job, ctx, dragging, onDragStart, onDragEnd }) {
   const bal = clientBalance(job);
   const owed = vendorPending(job);
   const paid = isPaidInFull(job);
+  // Stalled past a threshold and still short of Scheduled. Overrides the hold
+  // tint below: a held job that has also gone quiet for ten weeks is the more
+  // urgent fact, and two pale washes fighting each other says neither.
+  const overdue = ageFlags(job);
+  const isOverdue = overdue.length > 0;
   // A held job keeps its column and gets a marker — a hold is a fact about the
   // job, not a step backwards, so it must not read as a fresh contract.
   return (
     <div className={cls("td-ticket", dragging && "td-ticket-dragging",
-                        paid && "td-ticket-paid", deadStatus(job) && "td-ticket-dead")}
+                        paid && "td-ticket-paid", deadStatus(job) && "td-ticket-dead",
+                        isOverdue && "td-ticket-overdue")}
       style={{ "--tc": t ? t.color : "#8A8478",
-               ...(jobFlag(job) && jobFlag(job).tint ? { background: jobFlag(job).tint, borderColor: "#E6D3A6" } : {}) }}
+               ...(jobFlag(job) && jobFlag(job).tint ? { background: jobFlag(job).tint, borderColor: "#E6D3A6" } : {}),
+               ...(isOverdue ? { background: "#FBE0DA", borderColor: "#C25B47" } : {}) }}
       draggable onDragStart={onDragStart} onDragEnd={onDragEnd}
       onClick={() => ctx.setSelectedJobId(job.id)}>
-      {jobFlag(job) && (
-        <span className="td-ticket-flagmark" style={{ color: jobFlag(job).color }} title={jobFlag(job).label}>
-          {React.createElement(jobFlag(job).icon, { size: 13, strokeWidth: 2.6 })}
+      {(jobFlag(job) || isOverdue) && (
+        <span className="td-ticket-flagmark">
+          {overdue.map((r) => (
+            <span key={r.key} className="td-age-emoji"
+              title={r.label + " — " + r.weeksElapsed + " weeks, still not scheduled"}>{r.emoji}</span>
+          ))}
+          {jobFlag(job) && (
+            <span style={{ color: jobFlag(job).color, display: "inline-flex" }} title={jobFlag(job).label}>
+              {React.createElement(jobFlag(job).icon, { size: 13, strokeWidth: 2.6 })}
+            </span>
+          )}
         </span>
       )}
       <div className="td-ticket-head">
@@ -1163,8 +1275,15 @@ function JobTicket({ job, ctx, dragging, onDragStart, onDragEnd }) {
         <span className="td-ticket-value">{money(job.contractAmount)}</span>
         <span className="td-ticket-date">{fmtDateShort(job.targetDate)}</span>
       </div>
-      {(paid || bal > 0 || owed > 0 || job.isRepair || deadStatus(job)) && (
+      {(paid || bal > 0 || owed > 0 || job.isRepair || deadStatus(job) || isOverdue) && (
         <div className="td-ticket-flags">
+          {/* The counter, not just the flag: "14w since signed" tells you how
+              bad it is, where a red card only tells you that it is bad. */}
+          {overdue.map((r) => (
+            <span key={r.key} className="td-ticket-flag td-ticket-flag-overdue" title={r.label}>
+              {r.emoji} {r.weeksElapsed}w since {r.field === "materialsOrderedDate" ? "ordered" : "signed"}
+            </span>
+          ))}
           {deadStatus(job) && <span className="td-ticket-flag td-ticket-flag-red"><X size={10} /> {deadStatus(job)}</span>}
           {job.isRepair && <span className="td-ticket-flag td-ticket-flag-repair"><Wrench size={10} /> Repair</span>}
           {paid
@@ -1344,7 +1463,21 @@ function JobDetailModal({ ctx, job, onClose }) {
               <input className="td-input td-input-num" type="number"
                 value={job.contractAmount} onChange={(e) => updateJob(job.id, { contractAmount: Number(e.target.value) })} />
             </label>
+            <label className="td-deal-field">
+              <span className="td-field-label">Contract signed</span>
+              {/* Bare YYYY-MM-DD both ways. A date input speaks that natively and
+                  the column is a DATE, so nothing converts and nothing shifts. */}
+              <input className="td-input" type="date" value={job.contractSignedDate || ""}
+                onChange={(e) => updateJob(job.id, { contractSignedDate: e.target.value || null })} />
+            </label>
+            <label className="td-deal-field">
+              <span className="td-field-label">Materials ordered</span>
+              <input className="td-input" type="date" value={job.materialsOrderedDate || ""}
+                onChange={(e) => updateJob(job.id, { materialsOrderedDate: e.target.value || null })} />
+            </label>
           </div>
+
+          <JobAgeStatus job={job} />
         </div>
 
         <div className="td-info-row"><Building2 size={14} /> {job.customerAddress}</div>
@@ -1567,6 +1700,53 @@ function VendorFormModal({ initial, onClose, onSave }) {
         </div>
       </div>
     </Modal>
+  );
+}
+
+/**
+ * Ageing status for one job: how long each clock has been running, which rules
+ * have tripped, and — the part the office actually needs — a prompt for any
+ * date that is missing while its rule could still apply. An undated job is not
+ * a job that is on time; it is a job nobody is measuring.
+ */
+function JobAgeStatus({ job }) {
+  const tripped = ageFlags(job);
+  const gaps = ageDateGaps(job);
+  const scheduled = stageIndex(job.stage) >= stageIndex("scheduled");
+  const counters = ageRuleKeys()
+    .map((k) => ({ key: k, ...AGE_RULES[k] }))
+    .map((r) => ({ ...r, weeksElapsed: weeksSince(job[r.field]) }))
+    .filter((r) => r.weeksElapsed !== null);
+
+  if (!counters.length && !gaps.length) return null;
+
+  return (
+    <div className={cls("td-age-panel", tripped.length && "td-age-panel-hot")}>
+      {counters.map((r) => {
+        const hit = tripped.find((t) => t.key === r.key);
+        return (
+          <div key={r.key} className="td-age-item">
+            <span className="td-field-label">
+              {r.field === "materialsOrderedDate" ? "Since materials ordered" : "Since contract signed"}
+            </span>
+            <strong className={hit ? "td-text-red" : undefined}>
+              {hit && <span className="td-age-emoji">{r.emoji} </span>}
+              {r.weeksElapsed}w
+            </strong>
+            <span className="td-cell-sub">
+              {hit ? "past the " + r.weeks + "w mark"
+                   : scheduled ? "clock stopped at Scheduled"
+                   : r.weeks - r.weeksElapsed + "w before it flags"}
+            </span>
+          </div>
+        );
+      })}
+      {gaps.map((r) => (
+        <div key={r.key} className="td-age-gap">
+          <AlertTriangle size={13} /> <span>{r.prompt}</span>
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -2505,6 +2685,24 @@ function GlobalStyle() {
       .td-hold-toggle.active { background: #FDF3E3; border-color: #E6D3A6; color: #8A5A12; }
 
       .td-deal-modal-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+
+      /* ---------- Ageing: stalled jobs ---------- */
+      /* Strong enough to find across a full column at a glance, light enough
+         that the figures on the card stay readable. */
+      .td-ticket-overdue { box-shadow: 0 0 0 1px #C25B47 inset, 0 1px 3px rgba(178,58,46,.18); }
+      .td-ticket-flag-overdue { background: #F6CFC6; color: #8C2D1C; }
+      .td-age-emoji { font-size: 12px; line-height: 1; filter: saturate(1.1); }
+      .td-ticket-flagmark { gap: 3px; align-items: center; }
+      .td-age-panel { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 18px;
+        padding: 10px 13px; margin-top: 2px; border: 1px solid var(--td-border);
+        border-radius: var(--td-radius); background: #FBF9F5; }
+      .td-age-panel-hot { background: #FDEEEA; border-color: #E0B3A8; }
+      .td-age-item { display: flex; flex-direction: column; gap: 2px; }
+      .td-age-item strong { font-family: 'IBM Plex Mono', monospace; font-size: 15px; font-weight: 700; }
+      .td-age-gap { display: flex; align-items: center; gap: 7px; width: 100%;
+        padding: 8px 10px; border-radius: 7px; background: #F3E7C9; color: #8A6A0B;
+        font-size: 12.5px; font-weight: 600; }
+      .td-age-gap svg { flex: none; }
 
       /* ---------- Reports: the transaction report builder ---------- */
       .td-report { margin-bottom: 16px; }
