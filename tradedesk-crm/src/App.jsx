@@ -1582,38 +1582,53 @@ function VendorFormModal({ initial, onClose, onSave }) {
    grouping and a single export can serve client money in and vendor money out.
    ========================================================================= */
 
-/** Local midnight. Date-only strings parse as UTC, which shifts the day back
- *  in every US timezone — a payment on the 1st would land in the previous
- *  month's report. */
-const dayStart = (d) => {
-  const x = d instanceof Date ? new Date(d) : new Date(d + "T00:00:00");
-  x.setHours(0, 0, 0, 0);
-  return x;
+/**
+ * One parser for every date the reports touch, because they arrive in two
+ * shapes and the difference is not cosmetic:
+ *
+ *   "2026-09-07"                 a date input. Parsed bare it is read as UTC,
+ *                                which in every US timezone lands on the 6th —
+ *                                so a payment on the 1st would fall into the
+ *                                previous month's report. Pinned to LOCAL
+ *                                midnight instead.
+ *   "2026-09-07T14:23:00.000Z"   a stored payment timestamp. Already absolute;
+ *                                hand it to Date untouched.
+ *
+ * Returns null rather than an Invalid Date, so a bad value is something callers
+ * must handle instead of a RangeError thrown deep inside a render.
+ */
+const parseDate = (v) => {
+  if (v === null || v === undefined || v === "") return null;
+  let d;
+  if (v instanceof Date) d = new Date(v.getTime());
+  else if (typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v)) d = new Date(v + "T00:00:00");
+  else d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
 };
-const dayEnd = (d) => {
-  const x = dayStart(d);
-  x.setHours(23, 59, 59, 999);
-  return x;
+
+const dayStart = (v) => { const d = parseDate(v); if (!d) return null; d.setHours(0, 0, 0, 0); return d; };
+const dayEnd = (v) => { const d = dayStart(v); if (!d) return null; d.setHours(23, 59, 59, 999); return d; };
+const isoDay = (v) => {
+  const d = parseDate(v);
+  if (!d) return "";
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
 };
-const isoDay = (d) => {
-  const x = d instanceof Date ? d : new Date(d);
-  return new Date(x.getTime() - x.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
-};
-const addDaysTo = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+const addDaysTo = (v, n) => { const d = parseDate(v); if (!d) return null; d.setDate(d.getDate() + n); return d; };
 
 /** Monday-start weeks: the office thinks in work weeks, not Sunday weeks. */
-const startOfWeek = (d) => {
-  const x = dayStart(d);
-  const dow = (x.getDay() + 6) % 7;
-  return addDaysTo(x, -dow);
+const startOfWeek = (v) => {
+  const d = dayStart(v);
+  if (!d) return null;
+  return addDaysTo(d, -((d.getDay() + 6) % 7));
 };
-const startOfMonth = (d) => { const x = dayStart(d); x.setDate(1); return x; };
-const startOfQuarter = (d) => {
-  const x = startOfMonth(d);
-  x.setMonth(Math.floor(x.getMonth() / 3) * 3);
-  return x;
+const startOfMonth = (v) => { const d = dayStart(v); if (!d) return null; d.setDate(1); return d; };
+const startOfQuarter = (v) => {
+  const d = startOfMonth(v);
+  if (!d) return null;
+  d.setMonth(Math.floor(d.getMonth() / 3) * 3);
+  return d;
 };
-const startOfYear = (d) => { const x = startOfMonth(d); x.setMonth(0); return x; };
+const startOfYear = (v) => { const d = startOfMonth(v); if (!d) return null; d.setMonth(0); return d; };
 
 /** Named ranges. Each returns [from, to] as date-only strings. */
 const DATE_PRESETS = {
@@ -1630,43 +1645,58 @@ const DATE_PRESETS = {
   custom:       { label: "Custom range…", range: null },
 };
 
+/**
+ * Every key function receives the row's already-parsed Date as `when`, so the
+ * grouping pass never re-parses and never meets a bad value — rows without a
+ * usable date are dropped when the ledger is flattened, not here.
+ */
 const GROUPINGS = {
-  none:    { label: "No grouping", key: () => "All", sort: () => 0 },
-  day:     { label: "By day",      key: (d) => isoDay(dayStart(d)) },
-  week:    { label: "By week",     key: (d) => isoDay(startOfWeek(d)) },
-  month:   { label: "By month",    key: (d) => isoDay(startOfMonth(d)) },
-  quarter: { label: "By quarter",  key: (d) => isoDay(startOfQuarter(d)) },
-  year:    { label: "By year",     key: (d) => isoDay(startOfYear(d)) },
-  type:    { label: "By payment type", key: (d, r) => r.typeLabel },
-  method:  { label: "By method",   key: (d, r) => r.method || "—" },
-  trade:   { label: "By trade",    key: (d, r) => r.tradeLabel },
-  customer:{ label: "By customer", key: (d, r) => r.customer },
-  vendor:  { label: "By vendor",   key: (d, r) => r.vendor || "—" },
+  none:    { label: "No grouping", key: () => "All" },
+  day:     { label: "By day",      key: (when) => isoDay(dayStart(when)) },
+  week:    { label: "By week",     key: (when) => isoDay(startOfWeek(when)) },
+  month:   { label: "By month",    key: (when) => isoDay(startOfMonth(when)) },
+  quarter: { label: "By quarter",  key: (when) => isoDay(startOfQuarter(when)) },
+  year:    { label: "By year",     key: (when) => isoDay(startOfYear(when)) },
+  type:    { label: "By payment type", key: (when, r) => r.typeLabel },
+  method:  { label: "By method",   key: (when, r) => r.method || "—" },
+  trade:   { label: "By trade",    key: (when, r) => r.tradeLabel },
+  customer:{ label: "By customer", key: (when, r) => r.customer || "—" },
+  vendor:  { label: "By vendor",   key: (when, r) => r.vendor || "—" },
 };
 
 /** How a group key reads once grouped — "2026-09-07" means little on its own. */
 function groupLabel(groupBy, key) {
-  if (groupBy === "week") {
-    const s = dayStart(key);
-    return "Week of " + s.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
-  }
-  if (groupBy === "month") return dayStart(key).toLocaleDateString(undefined, { month: "long", year: "numeric" });
-  if (groupBy === "quarter") { const s = dayStart(key); return "Q" + (Math.floor(s.getMonth() / 3) + 1) + " " + s.getFullYear(); }
-  if (groupBy === "year") return String(dayStart(key).getFullYear());
-  if (groupBy === "day") return dayStart(key).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  const d = dayStart(key);
+  if (!d) return key || "—";
+  if (groupBy === "week") return "Week of " + d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  if (groupBy === "month") return d.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+  if (groupBy === "quarter") return "Q" + (Math.floor(d.getMonth() / 3) + 1) + " " + d.getFullYear();
+  if (groupBy === "year") return String(d.getFullYear());
+  if (groupBy === "day") return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
   return key;
 }
 
 /**
  * Flatten both ledgers into one list of comparable rows. Direction is what
  * keeps them straight: client payments are money in, vendor costs money out.
+ *
+ * The date is parsed ONCE here, into `when`. A payment whose date will not
+ * parse is counted and left out rather than carried forward — a date-less row
+ * cannot belong to any period, and letting one reach the grouping pass is what
+ * turned this whole page blank on 2026-09-23.
  */
 function buildLedgerRows(jobs) {
   const rows = [];
+  let undated = 0;
+  const push = (row) => {
+    const when = parseDate(row.date);
+    if (!when) { undated += 1; return; }
+    rows.push({ ...row, when });
+  };
   jobs.forEach((j) => {
     const tradeLabel = TRADES[j.trade] ? TRADES[j.trade].label : (j.trade || "—");
     const stageLabel = (STAGES.find((s) => s.key === j.stage) || {}).label || j.stage;
-    (j.clientPayments || []).forEach((p) => rows.push({
+    (j.clientPayments || []).forEach((p) => push({
       id: p.id, direction: "in", ledger: "Client payment",
       date: p.date, amount: Number(p.amount || 0),
       typeKey: p.paymentType || null, typeLabel: paymentTypeLabel(p.paymentType),
@@ -1676,7 +1706,7 @@ function buildLedgerRows(jobs) {
       tradeKey: j.trade, tradeLabel, stageKey: j.stage, stageLabel,
       fromCrm: Boolean(p.sourceRef), note: (p.note || "").replace(/^ADDED BY GHL — ?/, ""),
     }));
-    (j.vendorPayments || []).forEach((p) => rows.push({
+    (j.vendorPayments || []).forEach((p) => push({
       id: p.id, direction: "out", ledger: "Vendor cost",
       date: p.date, amount: Number(p.amount || 0),
       typeKey: null, typeLabel: p.category || "—",
@@ -1688,7 +1718,7 @@ function buildLedgerRows(jobs) {
       fromCrm: false, note: p.note || "",
     }));
   });
-  return rows;
+  return { rows, undated };
 }
 
 /* ---- export ---------------------------------------------------------- */
@@ -1909,13 +1939,13 @@ function TransactionReport({ jobs }) {
     return [dayStart(a), dayEnd(b)];
   }, [preset, customFrom, customTo]);
 
-  const allRows = useMemo(() => buildLedgerRows(jobs), [jobs]);
+  const { rows: allRows, undated } = useMemo(() => buildLedgerRows(jobs), [jobs]);
 
   const rows = useMemo(() => {
     const q = search.trim().toLowerCase();
+    if (!from || !to) return [];
     return allRows.filter((r) => {
-      const d = new Date(r.date);
-      if (!(d >= from && d <= to)) return false;
+      if (!(r.when >= from && r.when <= to)) return false;
       if (direction !== "both" && r.direction !== direction) return false;
       if (fType && r.typeKey !== fType) return false;
       if (fMethod && r.method !== fMethod) return false;
@@ -1931,14 +1961,14 @@ function TransactionReport({ jobs }) {
                  jobNo(r.jobNumber).toLowerCase().includes(q) ||
                  String(r.projectRef).toLowerCase().includes(q))) return false;
       return true;
-    }).sort((a, b) => new Date(b.date) - new Date(a.date));
+    }).sort((a, b) => b.when - a.when);
   }, [allRows, from, to, direction, fType, fMethod, fTrade, fStage, fVendor, fCategory, fStatus, search]);
 
   const groups = useMemo(() => {
     const g = GROUPINGS[groupBy] || GROUPINGS.none;
     const map = new Map();
     rows.forEach((r) => {
-      const key = g.key(r.date, r);
+      const key = g.key(r.when, r);
       const e = map.get(key) || { key, count: 0, moneyIn: 0, moneyOut: 0 };
       e.count += 1;
       if (r.direction === "in") e.moneyIn += r.amount; else e.moneyOut += r.amount;
@@ -2105,8 +2135,14 @@ function TransactionReport({ jobs }) {
         {direction !== "out" && <div><span className="td-field-label">Money in</span><strong className="td-text-green">{money(totalIn)}</strong></div>}
         {direction !== "in" && <div><span className="td-field-label">Money out</span><strong className="td-text-red">{money(totalOut)}</strong></div>}
         {direction === "both" && <div><span className="td-field-label">Net</span><strong className={totalIn - totalOut < 0 ? "td-text-red" : "td-text-green"}>{money(totalIn - totalOut)}</strong></div>}
+        {undated > 0 && (
+          <div title="These have no usable payment date, so they cannot belong to any period.">
+            <span className="td-field-label">Undated</span>
+            <strong className="td-text-red">{undated}</strong>
+          </div>
+        )}
         <div className="td-report-range">
-          {isoDay(from)} → {isoDay(to)}
+          {from && to ? isoDay(from) + " → " + isoDay(to) : "Pick a valid date range"}
         </div>
       </div>
 
