@@ -8,7 +8,8 @@ import {
   ChevronDown, ChevronRight, Trash2, Pencil,
   AlertTriangle, Tag, Building2, Menu, ClipboardList, RefreshCw,
   Wallet, HandCoins, Percent, Calendar as CalendarIcon, LogOut,
-  Hammer, Wrench, PaintBucket, Droplets, Thermometer, PackageCheck, ShoppingCart
+  Hammer, Wrench, PaintBucket, Droplets, Thermometer, PackageCheck, ShoppingCart,
+  Download, FileSpreadsheet, SlidersHorizontal, ArrowDownUp
 } from "lucide-react";
 
 /* =========================================================================
@@ -107,6 +108,51 @@ function applyJobFlags(rows) {
 
 const flagKeys = () => Object.keys(JOB_FLAGS);
 const jobFlag = (job) => (job && job.flag ? JOB_FLAGS[job.flag] : null);
+
+/**
+ * Client payment classifications, from the `payment_types` registry. Same
+ * mutable-module pattern as the trade and flag registries: rewritten from the
+ * database immediately before the state update that renders it.
+ *
+ * These exist because "how much did we take in deposits last week" cannot be
+ * answered from a payment method — Check, Financing and Cash say how the money
+ * arrived, not what it was for.
+ */
+const PAYMENT_TYPES = {
+  initial_deposit: { label: "Initial deposit", sort: 10 },
+  second_deposit: { label: "Second deposit", sort: 20 },
+  progress: { label: "Progress payment", sort: 30 },
+  final_payment: { label: "Final payment", sort: 40 },
+  other: { label: "Other", sort: 90 },
+};
+
+function applyPaymentTypes(rows) {
+  if (!rows || !rows.length) return;
+  Object.keys(PAYMENT_TYPES).forEach((k) => delete PAYMENT_TYPES[k]);
+  rows.forEach((r) => { PAYMENT_TYPES[r.key] = { label: r.label, sort: r.sort_order ?? 100 }; });
+}
+
+const paymentTypeKeys = () =>
+  Object.keys(PAYMENT_TYPES).sort((a, b) => PAYMENT_TYPES[a].sort - PAYMENT_TYPES[b].sort);
+
+const paymentTypeLabel = (key) =>
+  (key && PAYMENT_TYPES[key] ? PAYMENT_TYPES[key].label : "Unclassified");
+
+/**
+ * What a new payment on this job most likely is. The office can override it,
+ * but defaulting to blank would mean most rows never get classified — and an
+ * unclassified ledger is exactly what made deposit reporting impossible.
+ */
+function suggestPaymentType(job, amount) {
+  const existing = (job && job.clientPayments) || [];
+  const already = existing.reduce((s, p) => s + Number(p.amount || 0), 0);
+  const contract = Number((job && job.contractAmount) || 0);
+  const amt = Number(amount || 0);
+  if (contract > 0 && amt > 0 && already + amt >= contract - 0.01) return "final_payment";
+  if (existing.length === 0) return "initial_deposit";
+  if (existing.length === 1) return "second_deposit";
+  return "progress";
+}
 
 // Statuses that mean the job is no longer live. Kept on the board rather than
 // hidden — the history and any money already collected still matter — but they
@@ -385,6 +431,7 @@ function useJobTrackerData() {
         // so no render observes a half-applied list.
         applyTrades(loaded.trades);
         applyJobFlags(loaded.jobFlags);
+        applyPaymentTypes(loaded.paymentTypes);
         setDataState(loaded);
       } else {
         // Nothing stored at all. Only reachable in the localStorage dev
@@ -1180,7 +1227,7 @@ function JobFormModal({ onClose, onSave }) {
 function JobDetailModal({ ctx, job, onClose }) {
   const { updateJob, deleteJob, addClientPayment, deleteClientPayment, addVendorPayment, updateVendorPayment, deleteVendorPayment, vendorNames } = ctx;
   const [notes, setNotes] = useState(job?.notes || "");
-  const [cpForm, setCpForm] = useState({ amount: "", date: new Date().toISOString().slice(0, 10), method: PAYMENT_METHODS[0], note: "" });
+  const [cpForm, setCpForm] = useState({ amount: "", date: new Date().toISOString().slice(0, 10), method: PAYMENT_METHODS[0], note: "", paymentType: "" });
   const [vpForm, setVpForm] = useState({ vendorName: "", category: VENDOR_CATEGORIES[0], amount: "", date: new Date().toISOString().slice(0, 10), status: "pending", note: "" });
 
   if (!job) return null;
@@ -1206,8 +1253,16 @@ function JobDetailModal({ ctx, job, onClose }) {
       "That's normal after a change order — but if the contract amount should be higher, " +
       "update it first so the margin numbers stay right.\n\nLog the payment anyway?"
     )) return;
-    addClientPayment(job.id, { amount: cpAmount, date: new Date(cpForm.date).toISOString(), method: cpForm.method, note: cpForm.note.trim() });
-    setCpForm({ amount: "", date: new Date().toISOString().slice(0, 10), method: cpForm.method, note: "" });
+    addClientPayment(job.id, {
+      amount: cpAmount,
+      date: new Date(cpForm.date).toISOString(),
+      method: cpForm.method,
+      note: cpForm.note.trim(),
+      // Blank means the office never touched the dropdown, so fall back to the
+      // suggestion rather than filing an unclassified row.
+      paymentType: cpForm.paymentType || suggestPaymentType(job, cpAmount),
+    });
+    setCpForm({ amount: "", date: new Date().toISOString().slice(0, 10), method: cpForm.method, note: "", paymentType: "" });
   };
 
   // Mirror of the client-payment guard, on the cost side. Margin counts paid
@@ -1325,6 +1380,7 @@ function JobDetailModal({ ctx, job, onClose }) {
                     <div className="td-payment-row-main">
                       <div className="td-payment-row-top">
                         <span className="td-payment-amount td-text-green">{moneyDec(p.amount)}</span>
+                        <span className="td-paytype-chip">{paymentTypeLabel(p.paymentType)}</span>
                         <span className="td-cell-sub">{p.method}</span>
                         {p.sourceRef && <span className="td-ghl-badge" title="Kept in step with the CRM — editing it here will be overwritten on the next update">ADDED BY GHL</span>}
                       </div>
@@ -1351,9 +1407,18 @@ function JobDetailModal({ ctx, job, onClose }) {
                 <input className="td-input" type="date" value={cpForm.date} onChange={(e) => setCpForm((f) => ({ ...f, date: e.target.value }))} />
               </div>
               <div className="td-payment-form-row">
+                {/* What the money WAS (deposit, final) as well as how it arrived
+                    (check, financing). The reports group by the first. */}
+                <select className="td-select" value={cpForm.paymentType || suggestPaymentType(job, cpAmount)}
+                  onChange={(e) => setCpForm((f) => ({ ...f, paymentType: e.target.value }))}
+                  title="What this payment is. Suggested from the job's history — change it if that's wrong.">
+                  {paymentTypeKeys().map((k) => <option key={k} value={k}>{PAYMENT_TYPES[k].label}</option>)}
+                </select>
                 <select className="td-select" value={cpForm.method} onChange={(e) => setCpForm((f) => ({ ...f, method: e.target.value }))}>
                   {PAYMENT_METHODS.map((m) => <option key={m} value={m}>{m}</option>)}
                 </select>
+              </div>
+              <div className="td-payment-form-row">
                 <input className="td-input" placeholder="Note (optional)" value={cpForm.note} onChange={(e) => setCpForm((f) => ({ ...f, note: e.target.value }))} />
               </div>
               {cpOverage > 0 && (
@@ -1506,8 +1571,215 @@ function VendorFormModal({ initial, onClose, onSave }) {
 }
 
 /* =========================================================================
-   REPORTS
+   REPORTS — transaction reporting
+   -------------------------------------------------------------------------
+   The dashboard below answers "where do we stand right now". This part answers
+   "what happened between these two dates", which is a different question and
+   needs a different shape: every payment row is a fact with a date, and the
+   report is a filter plus a grouping over those facts.
+
+   Both ledgers are folded into one row type so a single filter, a single
+   grouping and a single export can serve client money in and vendor money out.
    ========================================================================= */
+
+/** Local midnight. Date-only strings parse as UTC, which shifts the day back
+ *  in every US timezone — a payment on the 1st would land in the previous
+ *  month's report. */
+const dayStart = (d) => {
+  const x = d instanceof Date ? new Date(d) : new Date(d + "T00:00:00");
+  x.setHours(0, 0, 0, 0);
+  return x;
+};
+const dayEnd = (d) => {
+  const x = dayStart(d);
+  x.setHours(23, 59, 59, 999);
+  return x;
+};
+const isoDay = (d) => {
+  const x = d instanceof Date ? d : new Date(d);
+  return new Date(x.getTime() - x.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+};
+const addDaysTo = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+
+/** Monday-start weeks: the office thinks in work weeks, not Sunday weeks. */
+const startOfWeek = (d) => {
+  const x = dayStart(d);
+  const dow = (x.getDay() + 6) % 7;
+  return addDaysTo(x, -dow);
+};
+const startOfMonth = (d) => { const x = dayStart(d); x.setDate(1); return x; };
+const startOfQuarter = (d) => {
+  const x = startOfMonth(d);
+  x.setMonth(Math.floor(x.getMonth() / 3) * 3);
+  return x;
+};
+const startOfYear = (d) => { const x = startOfMonth(d); x.setMonth(0); return x; };
+
+/** Named ranges. Each returns [from, to] as date-only strings. */
+const DATE_PRESETS = {
+  this_week:    { label: "This week",     range: () => [startOfWeek(new Date()), new Date()] },
+  last_week:    { label: "Last week",     range: () => { const s = addDaysTo(startOfWeek(new Date()), -7); return [s, addDaysTo(s, 6)]; } },
+  this_month:   { label: "This month",    range: () => [startOfMonth(new Date()), new Date()] },
+  last_month:   { label: "Last month",    range: () => { const s = startOfMonth(new Date()); s.setMonth(s.getMonth() - 1); const e = startOfMonth(new Date()); return [s, addDaysTo(e, -1)]; } },
+  last_30:      { label: "Last 30 days",  range: () => [addDaysTo(new Date(), -29), new Date()] },
+  last_90:      { label: "Last 90 days",  range: () => [addDaysTo(new Date(), -89), new Date()] },
+  this_quarter: { label: "This quarter",  range: () => [startOfQuarter(new Date()), new Date()] },
+  ytd:          { label: "Year to date",  range: () => [startOfYear(new Date()), new Date()] },
+  last_year:    { label: "Last year",     range: () => { const s = startOfYear(new Date()); s.setFullYear(s.getFullYear() - 1); const e = startOfYear(new Date()); return [s, addDaysTo(e, -1)]; } },
+  all:          { label: "All time",      range: () => [new Date(2000, 0, 1), new Date()] },
+  custom:       { label: "Custom range…", range: null },
+};
+
+const GROUPINGS = {
+  none:    { label: "No grouping", key: () => "All", sort: () => 0 },
+  day:     { label: "By day",      key: (d) => isoDay(dayStart(d)) },
+  week:    { label: "By week",     key: (d) => isoDay(startOfWeek(d)) },
+  month:   { label: "By month",    key: (d) => isoDay(startOfMonth(d)) },
+  quarter: { label: "By quarter",  key: (d) => isoDay(startOfQuarter(d)) },
+  year:    { label: "By year",     key: (d) => isoDay(startOfYear(d)) },
+  type:    { label: "By payment type", key: (d, r) => r.typeLabel },
+  method:  { label: "By method",   key: (d, r) => r.method || "—" },
+  trade:   { label: "By trade",    key: (d, r) => r.tradeLabel },
+  customer:{ label: "By customer", key: (d, r) => r.customer },
+  vendor:  { label: "By vendor",   key: (d, r) => r.vendor || "—" },
+};
+
+/** How a group key reads once grouped — "2026-09-07" means little on its own. */
+function groupLabel(groupBy, key) {
+  if (groupBy === "week") {
+    const s = dayStart(key);
+    return "Week of " + s.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  }
+  if (groupBy === "month") return dayStart(key).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+  if (groupBy === "quarter") { const s = dayStart(key); return "Q" + (Math.floor(s.getMonth() / 3) + 1) + " " + s.getFullYear(); }
+  if (groupBy === "year") return String(dayStart(key).getFullYear());
+  if (groupBy === "day") return dayStart(key).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  return key;
+}
+
+/**
+ * Flatten both ledgers into one list of comparable rows. Direction is what
+ * keeps them straight: client payments are money in, vendor costs money out.
+ */
+function buildLedgerRows(jobs) {
+  const rows = [];
+  jobs.forEach((j) => {
+    const tradeLabel = TRADES[j.trade] ? TRADES[j.trade].label : (j.trade || "—");
+    const stageLabel = (STAGES.find((s) => s.key === j.stage) || {}).label || j.stage;
+    (j.clientPayments || []).forEach((p) => rows.push({
+      id: p.id, direction: "in", ledger: "Client payment",
+      date: p.date, amount: Number(p.amount || 0),
+      typeKey: p.paymentType || null, typeLabel: paymentTypeLabel(p.paymentType),
+      method: p.method || "", vendor: "", category: "", status: "received",
+      jobNumber: j.number, projectRef: j.ghlProjectDisplayId || "",
+      customer: j.customerName, address: j.customerAddress || "",
+      tradeKey: j.trade, tradeLabel, stageKey: j.stage, stageLabel,
+      fromCrm: Boolean(p.sourceRef), note: (p.note || "").replace(/^ADDED BY GHL — ?/, ""),
+    }));
+    (j.vendorPayments || []).forEach((p) => rows.push({
+      id: p.id, direction: "out", ledger: "Vendor cost",
+      date: p.date, amount: Number(p.amount || 0),
+      typeKey: null, typeLabel: p.category || "—",
+      method: "", vendor: p.vendorName || "", category: p.category || "",
+      status: p.status || "pending",
+      jobNumber: j.number, projectRef: j.ghlProjectDisplayId || "",
+      customer: j.customerName, address: j.customerAddress || "",
+      tradeKey: j.trade, tradeLabel, stageKey: j.stage, stageLabel,
+      fromCrm: false, note: p.note || "",
+    }));
+  });
+  return rows;
+}
+
+/* ---- export ---------------------------------------------------------- */
+
+const EXPORT_COLUMNS = [
+  { key: "date",       header: "Date",          money: false },
+  { key: "ledger",     header: "Ledger",        money: false },
+  { key: "typeLabel",  header: "Type",          money: false },
+  { key: "amount",     header: "Amount",        money: true },
+  { key: "method",     header: "Method",        money: false },
+  { key: "vendor",     header: "Vendor",        money: false },
+  { key: "status",     header: "Status",        money: false },
+  { key: "jobNumber",  header: "Job #",         money: false },
+  { key: "projectRef", header: "Project #",     money: false },
+  { key: "customer",   header: "Customer",      money: false },
+  { key: "address",    header: "Address",       money: false },
+  { key: "tradeLabel", header: "Trade",         money: false },
+  { key: "stageLabel", header: "Stage",         money: false },
+  { key: "note",       header: "Note",          money: false },
+];
+
+const exportValue = (r, col) => (col.key === "date" ? isoDay(r.date) : (r[col.key] ?? ""));
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  // Revoked on the next tick: Safari cancels the download if the URL dies first.
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function exportCsv(rows, filename) {
+  // Excel reads a leading = + - @ as a formula, so a note starting with one is
+  // an injection risk in someone else's spreadsheet. Prefix with a quote.
+  const cell = (v) => {
+    let s = v === null || v === undefined ? "" : String(v);
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+    return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const lines = [EXPORT_COLUMNS.map((c) => cell(c.header)).join(",")];
+  rows.forEach((r) => lines.push(EXPORT_COLUMNS.map((c) => cell(exportValue(r, c))).join(",")));
+  // BOM so Excel opens UTF-8 correctly on Windows.
+  downloadBlob(new Blob(["﻿" + lines.join("\r\n")], { type: "text/csv;charset=utf-8;" }), filename);
+}
+
+/**
+ * Loaded on demand. The sheet writer is far larger than the rest of the app,
+ * and most sessions never export — so it stays out of the main bundle.
+ */
+async function exportXlsx(rows, filename, summary) {
+  const XLSX = await import("xlsx");
+  const aoa = [EXPORT_COLUMNS.map((c) => c.header)];
+  rows.forEach((r) => aoa.push(EXPORT_COLUMNS.map((c) => {
+    const v = exportValue(r, c);
+    return c.money ? Number(v || 0) : v;
+  })));
+  // Totals row, so the figure in the sheet matches the figure on screen.
+  const total = rows.reduce((s, r) => s + Number(r.amount || 0), 0);
+  aoa.push([]);
+  aoa.push(["TOTAL", "", "", total]);
+
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  const amountCol = EXPORT_COLUMNS.findIndex((c) => c.money);
+  for (let i = 1; i < aoa.length; i++) {
+    const ref = XLSX.utils.encode_cell({ r: i, c: amountCol });
+    if (ws[ref] && typeof ws[ref].v === "number") ws[ref].z = '"$"#,##0.00';
+  }
+  ws["!cols"] = EXPORT_COLUMNS.map((c) => ({ wch: c.key === "address" || c.key === "note" ? 28 : c.key === "customer" ? 22 : 13 }));
+  ws["!freeze"] = { xSplit: 0, ySplit: 1 };
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Transactions");
+
+  if (summary && summary.length) {
+    const sAoa = [["Group", "Count", "Money in", "Money out", "Net"]];
+    summary.forEach((g) => sAoa.push([g.label, g.count, g.moneyIn, g.moneyOut, g.net]));
+    const sws = XLSX.utils.aoa_to_sheet(sAoa);
+    for (let i = 1; i < sAoa.length; i++) {
+      [2, 3, 4].forEach((c) => {
+        const ref = XLSX.utils.encode_cell({ r: i, c });
+        if (sws[ref] && typeof sws[ref].v === "number") sws[ref].z = '"$"#,##0.00';
+      });
+    }
+    sws["!cols"] = [{ wch: 26 }, { wch: 8 }, { wch: 14 }, { wch: 14 }, { wch: 14 }];
+    XLSX.utils.book_append_sheet(wb, sws, "Summary");
+  }
+
+  const out = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+  downloadBlob(new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), filename);
+}
 
 function ReportsView({ ctx }) {
   const { jobs, vendors } = ctx;
@@ -1548,6 +1820,8 @@ function ReportsView({ ctx }) {
 
   return (
     <div className="td-view">
+      <TransactionReport jobs={jobs} />
+
       <div className="td-stat-row">
         <TicketStat label="Active contract value" value={money(totalContractValue)} icon={DollarSign} accent="#B8860B" />
         <TicketStat label="Client balance outstanding" value={money(totalAR)} icon={Wallet} accent="#C1440E" />
@@ -1603,6 +1877,318 @@ function ReportsView({ ctx }) {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * The report builder. Filters narrow the row set, the grouping decides how the
+ * summary is cut, and both exports take exactly what is on screen — so a figure
+ * in a spreadsheet can always be traced back to the filters that produced it.
+ */
+function TransactionReport({ jobs }) {
+  const [preset, setPreset] = useState("this_month");
+  const [customFrom, setCustomFrom] = useState(isoDay(startOfMonth(new Date())));
+  const [customTo, setCustomTo] = useState(isoDay(new Date()));
+  const [groupBy, setGroupBy] = useState("week");
+  const [direction, setDirection] = useState("in");
+  const [fType, setFType] = useState("");
+  const [fMethod, setFMethod] = useState("");
+  const [fTrade, setFTrade] = useState("");
+  const [fStage, setFStage] = useState("");
+  const [fVendor, setFVendor] = useState("");
+  const [fCategory, setFCategory] = useState("");
+  const [fStatus, setFStatus] = useState("");
+  const [search, setSearch] = useState("");
+  const [showRows, setShowRows] = useState(false);
+  const [busy, setBusy] = useState("");
+
+  const [from, to] = useMemo(() => {
+    if (preset === "custom") return [dayStart(customFrom), dayEnd(customTo)];
+    const [a, b] = DATE_PRESETS[preset].range();
+    return [dayStart(a), dayEnd(b)];
+  }, [preset, customFrom, customTo]);
+
+  const allRows = useMemo(() => buildLedgerRows(jobs), [jobs]);
+
+  const rows = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return allRows.filter((r) => {
+      const d = new Date(r.date);
+      if (!(d >= from && d <= to)) return false;
+      if (direction !== "both" && r.direction !== direction) return false;
+      if (fType && r.typeKey !== fType) return false;
+      if (fMethod && r.method !== fMethod) return false;
+      if (fTrade && r.tradeKey !== fTrade) return false;
+      if (fStage && r.stageKey !== fStage) return false;
+      if (fVendor && r.vendor !== fVendor) return false;
+      if (fCategory && r.category !== fCategory) return false;
+      if (fStatus && r.status !== fStatus) return false;
+      if (q && !(String(r.customer).toLowerCase().includes(q) ||
+                 String(r.vendor).toLowerCase().includes(q) ||
+                 String(r.address).toLowerCase().includes(q) ||
+                 String(r.note).toLowerCase().includes(q) ||
+                 jobNo(r.jobNumber).toLowerCase().includes(q) ||
+                 String(r.projectRef).toLowerCase().includes(q))) return false;
+      return true;
+    }).sort((a, b) => new Date(b.date) - new Date(a.date));
+  }, [allRows, from, to, direction, fType, fMethod, fTrade, fStage, fVendor, fCategory, fStatus, search]);
+
+  const groups = useMemo(() => {
+    const g = GROUPINGS[groupBy] || GROUPINGS.none;
+    const map = new Map();
+    rows.forEach((r) => {
+      const key = g.key(r.date, r);
+      const e = map.get(key) || { key, count: 0, moneyIn: 0, moneyOut: 0 };
+      e.count += 1;
+      if (r.direction === "in") e.moneyIn += r.amount; else e.moneyOut += r.amount;
+      map.set(key, e);
+    });
+    const dateGrouped = ["day", "week", "month", "quarter", "year"].includes(groupBy);
+    return [...map.values()]
+      .map((e) => ({ ...e, net: e.moneyIn - e.moneyOut, label: groupLabel(groupBy, e.key) }))
+      .sort((a, b) => dateGrouped ? (a.key < b.key ? 1 : -1) : (b.moneyIn + b.moneyOut) - (a.moneyIn + a.moneyOut));
+  }, [rows, groupBy]);
+
+  const totalIn = rows.filter((r) => r.direction === "in").reduce((s, r) => s + r.amount, 0);
+  const totalOut = rows.filter((r) => r.direction === "out").reduce((s, r) => s + r.amount, 0);
+
+  const vendorNames = useMemo(
+    () => [...new Set(allRows.filter((r) => r.vendor).map((r) => r.vendor))].sort(), [allRows]);
+
+  const rangeLabel = isoDay(from) + "_to_" + isoDay(to);
+  const filenameBase = "tradedesk_" +
+    (direction === "in" ? "client-payments" : direction === "out" ? "vendor-costs" : "all-transactions") +
+    "_" + rangeLabel;
+
+  const doExport = async (kind) => {
+    if (!rows.length) return;
+    setBusy(kind);
+    try {
+      if (kind === "csv") exportCsv(rows, filenameBase + ".csv");
+      else await exportXlsx(rows, filenameBase + ".xlsx", groups);
+    } catch (err) {
+      alert("Export failed: " + (err && err.message ? err.message : String(err)));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const reset = () => {
+    setFType(""); setFMethod(""); setFTrade(""); setFStage("");
+    setFVendor(""); setFCategory(""); setFStatus(""); setSearch("");
+  };
+  const activeFilters = [fType, fMethod, fTrade, fStage, fVendor, fCategory, fStatus, search].filter(Boolean).length;
+
+  return (
+    <div className="td-panel td-report">
+      <div className="td-panel-head">
+        <span><SlidersHorizontal size={14} style={{ verticalAlign: -2, marginRight: 6 }} />Payment reports</span>
+        <div className="td-report-actions">
+          <button className="td-btn" disabled={!rows.length || busy} onClick={() => doExport("csv")}>
+            <Download size={13} /> {busy === "csv" ? "Exporting…" : "CSV"}
+          </button>
+          <button className="td-btn" disabled={!rows.length || busy} onClick={() => doExport("xlsx")}>
+            <FileSpreadsheet size={13} /> {busy === "xlsx" ? "Building…" : "Excel"}
+          </button>
+        </div>
+      </div>
+
+      <div className="td-report-controls">
+        <label className="td-deal-field">
+          <span className="td-field-label">Period</span>
+          <select className="td-select" value={preset} onChange={(e) => setPreset(e.target.value)}>
+            {Object.entries(DATE_PRESETS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+          </select>
+        </label>
+        {preset === "custom" && (
+          <>
+            <label className="td-deal-field">
+              <span className="td-field-label">From</span>
+              <input className="td-input" type="date" value={customFrom} onChange={(e) => setCustomFrom(e.target.value)} />
+            </label>
+            <label className="td-deal-field">
+              <span className="td-field-label">To</span>
+              <input className="td-input" type="date" value={customTo} onChange={(e) => setCustomTo(e.target.value)} />
+            </label>
+          </>
+        )}
+        <label className="td-deal-field">
+          <span className="td-field-label">Show</span>
+          <select className="td-select" value={direction} onChange={(e) => setDirection(e.target.value)}>
+            <option value="in">Client payments (money in)</option>
+            <option value="out">Vendor costs (money out)</option>
+            <option value="both">Both</option>
+          </select>
+        </label>
+        <label className="td-deal-field">
+          <span className="td-field-label">Group</span>
+          <select className="td-select" value={groupBy} onChange={(e) => setGroupBy(e.target.value)}>
+            {Object.entries(GROUPINGS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+          </select>
+        </label>
+
+        {direction !== "out" && (
+          <>
+            <label className="td-deal-field">
+              <span className="td-field-label">Payment type</span>
+              <select className="td-select" value={fType} onChange={(e) => setFType(e.target.value)}>
+                <option value="">All types</option>
+                {paymentTypeKeys().map((k) => <option key={k} value={k}>{PAYMENT_TYPES[k].label}</option>)}
+              </select>
+            </label>
+            <label className="td-deal-field">
+              <span className="td-field-label">Method</span>
+              <select className="td-select" value={fMethod} onChange={(e) => setFMethod(e.target.value)}>
+                <option value="">All methods</option>
+                {PAYMENT_METHODS.map((m) => <option key={m} value={m}>{m}</option>)}
+              </select>
+            </label>
+          </>
+        )}
+
+        {direction !== "in" && (
+          <>
+            <label className="td-deal-field">
+              <span className="td-field-label">Cost category</span>
+              <select className="td-select" value={fCategory} onChange={(e) => setFCategory(e.target.value)}>
+                <option value="">All categories</option>
+                {VENDOR_CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </label>
+            <label className="td-deal-field">
+              <span className="td-field-label">Vendor</span>
+              <select className="td-select" value={fVendor} onChange={(e) => setFVendor(e.target.value)}>
+                <option value="">All vendors</option>
+                {vendorNames.map((v) => <option key={v} value={v}>{v}</option>)}
+              </select>
+            </label>
+            <label className="td-deal-field">
+              <span className="td-field-label">Status</span>
+              <select className="td-select" value={fStatus} onChange={(e) => setFStatus(e.target.value)}>
+                <option value="">Paid and pending</option>
+                <option value="paid">Paid only</option>
+                <option value="pending">Pending only</option>
+              </select>
+            </label>
+          </>
+        )}
+
+        <label className="td-deal-field">
+          <span className="td-field-label">Trade</span>
+          <select className="td-select" value={fTrade} onChange={(e) => setFTrade(e.target.value)}>
+            <option value="">All trades</option>
+            {tradeKeysFor(jobs).map((k) => <option key={k} value={k}>{TRADES[k] ? TRADES[k].label : k}</option>)}
+          </select>
+        </label>
+        <label className="td-deal-field">
+          <span className="td-field-label">Stage</span>
+          <select className="td-select" value={fStage} onChange={(e) => setFStage(e.target.value)}>
+            <option value="">All stages</option>
+            {STAGES.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
+          </select>
+        </label>
+        <label className="td-deal-field td-report-search">
+          <span className="td-field-label">Search</span>
+          <input className="td-input" placeholder="Customer, vendor, address, job #" value={search}
+            onChange={(e) => setSearch(e.target.value)} />
+        </label>
+        {activeFilters > 0 && (
+          <button className="td-btn td-report-reset" onClick={reset}>
+            <X size={13} /> Clear {activeFilters} filter{activeFilters === 1 ? "" : "s"}
+          </button>
+        )}
+      </div>
+
+      <div className="td-report-totals">
+        <div><span className="td-field-label">Transactions</span><strong>{rows.length}</strong></div>
+        {direction !== "out" && <div><span className="td-field-label">Money in</span><strong className="td-text-green">{money(totalIn)}</strong></div>}
+        {direction !== "in" && <div><span className="td-field-label">Money out</span><strong className="td-text-red">{money(totalOut)}</strong></div>}
+        {direction === "both" && <div><span className="td-field-label">Net</span><strong className={totalIn - totalOut < 0 ? "td-text-red" : "td-text-green"}>{money(totalIn - totalOut)}</strong></div>}
+        <div className="td-report-range">
+          {isoDay(from)} → {isoDay(to)}
+        </div>
+      </div>
+
+      {rows.length === 0 ? (
+        <EmptyState icon={CalendarIcon} title="Nothing in this period"
+          sub="Widen the date range or clear a filter." />
+      ) : (
+        <>
+          <div className="td-table-wrap">
+            <table className="td-table">
+              <thead>
+                <tr>
+                  <th>{GROUPINGS[groupBy].label.replace(/^By /, "").replace(/^No grouping$/, "Total")}</th>
+                  <th className="td-num">Count</th>
+                  {direction !== "out" && <th className="td-num">Money in</th>}
+                  {direction !== "in" && <th className="td-num">Money out</th>}
+                  {direction === "both" && <th className="td-num">Net</th>}
+                </tr>
+              </thead>
+              <tbody>
+                {groups.map((g) => (
+                  <tr key={g.key}>
+                    <td>{g.label}</td>
+                    <td className="td-num">{g.count}</td>
+                    {direction !== "out" && <td className="td-num td-text-green">{money(g.moneyIn)}</td>}
+                    {direction !== "in" && <td className="td-num td-text-red">{money(g.moneyOut)}</td>}
+                    {direction === "both" && <td className={"td-num " + (g.net < 0 ? "td-text-red" : "td-text-green")}>{money(g.net)}</td>}
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot>
+                <tr>
+                  <td><strong>Total</strong></td>
+                  <td className="td-num"><strong>{rows.length}</strong></td>
+                  {direction !== "out" && <td className="td-num"><strong>{money(totalIn)}</strong></td>}
+                  {direction !== "in" && <td className="td-num"><strong>{money(totalOut)}</strong></td>}
+                  {direction === "both" && <td className="td-num"><strong>{money(totalIn - totalOut)}</strong></td>}
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+
+          <button className="td-btn td-report-toggle" onClick={() => setShowRows((s) => !s)}>
+            <ArrowDownUp size={13} /> {showRows ? "Hide" : "Show"} the {rows.length} individual transaction{rows.length === 1 ? "" : "s"}
+          </button>
+
+          {showRows && (
+            <div className="td-table-wrap">
+              <table className="td-table">
+                <thead>
+                  <tr>
+                    <th>Date</th><th>Type</th><th className="td-num">Amount</th>
+                    <th>Customer</th><th>Job</th><th>Detail</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.slice(0, 500).map((r) => (
+                    <tr key={r.direction + r.id}>
+                      <td>{fmtDate(r.date)}</td>
+                      <td>{r.typeLabel}{r.fromCrm && <span className="td-ghl-badge" style={{ marginLeft: 6 }}>GHL</span>}</td>
+                      <td className={"td-num " + (r.direction === "in" ? "td-text-green" : "td-text-red")}>
+                        {r.direction === "in" ? "" : "−"}{moneyDec(r.amount)}
+                      </td>
+                      <td>{r.customer}</td>
+                      <td>{jobNo(r.jobNumber)}</td>
+                      <td className="td-cell-sub">
+                        {[r.method, r.vendor, r.direction === "out" ? r.status : null, r.note]
+                          .filter(Boolean).join(" · ")}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {rows.length > 500 && (
+                <div className="td-report-trunc">
+                  Showing the first 500 of {rows.length}. The export includes all of them.
+                </div>
+              )}
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }
@@ -1883,6 +2469,33 @@ function GlobalStyle() {
       .td-hold-toggle.active { background: #FDF3E3; border-color: #E6D3A6; color: #8A5A12; }
 
       .td-deal-modal-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+
+      /* ---------- Reports: the transaction report builder ---------- */
+      .td-report { margin-bottom: 16px; }
+      .td-report .td-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+      .td-report-actions { display: flex; gap: 8px; }
+      .td-report-controls { display: grid; gap: 10px 12px; align-items: end; margin: 12px 0 14px;
+        grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); }
+      .td-report-search { grid-column: span 2; }
+      .td-report-reset { align-self: end; white-space: nowrap; }
+      .td-report-totals { display: flex; align-items: baseline; gap: 22px; flex-wrap: wrap;
+        padding: 11px 13px; margin-bottom: 12px; border: 1px solid var(--td-border);
+        border-radius: var(--td-radius); background: #FBF9F5; }
+      .td-report-totals > div { display: flex; flex-direction: column; gap: 2px; }
+      .td-report-totals strong { font-family: 'IBM Plex Mono', monospace; font-size: 15px; font-weight: 700; }
+      .td-report-range { margin-left: auto; font-family: 'IBM Plex Mono', monospace;
+        font-size: 11.5px; color: var(--td-muted); align-self: center; }
+      .td-report-toggle { margin: 12px 0 4px; }
+      .td-report-trunc { padding: 9px 12px; font-size: 12px; color: var(--td-muted);
+        border-top: 1px solid var(--td-border); }
+      .td-report .td-num { text-align: right; font-family: 'IBM Plex Mono', monospace; }
+      .td-report tfoot td { border-top: 2px solid var(--td-border); background: #FBF9F5; }
+      .td-paytype-chip { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .02em;
+        color: #4A5480; background: #E2E4EE; border-radius: 3px; padding: 2px 6px; white-space: nowrap; }
+      @media (max-width: 640px) {
+        .td-report-search { grid-column: span 1; }
+        .td-report-range { margin-left: 0; }
+      }
 
       /* Job detail header. Chips on one line, editable fields on a grid that
          reflows instead of crushing its columns. */

@@ -114,6 +114,9 @@ const clientPaymentFromRow = (r) => ({
   // Set when the row was created from a GoHighLevel payment field. Rows the
   // office enters here have none, and the integration never touches them.
   sourceRef: r.source_ref || null,
+  // Initial deposit / second deposit / final payment. What the reports group
+  // by, so it is stored rather than re-inferred from order on every read.
+  paymentType: r.payment_type || null,
 });
 
 const vendorPaymentFromRow = (r) => ({
@@ -157,7 +160,7 @@ const supabaseRepo = {
   mode: "supabase",
 
   async loadAll() {
-    const [jobRows, vendorRows, cpRows, vpRows, tradeRows, flagRows] = await Promise.all([
+    const [jobRows, vendorRows, cpRows, vpRows, tradeRows, flagRows, payTypeRows] = await Promise.all([
       supabase.from("jobs").select("*").order("number", { ascending: false }).then(unwrap),
       supabase.from("vendors").select("*").order("name", { ascending: true }).then(unwrap),
       supabase.from("client_payments").select("*").order("payment_date", { ascending: false }).then(unwrap),
@@ -166,6 +169,7 @@ const supabaseRepo = {
       // handed to applyTrades() before the first render.
       supabase.from("trades").select("*").eq("active", true).order("sort_order").then(unwrap),
       supabase.from("job_flags").select("*").order("sort_order").then(unwrap),
+      supabase.from("payment_types").select("*").eq("active", true).order("sort_order").then(unwrap),
     ]);
 
     const jobs = jobRows.map(jobFromRow);
@@ -173,7 +177,8 @@ const supabaseRepo = {
     cpRows.forEach((r) => byId.get(r.job_id)?.clientPayments.push(clientPaymentFromRow(r)));
     vpRows.forEach((r) => byId.get(r.job_id)?.vendorPayments.push(vendorPaymentFromRow(r)));
 
-    return { jobs, vendors: vendorRows.map(vendorFromRow), trades: tradeRows, jobFlags: flagRows };
+    return { jobs, vendors: vendorRows.map(vendorFromRow), trades: tradeRows, jobFlags: flagRows,
+             paymentTypes: payTypeRows };
   },
 
   // Seeding is a database concern in Supabase mode, not something the browser
@@ -211,6 +216,7 @@ const supabaseRepo = {
         payment_date: toIso(p.date),
         method: p.method,
         note: p.note || "",
+        payment_type: p.paymentType || null,
       })
       .then(unwrap);
   },
