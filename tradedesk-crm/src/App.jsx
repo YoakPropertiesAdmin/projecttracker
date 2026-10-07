@@ -5,7 +5,7 @@ import {
   LayoutDashboard, LayoutGrid, List, Truck, TrendingUp,
   Home, Layers, AppWindow, DoorOpen,
   Plus, X, Search, Phone, Mail, MapPin, DollarSign, Check,
-  ChevronDown, ChevronRight, Trash2, Pencil,
+  ChevronDown, ChevronRight, ChevronLeft, Trash2, Pencil, Users, UserPlus,
   AlertTriangle, Tag, Building2, Menu, ClipboardList, RefreshCw,
   Wallet, HandCoins, Percent, Calendar as CalendarIcon, LogOut,
   Hammer, Wrench, PaintBucket, Droplets, Thermometer, PackageCheck, ShoppingCart,
@@ -246,6 +246,73 @@ function ageDateGaps(job) {
     .map((k) => ({ key: k, ...AGE_RULES[k] }))
     .filter((r) => here < stageIndex(r.stopsAt) && !r.field.startsWith("__") && !job[r.field]);
 }
+
+/**
+ * Who can be put on a job, from the `assignee_roles` registry. Same mutable-
+ * module pattern as the other registries.
+ *
+ * `scheduled` is the whole distinction: an installer and a service crew occupy
+ * days, so they carry a date range and show on the calendar. A project manager
+ * owns the job from signing to close — that is not a booking, and pretending it
+ * is would fill the calendar with month-long bars that tell nobody anything.
+ */
+const ASSIGNEE_ROLES = {
+  project_manager: { label: "Project manager", scheduled: false, sort: 10 },
+  installer: { label: "Installer", scheduled: true, sort: 20 },
+  service: { label: "Service", scheduled: true, sort: 30 },
+};
+
+function applyAssigneeRoles(rows) {
+  if (!rows || !rows.length) return;
+  Object.keys(ASSIGNEE_ROLES).forEach((k) => delete ASSIGNEE_ROLES[k]);
+  rows.forEach((r) => {
+    ASSIGNEE_ROLES[r.key] = {
+      label: r.label,
+      scheduled: r.scheduled !== false,
+      sort: r.sort_order ?? 100,
+    };
+  });
+}
+
+const assigneeRoleKeys = () =>
+  Object.keys(ASSIGNEE_ROLES).sort((a, b) => ASSIGNEE_ROLES[a].sort - ASSIGNEE_ROLES[b].sort);
+
+const assigneeRole = (key) => ASSIGNEE_ROLES[key] || { label: key, scheduled: true, sort: 100 };
+
+const scheduledRoleKeys = () => assigneeRoleKeys().filter((k) => assigneeRole(k).scheduled);
+
+/** mm/dd/yy. The office writes dates this way, so the card reads them back the same. */
+const fmtDateNum = (v) => {
+  const d = parseDate(v);
+  if (!d) return "";
+  const p = (n) => String(n).padStart(2, "0");
+  return p(d.getMonth() + 1) + "/" + p(d.getDate()) + "/" + String(d.getFullYear()).slice(-2);
+};
+
+/** "10/12/26 – 10/14/26", collapsed to one date when the range is a single day. */
+const fmtDateRange = (start, end) => {
+  const a = fmtDateNum(start);
+  const b = fmtDateNum(end);
+  if (!a && !b) return "";
+  if (!b || a === b) return a;
+  if (!a) return "until " + b;
+  return a + " – " + b;
+};
+
+/**
+ * Black or white text on a coloured block. The sixteen palette colours are all
+ * dark enough for white, but a colour set by hand in the database is not bound
+ * by that, and unreadable labels on someone's own calendar is a poor way to
+ * find out. Relative luminance per WCAG.
+ */
+const textOn = (hex) => {
+  const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || ""));
+  if (!m) return "#FFFFFF";
+  const n = parseInt(m[1], 16);
+  const lin = (c) => { const s = c / 255; return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4); };
+  const L = 0.2126 * lin((n >> 16) & 255) + 0.7152 * lin((n >> 8) & 255) + 0.0722 * lin(n & 255);
+  return L > 0.45 ? "#1B2027" : "#FFFFFF";
+};
 
 /**
  * Column ordering. A held contract is still a contract, so it keeps its column
@@ -529,6 +596,7 @@ function useJobTrackerData() {
         applyJobFlags(loaded.jobFlags);
         applyPaymentTypes(loaded.paymentTypes);
         applyAgeRules(loaded.ageRules);
+        applyAssigneeRoles(loaded.assigneeRoles);
         setDataState(loaded);
       } else {
         // Nothing stored at all. Only reachable in the localStorage dev
@@ -708,8 +776,13 @@ export default function App() {
 
   const jobs = safeData.jobs;
   const vendors = safeData.vendors;
+  const assignees = safeData.assignees || [];
 
   const vendorNames = useMemo(() => vendors.map((v) => v.name), [vendors]);
+
+  // Every assignment on the board needs its person's name and colour, and the
+  // calendar asks for them once per block. A map beats a find() per render.
+  const assigneeById = useMemo(() => new Map(assignees.map((a) => [a.id, a])), [assignees]);
 
   const vendorSpend = useMemo(() => {
     const map = {};
@@ -839,14 +912,80 @@ export default function App() {
     persist(() => repo.deleteVendor(id), "Deleting the vendor");
   };
 
+  /**
+   * Put someone on a job.
+   *
+   * `name` is a write-in; `assigneeId` is a pick from the dropdown. The two
+   * paths differ in one way that matters: a write-in has to reach the database
+   * and come back before anything can be drawn, because the id and the colour
+   * are both allocated there. Guessing a colour locally and reconciling later
+   * would mean two people adding the same installer at the same moment watch
+   * his colour change under them.
+   */
+  const addAssignment = async ({ jobId, role, assigneeId, name, startDate, endDate, note }) => {
+    let person = assigneeId ? assigneeById.get(assigneeId) : null;
+
+    if (!person) {
+      try {
+        person = await repo.ensureAssignee(role, name);
+      } catch (err) {
+        setPersistError(
+          "Could not add " + (String(name || "").trim() || "that person") + " — " +
+          ((err && err.message) || "connection problem") + "."
+        );
+        return;
+      }
+      // Already present means another tab or another person got there first;
+      // either way the row we just resolved is the one to keep.
+      setData((prev) => ({
+        ...prev,
+        assignees: (prev.assignees || []).some((a) => a.id === person.id)
+          ? (prev.assignees || []).map((a) => (a.id === person.id ? person : a))
+          : [...(prev.assignees || []), person],
+      }));
+    }
+
+    const a = {
+      id: newId(), jobId, role, assigneeId: person.id,
+      startDate: startDate || null, endDate: endDate || null, note: note || "",
+    };
+    setData((prev) => ({
+      ...prev,
+      jobs: prev.jobs.map((j) => (j.id === jobId ? { ...j, assignments: [...(j.assignments || []), a] } : j)),
+    }));
+    persist(() => repo.createAssignment(jobId, a), "The assignment");
+  };
+
+  const updateAssignment = (jobId, assignmentId, patch) => {
+    setData((prev) => ({
+      ...prev,
+      jobs: prev.jobs.map((j) => (j.id === jobId
+        ? { ...j, assignments: (j.assignments || []).map((a) => (a.id === assignmentId ? { ...a, ...patch } : a)) }
+        : j)),
+    }));
+    persist(() => repo.updateAssignment(assignmentId, patch), "The assignment update");
+  };
+
+  const removeAssignment = (jobId, assignmentId) => {
+    setData((prev) => ({
+      ...prev,
+      jobs: prev.jobs.map((j) => (j.id === jobId
+        ? { ...j, assignments: (j.assignments || []).filter((a) => a.id !== assignmentId) }
+        : j)),
+    }));
+    persist(() => repo.deleteAssignment(assignmentId), "Removing the assignment");
+  };
+
   const signOut = () => { if (isSupabaseConfigured) supabase.auth.signOut(); };
 
   const ctx = {
     data: safeData, jobs, vendors, vendorNames, vendorSpend,
+    assignees, assigneeById,
     addJob, updateJob, deleteJob,
     addClientPayment, deleteClientPayment,
     addVendorPayment, updateVendorPayment, deleteVendorPayment,
     addVendor, updateVendor, deleteVendor,
+    addAssignment, updateAssignment, removeAssignment,
     selectedJobId, setSelectedJobId, showAddJob, setShowAddJob, showVendorForm, setShowVendorForm,
     search, setSearch,
   };
@@ -854,6 +993,7 @@ export default function App() {
   const NAV = [
     { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
     { key: "jobs", label: "Jobs", icon: LayoutGrid },
+    { key: "calendar", label: "Calendar", icon: CalendarIcon },
     { key: "vendors", label: "Vendors", icon: Truck },
     { key: "reports", label: "Reports", icon: TrendingUp },
   ];
@@ -947,6 +1087,7 @@ export default function App() {
           <main className="td-content">
             {view === "dashboard" && <DashboardView ctx={ctx} setView={setView} />}
             {view === "jobs" && <JobsView ctx={ctx} />}
+            {view === "calendar" && <CalendarView ctx={ctx} />}
             {view === "vendors" && <VendorsView ctx={ctx} />}
             {view === "reports" && <ReportsView ctx={ctx} />}
           </main>
@@ -1483,6 +1624,8 @@ function JobDetailModal({ ctx, job, onClose }) {
         <div className="td-info-row"><Building2 size={14} /> {job.customerAddress}</div>
         <div className="td-info-row"><Phone size={14} /> {job.customerPhone || "—"}<Mail size={14} style={{ marginLeft: 14 }} /> {job.customerEmail || "—"}</div>
 
+        <JobAssignments ctx={ctx} job={job} />
+
         <div className="td-payment-summary">
           <div className="td-payment-summary-item">
             <span className="td-field-label">Received</span>
@@ -1623,6 +1766,156 @@ function JobDetailModal({ ctx, job, onClose }) {
         </Field>
       </div>
     </Modal>
+  );
+}
+
+/* =========================================================================
+   ASSIGNMENTS — who is on this job, and when
+   -------------------------------------------------------------------------
+   One section per role from the registry. Each is a list rather than a single
+   value: two installers in different weeks, or a second trade back for a punch
+   list, is ordinary rather than exceptional.
+
+   Roles the registry marks `scheduled` carry a date range and reach the
+   calendar. The project manager does not — owning a job is not a booking.
+   ========================================================================= */
+
+function JobAssignments({ ctx, job }) {
+  return (
+    <div className="td-assign">
+      {assigneeRoleKeys().map((roleKey) => (
+        <AssignmentRole key={roleKey} ctx={ctx} job={job} roleKey={roleKey} />
+      ))}
+    </div>
+  );
+}
+
+function AssignmentRole({ ctx, job, roleKey }) {
+  const { assignees, assigneeById, addAssignment, updateAssignment, removeAssignment } = ctx;
+  const role = assigneeRole(roleKey);
+  const [pick, setPick] = useState("");
+  const [newName, setNewName] = useState("");
+  const [start, setStart] = useState("");
+  const [end, setEnd] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const rows = (job.assignments || []).filter((a) => a.role === roleKey);
+  // Retired people stay resolvable for rows they are already on, but they are
+  // not offered for new ones.
+  const options = assignees.filter((a) => a.role === roleKey && a.active);
+
+  const writingIn = pick === "__new";
+  const canAdd = writingIn ? Boolean(newName.trim()) : Boolean(pick);
+
+  const submit = async () => {
+    if (!canAdd || busy) return;
+    setBusy(true);
+    await addAssignment({
+      jobId: job.id,
+      role: roleKey,
+      assigneeId: writingIn ? null : pick,
+      name: writingIn ? newName : "",
+      startDate: role.scheduled ? (start || null) : null,
+      endDate: role.scheduled ? (end || null) : null,
+    });
+    setBusy(false);
+    setPick("");
+    setNewName("");
+    setStart("");
+    setEnd("");
+  };
+
+  return (
+    <div className="td-assign-role">
+      <div className="td-assign-role-head">
+        <span className="td-field-label">{role.label}</span>
+        {!role.scheduled && <span className="td-assign-note">no dates — not on the calendar</span>}
+      </div>
+
+      {rows.length === 0 ? (
+        <div className="td-muted-line">Nobody assigned.</div>
+      ) : (
+        rows.map((a) => (
+          <AssignmentRow key={a.id} a={a} person={assigneeById.get(a.assigneeId)}
+            scheduled={role.scheduled}
+            onChange={(patch) => updateAssignment(job.id, a.id, patch)}
+            onRemove={() => {
+              const who = (assigneeById.get(a.assigneeId) || {}).name || "this person";
+              if (confirm("Take " + who + " off " + jobRef(job) + "?")) removeAssignment(job.id, a.id);
+            }} />
+        ))
+      )}
+
+      <div className="td-assign-add">
+        <select className="td-select" value={pick}
+          onChange={(e) => { setPick(e.target.value); if (e.target.value !== "__new") setNewName(""); }}>
+          <option value="">Assign {role.label.toLowerCase()}…</option>
+          {options.map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}
+          {/* A write-in is saved as a person, so it is in this list next time —
+              which is the only way a dropdown stays useful without someone
+              having to maintain it. */}
+          <option value="__new">+ Add a new name…</option>
+        </select>
+        {writingIn && (
+          <input className="td-input" placeholder="Name" value={newName} autoFocus
+            onChange={(e) => setNewName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") submit(); }} />
+        )}
+        {role.scheduled && (
+          <>
+            <input className="td-input td-assign-date" type="date" value={start} title="Start"
+              onChange={(e) => setStart(e.target.value)} />
+            <span className="td-assign-dash">–</span>
+            <input className="td-input td-assign-date" type="date" value={end} title="End"
+              min={start || undefined} onChange={(e) => setEnd(e.target.value)} />
+          </>
+        )}
+        <button className="td-btn td-btn-sm" onClick={submit} disabled={!canAdd || busy}>
+          {busy ? <RefreshCw size={13} className="td-spin" /> : <UserPlus size={13} />} Add
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * One assigned person. The dates read as mm/dd/yy and only turn into pickers
+ * when clicked — two date inputs sitting open on every row turned a job with
+ * four people on it into a wall of grey boxes.
+ */
+function AssignmentRow({ a, person, scheduled, onChange, onRemove }) {
+  const [editing, setEditing] = useState(false);
+  const label = fmtDateRange(a.startDate, a.endDate);
+  const color = (person && person.color) || "#4A6070";
+
+  return (
+    <div className="td-assign-row">
+      <span className="td-assign-chip" style={{ background: color, color: textOn(color) }}>
+        {person ? person.name : "Unknown person"}
+        {person && person.active === false && <span className="td-assign-retired" title="No longer on the list">·</span>}
+      </span>
+
+      {scheduled && (editing ? (
+        <>
+          <input className="td-input td-assign-date" type="date" value={a.startDate || ""} autoFocus
+            onChange={(e) => onChange({ startDate: e.target.value || null })} />
+          <span className="td-assign-dash">–</span>
+          <input className="td-input td-assign-date" type="date" value={a.endDate || ""}
+            min={a.startDate || undefined}
+            onChange={(e) => onChange({ endDate: e.target.value || null })} />
+          <button className="td-btn td-btn-sm td-btn-ghost" onClick={() => setEditing(false)}>Done</button>
+        </>
+      ) : (
+        <button className={cls("td-assign-dates", !label && "td-assign-dates-empty")}
+          onClick={() => setEditing(true)}
+          title="Click to set the date range">
+          <CalendarIcon size={12} /> {label || "Set dates"}
+        </button>
+      ))}
+
+      <div style={{ flex: 1 }} />
+      <IconBtn icon={Trash2} danger title="Remove from this job" onClick={onRemove} />
+    </div>
   );
 }
 
@@ -2413,6 +2706,360 @@ function TransactionReport({ jobs }) {
    GLOBAL STYLE
    ========================================================================= */
 
+/* =========================================================================
+   CALENDAR — who is where, and when
+   -------------------------------------------------------------------------
+   The board answers "what stage is this job at". This answers "who is working
+   on Thursday", which the board cannot, because a column has no dates in it.
+
+   Two views over the same events. The month grid is for "what is happening in
+   November"; the per-person timeline is for "is Mike free that week", and the
+   second question is the one that actually gets asked when someone rings up
+   wanting a date.
+
+   A person's colour comes from their assignee row and never changes, so the
+   same green means the same crew in every month you page through.
+   ========================================================================= */
+
+const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+/** The street line, which is what identifies a job at a glance on a small block. */
+const shortAddress = (job) =>
+  String((job && job.customerAddress) || "").split(",")[0].trim() || (job && job.customerName) || "";
+
+const sameDay = (a, b) =>
+  a && b && a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+
+/**
+ * Stack overlapping bars so none hides another. Each lane records the first
+ * column it is free from; a segment drops into the first lane whose free point
+ * has been passed. Longest-first within a start column, so the long run of work
+ * sits above the one-day visit rather than under it.
+ */
+function packLanes(segments) {
+  const freeFrom = [];
+  segments.forEach((s) => {
+    let lane = 0;
+    while (freeFrom[lane] !== undefined && freeFrom[lane] > s.colStart) lane++;
+    s.lane = lane;
+    freeFrom[lane] = s.colEnd + 1;
+  });
+  return segments.reduce((m, s) => Math.max(m, s.lane + 1), 0);
+}
+
+function CalendarView({ ctx }) {
+  const { jobs, assigneeById, setSelectedJobId, search } = ctx;
+  const [mode, setMode] = useState("month");
+  const [cursor, setCursor] = useState(() => startOfMonth(new Date()));
+  const [roleFilter, setRoleFilter] = useState("all");
+  const [personFilter, setPersonFilter] = useState("all");
+  const [popover, setPopover] = useState(null);
+
+  const today = dayStart(new Date());
+  const monthStart = cursor;
+  const monthEnd = useMemo(
+    () => dayStart(new Date(cursor.getFullYear(), cursor.getMonth() + 1, 0)), [cursor]);
+  const daysInMonth = monthEnd.getDate();
+
+  /**
+   * Every booking that can be drawn. An assignment with no start date is a
+   * decision about who, not about when — it belongs on the card, and putting
+   * it somewhere arbitrary on the calendar would be a lie. No end date reads
+   * as a single day.
+   */
+  const events = useMemo(() => {
+    const out = [];
+    jobs.forEach((j) => {
+      (j.assignments || []).forEach((a) => {
+        if (!assigneeRole(a.role).scheduled) return;
+        const start = dayStart(a.startDate);
+        if (!start) return;
+        const end = dayStart(a.endDate) || start;
+        if (end < start) return;
+        out.push({ id: a.id, job: j, assignment: a, person: assigneeById.get(a.assigneeId), start, end });
+      });
+    });
+    return out;
+  }, [jobs, assigneeById]);
+
+  const needle = search.trim().toLowerCase();
+  const filtered = useMemo(() => events.filter((ev) => {
+    if (roleFilter !== "all" && ev.assignment.role !== roleFilter) return false;
+    if (personFilter !== "all" && ev.assignment.assigneeId !== personFilter) return false;
+    if (!needle) return true;
+    const hay = [ev.job.customerName, ev.job.customerAddress, jobRef(ev.job),
+                 ev.person && ev.person.name].filter(Boolean).join(" ").toLowerCase();
+    return hay.includes(needle);
+  }), [events, roleFilter, personFilter, needle]);
+
+  const inMonth = useMemo(
+    () => filtered.filter((ev) => ev.end >= monthStart && ev.start <= monthEnd),
+    [filtered, monthStart, monthEnd]);
+
+  // Only people who actually appear this month, so the timeline is not mostly
+  // empty rows for crews working elsewhere.
+  const peopleThisMonth = useMemo(() => {
+    const seen = new Map();
+    inMonth.forEach((ev) => { if (ev.person && !seen.has(ev.person.id)) seen.set(ev.person.id, ev.person); });
+    return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }, [inMonth]);
+
+  const everyone = useMemo(() => {
+    const seen = new Map();
+    events.forEach((ev) => { if (ev.person && !seen.has(ev.person.id)) seen.set(ev.person.id, ev.person); });
+    return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }, [events]);
+
+  const weeks = useMemo(() => {
+    const out = [];
+    let cur = startOfWeek(monthStart);
+    const last = startOfWeek(monthEnd);
+    while (cur <= last) { out.push(cur); cur = addDaysTo(cur, 7); }
+    return out;
+  }, [monthStart, monthEnd]);
+
+  /** Clip events to a window and turn them into grid-placed segments. */
+  const segmentsFor = (list, winStart, winEnd) => {
+    const segs = list
+      .filter((ev) => ev.end >= winStart && ev.start <= winEnd)
+      .map((ev) => {
+        const s = ev.start < winStart ? winStart : ev.start;
+        const e = ev.end > winEnd ? winEnd : ev.end;
+        return {
+          ev,
+          // Rounded, not floored: a window that spans a daylight-saving change
+          // is 6.96 or 7.04 days long, and flooring would shunt every bar after
+          // the change back a column.
+          colStart: Math.round((s - winStart) / 86400000),
+          colEnd: Math.round((e - winStart) / 86400000),
+          openLeft: ev.start < winStart,
+          openRight: ev.end > winEnd,
+        };
+      })
+      .sort((a, b) => a.colStart - b.colStart || (b.colEnd - b.colStart) - (a.colEnd - a.colStart));
+    const lanes = packLanes(segs);
+    return { segs, lanes };
+  };
+
+  const openPopover = (e, ev) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    setPopover({ ev, x: r.left, y: r.bottom + 6 });
+  };
+
+  const monthLabel = monthStart.toLocaleDateString("en-US", { month: "long", year: "numeric" });
+
+  const Bar = ({ s }) => {
+    const color = (s.ev.person && s.ev.person.color) || "#4A6070";
+    return (
+      <button type="button"
+        className={cls("td-cal-bar", s.openLeft && "td-cal-bar-l", s.openRight && "td-cal-bar-r")}
+        style={{
+          gridColumn: (s.colStart + 1) + " / span " + (s.colEnd - s.colStart + 1),
+          gridRow: s.lane + 1,
+          background: color,
+          color: textOn(color),
+        }}
+        onClick={(e) => openPopover(e, s.ev)}
+        title={(s.ev.person ? s.ev.person.name : "Unknown") + " · " + shortAddress(s.ev.job) + " · " +
+               fmtDateRange(s.ev.assignment.startDate, s.ev.assignment.endDate)}>
+        <span className="td-cal-bar-text">
+          <strong>{s.ev.person ? s.ev.person.name : "Unknown"}</strong>
+          <span>{shortAddress(s.ev.job)}</span>
+        </span>
+      </button>
+    );
+  };
+
+  return (
+    <div className="td-cal">
+      <div className="td-panel">
+        <div className="td-panel-head td-cal-head">
+          <div className="td-cal-nav">
+            <button className="td-btn td-btn-sm" onClick={() => setCursor(startOfMonth(new Date(cursor.getFullYear(), cursor.getMonth() - 1, 1)))} aria-label="Previous month"><ChevronLeft size={14} /></button>
+            <button className="td-btn td-btn-sm" onClick={() => setCursor(startOfMonth(new Date()))}>Today</button>
+            <button className="td-btn td-btn-sm" onClick={() => setCursor(startOfMonth(new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1)))} aria-label="Next month"><ChevronRight size={14} /></button>
+            <div className="td-cal-month">{monthLabel}</div>
+          </div>
+
+          <div className="td-cal-controls">
+            <select className="td-select" value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)}>
+              <option value="all">All roles</option>
+              {scheduledRoleKeys().map((k) => <option key={k} value={k}>{assigneeRole(k).label}</option>)}
+            </select>
+            <select className="td-select" value={personFilter} onChange={(e) => setPersonFilter(e.target.value)}>
+              <option value="all">Everyone</option>
+              {everyone.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+            <div className="td-cal-modes">
+              <button type="button" className={cls("td-cal-mode", mode === "month" && "active")} onClick={() => setMode("month")}>
+                <LayoutGrid size={13} /> Month
+              </button>
+              <button type="button" className={cls("td-cal-mode", mode === "people" && "active")} onClick={() => setMode("people")}>
+                <Users size={13} /> By person
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {inMonth.length === 0 ? (
+          <EmptyState icon={CalendarIcon} title={"Nothing scheduled in " + monthLabel}
+            sub="Assign an installer or a service crew on a job card and give them a date range — it shows up here." />
+        ) : mode === "month" ? (
+          <div className="td-cal-month-grid">
+            <div className="td-cal-weekdays">
+              {WEEKDAYS.map((d) => <div key={d}>{d}</div>)}
+            </div>
+            {weeks.map((w) => {
+              const wEnd = addDaysTo(w, 6);
+              const { segs, lanes } = segmentsFor(inMonth, w, wEnd);
+              return (
+                <div className="td-cal-week" key={+w}>
+                  <div className="td-cal-days">
+                    {WEEKDAYS.map((_, i) => {
+                      const d = addDaysTo(w, i);
+                      return (
+                        <div key={i} className={cls("td-cal-day",
+                          d.getMonth() !== monthStart.getMonth() && "td-cal-day-out",
+                          sameDay(d, today) && "td-cal-day-today")}>
+                          <span className="td-cal-daynum">{d.getDate()}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <div className="td-cal-lanes" style={{ gridTemplateRows: "repeat(" + Math.max(lanes, 1) + ", auto)" }}>
+                    {segs.map((s) => <Bar key={s.ev.id} s={s} />)}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="td-cal-people-scroll">
+            <div className="td-cal-people" style={{ "--days": daysInMonth }}>
+              <div className="td-cal-people-row td-cal-people-head">
+                <div className="td-cal-person-name" />
+                <div className="td-cal-person-track td-cal-person-dates">
+                  {Array.from({ length: daysInMonth }, (_, i) => {
+                    const d = addDaysTo(monthStart, i);
+                    return (
+                      <div key={i} className={cls("td-cal-pday", sameDay(d, today) && "td-cal-day-today",
+                        (d.getDay() === 0 || d.getDay() === 6) && "td-cal-pday-weekend")}>
+                        <span>{WEEKDAYS[(d.getDay() + 6) % 7][0]}</span>
+                        <strong>{d.getDate()}</strong>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+              {peopleThisMonth.map((p) => {
+                const mine = inMonth.filter((ev) => ev.person && ev.person.id === p.id);
+                const { segs, lanes } = segmentsFor(mine, monthStart, monthEnd);
+                return (
+                  <div className="td-cal-people-row" key={p.id}>
+                    <div className="td-cal-person-name">
+                      <span className="td-cal-dot" style={{ background: p.color }} />
+                      <span className="td-cal-person-label">{p.name}</span>
+                    </div>
+                    <div className="td-cal-person-track"
+                      style={{ gridTemplateRows: "repeat(" + Math.max(lanes, 1) + ", auto)" }}>
+                      {segs.map((s) => <Bar key={s.ev.id} s={s} />)}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {popover && (
+        <CalendarPopover ev={popover.ev} x={popover.x} y={popover.y}
+          assigneeById={assigneeById}
+          onClose={() => setPopover(null)}
+          onOpenJob={() => { setSelectedJobId(popover.ev.job.id); setPopover(null); }} />
+      )}
+    </div>
+  );
+}
+
+/**
+ * The detail behind a block. A bar is too small to carry the job number, the
+ * stage and who else is on site, so it carries the address and this carries
+ * the rest.
+ */
+function CalendarPopover({ ev, x, y, assigneeById, onClose, onOpenJob }) {
+  const ref = useRef(null);
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    const onDown = (e) => { if (ref.current && !ref.current.contains(e.target)) onClose(); };
+    document.addEventListener("keydown", onKey);
+    // Deferred: the click that opened this popover is still propagating, and
+    // without the delay it closes itself on the way back up.
+    const t = setTimeout(() => document.addEventListener("mousedown", onDown), 0);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onDown);
+      clearTimeout(t);
+    };
+  }, [onClose]);
+
+  const job = ev.job;
+  const stage = STAGES.find((s) => s.key === job.stage);
+  const others = (job.assignments || [])
+    .filter((a) => a.id !== ev.assignment.id)
+    .map((a) => ({ a, p: assigneeById.get(a.assigneeId) }))
+    .filter((o) => o.p);
+
+  // Keep it on screen when the bar that opened it sits near an edge.
+  const left = Math.min(Math.max(8, x), (typeof window !== "undefined" ? window.innerWidth : 1200) - 308);
+  const color = (ev.person && ev.person.color) || "#4A6070";
+
+  return (
+    <div className="td-cal-pop" ref={ref} style={{ left, top: y }} role="dialog">
+      <div className="td-cal-pop-head">
+        <span className="td-assign-chip" style={{ background: color, color: textOn(color) }}>
+          {ev.person ? ev.person.name : "Unknown"}
+        </span>
+        <span className="td-cell-sub">{assigneeRole(ev.assignment.role).label}</span>
+        <div style={{ flex: 1 }} />
+        <IconBtn icon={X} title="Close" onClick={onClose} />
+      </div>
+
+      <div className="td-cal-pop-dates">
+        <CalendarIcon size={13} /> {fmtDateRange(ev.assignment.startDate, ev.assignment.endDate)}
+      </div>
+
+      <div className="td-cal-pop-job">
+        <div className="td-cal-pop-addr"><Building2 size={13} /> {job.customerAddress || "—"}</div>
+        <div className="td-cell-sub">{job.customerName} · {jobRef(job)}</div>
+        <div className="td-cal-pop-meta">
+          <StatusPill>{stage ? stage.label : job.stage}</StatusPill>
+          <span className="td-cal-pop-amt">{money(job.contractAmount)}</span>
+        </div>
+      </div>
+
+      {others.length > 0 && (
+        <div className="td-cal-pop-others">
+          <span className="td-field-label">Also on this job</span>
+          {others.map(({ a, p }) => (
+            <div key={a.id} className="td-cal-pop-other">
+              <span className="td-cal-dot" style={{ background: p.color }} />
+              <span>{p.name}</span>
+              <span className="td-cell-sub">{assigneeRole(a.role).label}</span>
+              {a.startDate && <span className="td-cell-sub">{fmtDateRange(a.startDate, a.endDate)}</span>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <button className="td-btn td-btn-primary td-btn-sm td-cal-pop-open" onClick={onOpenJob}>
+        Open job <ChevronRight size={13} />
+      </button>
+    </div>
+  );
+}
+
 function GlobalStyle() {
   return (
     <style>{`
@@ -2744,6 +3391,114 @@ function GlobalStyle() {
       .td-deal-field-amount .td-input { font-weight: 700; }
       .td-hold-toggle { white-space: nowrap; }
       .td-substage-chip { white-space: nowrap; }
+
+      /* ---------- Assignments on the job card ---------- */
+      .td-assign { display: grid; gap: 12px 18px; margin: 12px 0 2px; padding: 11px 13px;
+        border: 1px solid var(--td-border); border-radius: var(--td-radius); background: #FBF9F5;
+        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); align-items: start; }
+      .td-assign-role { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+      .td-assign-role-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+      .td-assign-note { font-size: 10.5px; color: var(--td-muted); font-style: italic; }
+      .td-assign-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+        background: var(--td-card); border: 1px solid var(--td-border); border-radius: 4px; padding: 5px 6px; }
+      .td-assign-chip { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px;
+        border-radius: 3px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+      .td-assign-retired { opacity: .7; }
+      .td-assign-dates { display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px;
+        border: 1px dashed var(--td-border); border-radius: 3px; background: transparent;
+        font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: var(--td-text); cursor: pointer; }
+      .td-assign-dates:hover { border-style: solid; border-color: var(--td-accent); }
+      .td-assign-dates-empty { color: var(--td-muted); font-family: 'Inter', sans-serif; font-style: italic; }
+      .td-assign-date { width: 132px; min-width: 0; padding: 4px 6px; font-size: 12px; }
+      .td-assign-dash { color: var(--td-muted); font-size: 12px; }
+      .td-assign-add { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
+      .td-assign-add .td-select, .td-assign-add .td-input { min-width: 0; }
+      .td-assign-add > .td-select { flex: 1 1 150px; }
+      .td-btn-ghost { background: transparent; border-color: transparent; color: var(--td-muted); }
+      .td-btn-ghost:hover { color: var(--td-text); }
+
+      /* ---------- Calendar ---------- */
+      .td-cal-head { align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+      .td-cal-nav { display: flex; align-items: center; gap: 6px; }
+      .td-cal-month { font-family: 'Oswald', sans-serif; font-size: 16px; font-weight: 600; margin-left: 6px; }
+      .td-cal-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .td-cal-modes { display: flex; border: 1px solid var(--td-border); border-radius: var(--td-radius); overflow: hidden; }
+      .td-cal-mode { display: flex; align-items: center; gap: 5px; padding: 6px 10px; border: none;
+        background: var(--td-card); font-size: 12px; font-weight: 600; color: var(--td-muted); cursor: pointer; }
+      .td-cal-mode.active { background: var(--td-ink); color: var(--td-ink-text); }
+
+      .td-cal-weekdays { display: grid; grid-template-columns: repeat(7, 1fr);
+        font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; font-weight: 700;
+        color: var(--td-muted); padding: 0 0 5px; }
+      .td-cal-weekdays > div { padding-left: 6px; }
+      .td-cal-week { border: 1px solid var(--td-border); border-radius: var(--td-radius);
+        margin-bottom: 7px; overflow: hidden; background: var(--td-card); }
+      .td-cal-days { display: grid; grid-template-columns: repeat(7, 1fr); }
+      .td-cal-day { min-height: 22px; padding: 3px 6px; border-right: 1px solid var(--td-track); }
+      .td-cal-day:last-child { border-right: none; }
+      .td-cal-day-out { background: #F7F4EC; }
+      .td-cal-daynum { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--td-muted); }
+      .td-cal-day-out .td-cal-daynum { opacity: .55; }
+      .td-cal-day-today { background: #FDF0E8; }
+      .td-cal-day-today .td-cal-daynum { color: var(--td-accent); font-weight: 700; }
+      /* Bars live on their own grid under the day numbers rather than inside a
+         cell, which is what lets one run from Tuesday to Friday as a single
+         block instead of four disconnected pills. */
+      .td-cal-lanes { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px;
+        padding: 2px 2px 5px; }
+      .td-cal-bar { display: block; min-width: 0; overflow: hidden; text-align: left;
+        border: none; border-radius: 3px; padding: 3px 6px; font: inherit; font-size: 11px;
+        line-height: 1.25; cursor: pointer; }
+      .td-cal-bar:hover { filter: brightness(1.08); }
+      /* A run that carries on past the edge of the window is squared off there,
+         so a four-day job does not read as ending on Sunday. */
+      .td-cal-bar-l { border-top-left-radius: 0; border-bottom-left-radius: 0; }
+      .td-cal-bar-r { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+      .td-cal-bar-text { display: flex; gap: 6px; align-items: baseline; min-width: 0; }
+      .td-cal-bar-text strong { font-weight: 700; white-space: nowrap; }
+      .td-cal-bar-text span { opacity: .85; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+      .td-cal-people-scroll { overflow-x: auto; }
+      .td-cal-people { --col: 30px; min-width: min-content; }
+      .td-cal-people-row { display: grid; grid-template-columns: 148px calc(var(--days) * var(--col));
+        border-bottom: 1px solid var(--td-track); }
+      .td-cal-people-row:last-child { border-bottom: none; }
+      .td-cal-people-head { border-bottom: 1px solid var(--td-border); }
+      .td-cal-person-name { display: flex; align-items: center; gap: 7px; padding: 7px 10px 7px 2px;
+        font-size: 12.5px; font-weight: 600; position: sticky; left: 0; background: var(--td-card); z-index: 1;
+        border-right: 1px solid var(--td-track); }
+      .td-cal-person-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .td-cal-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+      .td-cal-person-track { display: grid; grid-template-columns: repeat(var(--days), var(--col));
+        gap: 2px; padding: 4px 0; align-content: start; }
+      .td-cal-person-dates { gap: 0; padding: 0; }
+      .td-cal-pday { display: flex; flex-direction: column; align-items: center; justify-content: center;
+        padding: 4px 0; border-right: 1px solid var(--td-track); font-size: 9px; color: var(--td-muted); }
+      .td-cal-pday strong { font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600; }
+      .td-cal-pday-weekend { background: #F7F4EC; }
+
+      .td-cal-pop { position: fixed; z-index: 120; width: 300px; display: flex; flex-direction: column; gap: 9px;
+        background: var(--td-card); border: 1px solid var(--td-border); border-radius: var(--td-radius);
+        padding: 12px; box-shadow: 0 10px 30px rgba(34,30,23,.18); }
+      .td-cal-pop-head { display: flex; align-items: center; gap: 8px; }
+      .td-cal-pop-dates { display: flex; align-items: center; gap: 6px;
+        font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; font-weight: 600; }
+      .td-cal-pop-job { display: flex; flex-direction: column; gap: 4px;
+        border-top: 1px solid var(--td-track); padding-top: 9px; }
+      .td-cal-pop-addr { display: flex; align-items: flex-start; gap: 6px; font-size: 13px; font-weight: 600; line-height: 1.3; }
+      .td-cal-pop-addr svg { flex: none; margin-top: 2px; }
+      .td-cal-pop-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 3px; }
+      .td-cal-pop-amt { font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 700; }
+      .td-cal-pop-others { display: flex; flex-direction: column; gap: 4px;
+        border-top: 1px solid var(--td-track); padding-top: 9px; }
+      .td-cal-pop-other { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+      .td-cal-pop-open { justify-content: center; }
+
+      @media (max-width: 720px) {
+        .td-cal-bar-text span { display: none; }
+        .td-cal-person-name { width: 120px; }
+        .td-cal-people-row { grid-template-columns: 120px calc(var(--days) * var(--col)); }
+      }
 
       /* ---------- Job detail ---------- */
       .td-job-detail { display: flex; flex-direction: column; gap: 4px; }

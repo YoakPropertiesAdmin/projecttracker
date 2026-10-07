@@ -65,6 +65,9 @@ const jobFromRow = (r) => ({
   createdAt: toIso(r.created_at),
   clientPayments: [],
   vendorPayments: [],
+  // Project manager / installers / services working this job. Filled by
+  // loadAll from job_assignments; the calendar reads the same rows.
+  assignments: [],
 });
 
 const jobToRow = (j) => {
@@ -140,6 +143,28 @@ const vendorPaymentFromRow = (r) => ({
   note: r.note || "",
 });
 
+const assigneeFromRow = (r) => ({
+  id: r.id,
+  role: r.role,
+  name: r.name,
+  // Allocated once by the database at insert and then fixed, which is what
+  // keeps one person one colour on the calendar even after a rename.
+  color: r.color,
+  active: r.active !== false,
+});
+
+const assignmentFromRow = (r) => ({
+  id: r.id,
+  jobId: r.job_id,
+  assigneeId: r.assignee_id,
+  role: r.role,
+  // Bare "YYYY-MM-DD" straight through. A work day has no timezone, and
+  // converting it to an instant is what lands a block on the wrong day.
+  startDate: r.start_date || null,
+  endDate: r.end_date || null,
+  note: r.note || "",
+});
+
 /* ---------------------------------------------------------------------------
    Supabase implementation
    --------------------------------------------------------------------------- */
@@ -151,7 +176,9 @@ const friendly = (error) => {
   const code = error.code || "";
   const msg = error.message || "";
   if (code === "23505" && msg.includes("vendors_name_unique")) return "a vendor with that name already exists";
+  if (code === "23505" && msg.includes("assignees_role_name_uniq")) return "someone with that name is already on this list";
   if (code === "23505") return "that record already exists";
+  if (code === "23514" && msg.includes("job_assignments_date_order")) return "the end date is before the start date";
   if (code === "23503") return "the job or vendor it belongs to no longer exists — someone may have just deleted it";
   if (code === "23514") return "the amount is not valid (it cannot be negative)";
   if (code === "42501" || code === "PGRST301") return "your sign-in has expired — sign in again";
@@ -171,7 +198,8 @@ const supabaseRepo = {
   mode: "supabase",
 
   async loadAll() {
-    const [jobRows, vendorRows, cpRows, vpRows, tradeRows, flagRows, payTypeRows, ageRuleRows] = await Promise.all([
+    const [jobRows, vendorRows, cpRows, vpRows, tradeRows, flagRows, payTypeRows, ageRuleRows,
+           roleRows, assigneeRows, assignmentRows] = await Promise.all([
       supabase.from("jobs").select("*").order("number", { ascending: false }).then(unwrap),
       supabase.from("vendors").select("*").order("name", { ascending: true }).then(unwrap),
       supabase.from("client_payments").select("*").order("payment_date", { ascending: false }).then(unwrap),
@@ -182,15 +210,23 @@ const supabaseRepo = {
       supabase.from("job_flags").select("*").order("sort_order").then(unwrap),
       supabase.from("payment_types").select("*").eq("active", true).order("sort_order").then(unwrap),
       supabase.from("job_age_rules").select("*").eq("active", true).order("sort_order").then(unwrap),
+      supabase.from("assignee_roles").select("*").order("sort_order").then(unwrap),
+      // Deliberately NOT filtered to active: someone retired from the dropdown
+      // is still named on the jobs they already worked, and a block with no
+      // name or colour is worse than a block for someone who has left.
+      supabase.from("assignees").select("*").order("name", { ascending: true }).then(unwrap),
+      supabase.from("job_assignments").select("*").then(unwrap),
     ]);
 
     const jobs = jobRows.map(jobFromRow);
     const byId = new Map(jobs.map((j) => [j.id, j]));
     cpRows.forEach((r) => byId.get(r.job_id)?.clientPayments.push(clientPaymentFromRow(r)));
     vpRows.forEach((r) => byId.get(r.job_id)?.vendorPayments.push(vendorPaymentFromRow(r)));
+    assignmentRows.forEach((r) => byId.get(r.job_id)?.assignments.push(assignmentFromRow(r)));
 
     return { jobs, vendors: vendorRows.map(vendorFromRow), trades: tradeRows, jobFlags: flagRows,
-             paymentTypes: payTypeRows, ageRules: ageRuleRows };
+             paymentTypes: payTypeRows, ageRules: ageRuleRows,
+             assigneeRoles: roleRows, assignees: assigneeRows.map(assigneeFromRow) };
   },
 
   // Seeding is a database concern in Supabase mode, not something the browser
@@ -305,6 +341,67 @@ const supabaseRepo = {
     // survives with its vendor_name snapshot intact.
     await supabase.from("vendors").delete().eq("id", id).then(unwrap);
   },
+
+  /**
+   * Turn a typed-in name into an assignee row, or hand back the one that is
+   * already there.
+   *
+   * Insert-then-recover rather than select-then-insert: two people adding the
+   * same installer at the same moment both pass a prior SELECT and one of them
+   * then fails. Letting the unique index decide is the only version without a
+   * race. The id and the colour are both assigned server-side, so this is the
+   * one mutator the UI has to await before it can render anything.
+   */
+  async ensureAssignee(role, rawName) {
+    const name = String(rawName || "").trim();
+    if (!name) throw new Error("a name is required");
+
+    const ins = await supabase.from("assignees").insert({ role, name }).select().single();
+    if (!ins.error) return assigneeFromRow(ins.data);
+    if (ins.error.code !== "23505") throw Object.assign(new Error(friendly(ins.error)), { code: ins.error.code });
+
+    // Already there under this role. Match in JS rather than with ilike(),
+    // whose % and _ are wildcards — a perfectly ordinary thing to have in a
+    // company name.
+    const rows = await supabase.from("assignees").select("*").eq("role", role).then(unwrap);
+    const hit = rows.find((r) => String(r.name).trim().toLowerCase() === name.toLowerCase());
+    if (!hit) throw new Error(friendly(ins.error));
+
+    // Retired from the dropdown and now typed in again: that is a request to
+    // bring them back, not a duplicate.
+    if (hit.active === false) {
+      await supabase.from("assignees").update({ active: true }).eq("id", hit.id).then(unwrap);
+      hit.active = true;
+    }
+    return assigneeFromRow(hit);
+  },
+
+  async createAssignment(jobId, a) {
+    await supabase
+      .from("job_assignments")
+      .insert({
+        id: a.id,
+        job_id: jobId,
+        assignee_id: a.assigneeId,
+        role: a.role,
+        start_date: a.startDate || null,
+        end_date: a.endDate || null,
+        note: a.note || "",
+      })
+      .then(unwrap);
+  },
+
+  async updateAssignment(id, patch) {
+    const row = {};
+    if (patch.startDate !== undefined) row.start_date = patch.startDate || null;
+    if (patch.endDate !== undefined) row.end_date = patch.endDate || null;
+    if (patch.note !== undefined) row.note = patch.note || "";
+    await supabase.from("job_assignments").update(row).eq("id", id).then(unwrap);
+  },
+
+  async deleteAssignment(id) {
+    await supabase.from("job_assignments").delete().eq("id", id).then(unwrap);
+  },
 };
 
 /* ---------------------------------------------------------------------------
@@ -329,6 +426,12 @@ const localRepo = {
       cache = res && res.value ? JSON.parse(res.value) : null;
     } catch {
       cache = null;
+    }
+    // Blobs written before assignments existed have neither key; fill them in
+    // so every caller sees the same shape Supabase mode returns.
+    if (cache) {
+      cache.assignees = cache.assignees || [];
+      cache.jobs = (cache.jobs || []).map((j) => ({ ...j, assignments: j.assignments || [] }));
     }
     return cache;
   },
@@ -365,6 +468,49 @@ const localRepo = {
   },
   async deleteVendorPayment(jobId, paymentId) {
     return mapJob(jobId, (j) => ({ ...j, vendorPayments: (j.vendorPayments || []).filter((p) => p.id !== paymentId) }));
+  },
+
+  // The dev fallback keeps assignees alongside jobs in the same blob. The
+  // colour rotation mirrors allocate_assignee_color() closely enough that the
+  // calendar looks the same here as it does against Supabase.
+  async ensureAssignee(role, rawName) {
+    const name = String(rawName || "").trim();
+    if (!name) throw new Error("a name is required");
+    cache.assignees = cache.assignees || [];
+    const hit = cache.assignees.find(
+      (a) => a.role === role && a.name.trim().toLowerCase() === name.toLowerCase());
+    if (hit) { hit.active = true; await persistLocal(); return hit; }
+
+    const sameName = cache.assignees.find((a) => a.name.trim().toLowerCase() === name.toLowerCase());
+    const palette = ["#B23A48", "#2F5AA8", "#2F7A4A", "#C2601F", "#5347A3", "#12786B", "#A13580",
+                     "#5F7A1E", "#1C6E92", "#7A4B2E", "#7A3F99", "#9A7A12", "#A8365C", "#2E6B5F",
+                     "#4A6070", "#6B6B2E"];
+    const used = new Map(palette.map((h) => [h, 0]));
+    cache.assignees.forEach((a) => used.set(a.color, (used.get(a.color) || 0) + 1));
+    const color = sameName ? sameName.color
+      : palette.slice().sort((a, b) => (used.get(a) || 0) - (used.get(b) || 0))[0];
+
+    const created = { id: "as-" + Math.random().toString(36).slice(2, 10), role, name, color, active: true };
+    cache.assignees = [...cache.assignees, created];
+    await persistLocal();
+    return created;
+  },
+  async createAssignment(jobId, a) {
+    return mapJob(jobId, (j) => ({ ...j, assignments: [...(j.assignments || []), { ...a, jobId }] }));
+  },
+  async updateAssignment(id, patch) {
+    cache.jobs = cache.jobs.map((j) => ({
+      ...j,
+      assignments: (j.assignments || []).map((a) => (a.id === id ? { ...a, ...patch } : a)),
+    }));
+    return persistLocal();
+  },
+  async deleteAssignment(id) {
+    cache.jobs = cache.jobs.map((j) => ({
+      ...j,
+      assignments: (j.assignments || []).filter((a) => a.id !== id),
+    }));
+    return persistLocal();
   },
 
   async createVendor(vendor) { cache.vendors = [vendor, ...cache.vendors]; return persistLocal(); },
