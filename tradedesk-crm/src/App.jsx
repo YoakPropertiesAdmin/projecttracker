@@ -9,7 +9,7 @@ import {
   AlertTriangle, Tag, Building2, Menu, ClipboardList, RefreshCw,
   Wallet, HandCoins, Percent, Calendar as CalendarIcon, LogOut,
   Hammer, Wrench, PaintBucket, Droplets, Thermometer, PackageCheck, ShoppingCart,
-  Download, FileSpreadsheet, SlidersHorizontal, ArrowDownUp
+  Download, FileSpreadsheet, SlidersHorizontal, ArrowDownUp, ShieldCheck, Link2
 } from "lucide-react";
 
 /* =========================================================================
@@ -563,7 +563,7 @@ function buildSeedData() {
     },
   ];
 
-  return { jobs, vendors, counters: { job: 1008 } };
+  return { jobs, vendors, counters: { job: 1008 }, role: "admin" };
 }
 
 /* =========================================================================
@@ -778,6 +778,14 @@ export default function App() {
   const vendors = safeData.vendors;
   const assignees = safeData.assignees || [];
 
+  // What this login is allowed to see, as resolved by the database. This is
+  // presentation only — RLS has already decided what rows arrive, and these
+  // flags exist so a project manager sees no panel at all rather than a panel
+  // reading $0. Anything gated on them must also be gated in Postgres.
+  const role = safeData.role || "project_manager";
+  const isAdmin = role === "admin" || role === "super_admin";
+  const isSuperAdmin = role === "super_admin";
+
   const vendorNames = useMemo(() => vendors.map((v) => v.name), [vendors]);
 
   // Every assignment on the board needs its person's name and colour, and the
@@ -981,6 +989,7 @@ export default function App() {
   const ctx = {
     data: safeData, jobs, vendors, vendorNames, vendorSpend,
     assignees, assigneeById,
+    role, isAdmin, isSuperAdmin, reload,
     addJob, updateJob, deleteJob,
     addClientPayment, deleteClientPayment,
     addVendorPayment, updateVendorPayment, deleteVendorPayment,
@@ -994,9 +1003,19 @@ export default function App() {
     { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
     { key: "jobs", label: "Jobs", icon: LayoutGrid },
     { key: "calendar", label: "Calendar", icon: CalendarIcon },
-    { key: "vendors", label: "Vendors", icon: Truck },
-    { key: "reports", label: "Reports", icon: TrendingUp },
+    // The vendor directory and the reports are both whole-company money, so
+    // they are not offered to a project manager. The tables behind them are
+    // closed to that role too; this only stops the empty screen.
+    ...(isAdmin ? [
+      { key: "vendors", label: "Vendors", icon: Truck },
+      { key: "reports", label: "Reports", icon: TrendingUp },
+    ] : []),
+    ...(isSuperAdmin ? [{ key: "access", label: "Access", icon: ShieldCheck }] : []),
   ];
+
+  // A role change mid-session (or a stale tab) could leave the view pointing
+  // at a screen this login no longer has.
+  const safeView = NAV.some((n) => n.key === view) ? view : "dashboard";
 
   // All hooks above run unconditionally on every render; only the returned
   // JSX branches on load state, which keeps hook order stable (Rules of Hooks).
@@ -1039,7 +1058,7 @@ export default function App() {
           <nav className="td-nav">
             {NAV.map((n) => (
               <button key={n.key} type="button"
-                className={cls("td-nav-item", view === n.key && "active")}
+                className={cls("td-nav-item", safeView === n.key && "active")}
                 onClick={() => { setView(n.key); setSidebarOpen(false); }}>
                 <n.icon size={16} strokeWidth={2.2} />
                 <span>{n.label}</span>
@@ -1066,14 +1085,16 @@ export default function App() {
         <div className="td-main">
           <header className="td-topbar">
             <button className="td-hamburger" onClick={() => setSidebarOpen((v) => !v)} aria-label="Menu"><Menu size={18} /></button>
-            <div className="td-topbar-title">{NAV.find((n) => n.key === view)?.label}</div>
+            <div className="td-topbar-title">{NAV.find((n) => n.key === safeView)?.label}</div>
             <div className="td-topbar-search">
               <Search size={14} />
               <input placeholder="Search by customer, address, project # or job #…" value={search} onChange={(e) => setSearch(e.target.value)} />
             </div>
-            <button className="td-btn td-btn-primary" onClick={() => setShowAddJob(true)}>
-              <Plus size={15} /> New job
-            </button>
+            {isAdmin && (
+              <button className="td-btn td-btn-primary" onClick={() => setShowAddJob(true)}>
+                <Plus size={15} /> New job
+              </button>
+            )}
           </header>
 
           {(loadError || persistError) && (
@@ -1085,11 +1106,12 @@ export default function App() {
           )}
 
           <main className="td-content">
-            {view === "dashboard" && <DashboardView ctx={ctx} setView={setView} />}
-            {view === "jobs" && <JobsView ctx={ctx} />}
-            {view === "calendar" && <CalendarView ctx={ctx} />}
-            {view === "vendors" && <VendorsView ctx={ctx} />}
-            {view === "reports" && <ReportsView ctx={ctx} />}
+            {safeView === "dashboard" && <DashboardView ctx={ctx} setView={setView} />}
+            {safeView === "jobs" && <JobsView ctx={ctx} />}
+            {safeView === "calendar" && <CalendarView ctx={ctx} />}
+            {safeView === "vendors" && isAdmin && <VendorsView ctx={ctx} />}
+            {safeView === "reports" && isAdmin && <ReportsView ctx={ctx} />}
+            {safeView === "access" && isSuperAdmin && <AccessView ctx={ctx} />}
           </main>
         </div>
       </div>
@@ -1148,8 +1170,12 @@ function DashboardView({ ctx, setView }) {
       <div className="td-stat-row">
         <TicketStat label="Active jobs" value={activeJobs.length} icon={LayoutGrid} accent="#3F8EA6" footnote={jobs.length + " total"} />
         <TicketStat label="Active contract value" value={money(activeContractValue)} icon={DollarSign} accent="#B8860B" />
-        <TicketStat label="Client balance outstanding" value={money(arOutstanding)} icon={Wallet} accent="#C1440E" footnote="Owed to you" />
-        <TicketStat label="Vendor balance outstanding" value={money(apOutstanding)} icon={HandCoins} accent="#B23A2E" footnote="You owe" />
+        {ctx.isAdmin && (
+          <>
+            <TicketStat label="Client balance outstanding" value={money(arOutstanding)} icon={Wallet} accent="#C1440E" footnote="Owed to you" />
+            <TicketStat label="Vendor balance outstanding" value={money(apOutstanding)} icon={HandCoins} accent="#B23A2E" footnote="You owe" />
+          </>
+        )}
       </div>
 
       <div className="td-dash-grid">
@@ -1181,6 +1207,7 @@ function DashboardView({ ctx, setView }) {
           )}
         </div>
 
+        {ctx.isAdmin && (
         <div className="td-panel" style={{ gridColumn: "1 / -1" }}>
           <div className="td-panel-head"><span>Recent payment activity</span></div>
           {recentActivity.length === 0 ? (
@@ -1202,6 +1229,7 @@ function DashboardView({ ctx, setView }) {
             </div>
           )}
         </div>
+        )}
       </div>
     </div>
   );
@@ -1243,6 +1271,9 @@ function JobsView({ ctx }) {
 
   const onDrop = (stageKey) => (e) => {
     e.preventDefault();
+    // The stage is the board position, and a project manager does not move
+    // jobs across the board. The trigger on `jobs` refuses it anyway.
+    if (!ctx.isAdmin) { setDragOverStage(null); setDraggingId(null); return; }
     const id = e.dataTransfer.getData("text/plain");
     if (id) updateJob(id, { stage: stageKey });
     setDragOverStage(null);
@@ -1359,9 +1390,12 @@ function JobsView({ ctx }) {
 
 function JobTicket({ job, ctx, dragging, onDragStart, onDragEnd }) {
   const t = TRADES[job.trade];
-  const bal = clientBalance(job);
-  const owed = vendorPending(job);
-  const paid = isPaidInFull(job);
+  // A project manager gets no payment rows at all, so these would read as a
+  // full balance due on every card. The contract amount stays — that is the
+  // job's worth, which they are meant to see.
+  const bal = ctx.isAdmin ? clientBalance(job) : 0;
+  const owed = ctx.isAdmin ? vendorPending(job) : 0;
+  const paid = ctx.isAdmin ? isPaidInFull(job) : false;
   // Stalled past a threshold and still short of Scheduled. Overrides the hold
   // tint below: a held job that has also gone quiet for ten weeks is the more
   // urgent fact, and two pale washes fighting each other says neither.
@@ -1376,7 +1410,7 @@ function JobTicket({ job, ctx, dragging, onDragStart, onDragEnd }) {
       style={{ "--tc": t ? t.color : "#8A8478",
                ...(jobFlag(job) && jobFlag(job).tint ? { background: jobFlag(job).tint, borderColor: "#E6D3A6" } : {}),
                ...(isOverdue ? { background: "#FBE0DA", borderColor: "#C25B47" } : {}) }}
-      draggable onDragStart={onDragStart} onDragEnd={onDragEnd}
+      draggable={ctx.isAdmin} onDragStart={onDragStart} onDragEnd={onDragEnd}
       onClick={() => ctx.setSelectedJobId(job.id)}>
       {(jobFlag(job) || isOverdue) && (
         <span className="td-ticket-flagmark">
@@ -1492,6 +1526,12 @@ function JobDetailModal({ ctx, job, onClose }) {
 
   if (!job) return null;
 
+  // A project manager can change the notes on a job and the dates of their own
+  // assignment, and nothing else. Both guard triggers in the database enforce
+  // that; this keeps the controls off the screen rather than letting someone
+  // type into a field whose save will be refused.
+  const canManage = ctx.isAdmin;
+
   const received = clientReceived(job);
   const balance = clientBalance(job);
   const vPaid = vendorPaid(job);
@@ -1547,7 +1587,9 @@ function JobDetailModal({ ctx, job, onClose }) {
   return (
     <Modal title={jobRef(job) + " · " + job.customerName} onClose={onClose} wide
       footer={<>
-        <button className="td-btn td-btn-danger" onClick={() => { if (confirm("Delete this job? This can't be undone.")) deleteJob(job.id); }}><Trash2 size={13} /> Delete job</button>
+        {canManage && (
+          <button className="td-btn td-btn-danger" onClick={() => { if (confirm("Delete this job? This can't be undone.")) deleteJob(job.id); }}><Trash2 size={13} /> Delete job</button>
+        )}
         <div style={{ flex: 1 }} />
         <button className="td-btn td-btn-primary" onClick={() => { updateJob(job.id, { notes }); onClose(); }}>Save & close</button>
       </>}>
@@ -1565,13 +1607,16 @@ function JobDetailModal({ ctx, job, onClose }) {
           <div className="td-deal-meta">
             <TradeBadge trade={job.trade} />
             {job.substage && <span className="td-substage-chip" title="Stage name from GoHighLevel">{job.substage}</span>}
-            <button type="button"
-              className={cls("td-hold-toggle", job.isRepair && "active")}
-              onClick={() => updateJob(job.id, { isRepair: !job.isRepair })}
-              title="Repair work rather than a full replacement">
-              <Wrench size={13} /> {job.isRepair ? "Repair" : "Mark as repair"}
-            </button>
+            {canManage ? (
+              <button type="button"
+                className={cls("td-hold-toggle", job.isRepair && "active")}
+                onClick={() => updateJob(job.id, { isRepair: !job.isRepair })}
+                title="Repair work rather than a full replacement">
+                <Wrench size={13} /> {job.isRepair ? "Repair" : "Mark as repair"}
+              </button>
+            ) : (job.isRepair && <span className="td-substage-chip"><Wrench size={12} /> Repair</span>)}
           </div>
+          {canManage ? (
           <div className="td-deal-fields">
             <label className="td-deal-field">
               <span className="td-field-label">Stage</span>
@@ -1617,6 +1662,9 @@ function JobDetailModal({ ctx, job, onClose }) {
                 onChange={(e) => updateJob(job.id, { materialsOrderedDate: e.target.value || null })} />
             </label>
           </div>
+          ) : (
+            <ReadOnlyDealFields job={job} />
+          )}
 
           <JobAgeStatus job={job} />
         </div>
@@ -1626,6 +1674,7 @@ function JobDetailModal({ ctx, job, onClose }) {
 
         <JobAssignments ctx={ctx} job={job} />
 
+        {canManage && (<>
         <div className="td-payment-summary">
           <div className="td-payment-summary-item">
             <span className="td-field-label">Received</span>
@@ -1760,12 +1809,50 @@ function JobDetailModal({ ctx, job, onClose }) {
             </div>
           </div>
         </div>
+        </>)}
 
         <Field label="Job notes">
           <textarea className="td-textarea" rows={3} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Site access notes, material changes, punch list items…" />
         </Field>
       </div>
     </Modal>
+  );
+}
+
+/**
+ * What a project manager sees where the editable fields sit for everyone else.
+ *
+ * The contract amount is here on purpose — knowing what the job is worth is
+ * part of running it. Everything else on this card that is money (what has
+ * been received, what the vendors are owed, the margin) is not shown to them
+ * at all, and is not sent to the browser in the first place.
+ */
+function ReadOnlyDealFields({ job }) {
+  const stage = STAGES.find((s) => s.key === job.stage);
+  const trade = TRADES[job.trade];
+  return (
+    <div className="td-deal-fields td-deal-ro">
+      <div className="td-deal-field">
+        <span className="td-field-label">Stage</span>
+        <span className="td-deal-ro-value">{stage ? stage.label : job.stage}</span>
+      </div>
+      <div className="td-deal-field">
+        <span className="td-field-label">Project type</span>
+        <span className="td-deal-ro-value">{trade ? trade.label : job.trade}</span>
+      </div>
+      <div className="td-deal-field td-deal-field-amount">
+        <span className="td-field-label">Contract amount</span>
+        <span className="td-deal-ro-value">{money(job.contractAmount)}</span>
+      </div>
+      <div className="td-deal-field">
+        <span className="td-field-label">Contract signed</span>
+        <span className="td-deal-ro-value">{job.contractSignedDate ? fmtDateNum(job.contractSignedDate) : "—"}</span>
+      </div>
+      <div className="td-deal-field">
+        <span className="td-field-label">Materials ordered</span>
+        <span className="td-deal-ro-value">{job.materialsOrderedDate ? fmtDateNum(job.materialsOrderedDate) : "—"}</span>
+      </div>
+    </div>
   );
 }
 
@@ -1792,6 +1879,10 @@ function JobAssignments({ ctx, job }) {
 
 function AssignmentRole({ ctx, job, roleKey }) {
   const { assignees, assigneeById, addAssignment, updateAssignment, removeAssignment } = ctx;
+  // Who is on a job is the office's call. A project manager can move the dates
+  // of a crew already booked — that is the whole point of giving them the
+  // calendar — but cannot put someone on a job or take them off it.
+  const canManage = ctx.isAdmin;
   const role = assigneeRole(roleKey);
   const [pick, setPick] = useState("");
   const [newName, setNewName] = useState("");
@@ -1837,7 +1928,7 @@ function AssignmentRole({ ctx, job, roleKey }) {
       ) : (
         rows.map((a) => (
           <AssignmentRow key={a.id} a={a} person={assigneeById.get(a.assigneeId)}
-            scheduled={role.scheduled}
+            scheduled={role.scheduled} canManage={canManage}
             onChange={(patch) => updateAssignment(job.id, a.id, patch)}
             onRemove={() => {
               const who = (assigneeById.get(a.assigneeId) || {}).name || "this person";
@@ -1846,6 +1937,7 @@ function AssignmentRole({ ctx, job, roleKey }) {
         ))
       )}
 
+      {canManage && (
       <div className="td-assign-add">
         <select className="td-select" value={pick}
           onChange={(e) => { setPick(e.target.value); if (e.target.value !== "__new") setNewName(""); }}>
@@ -1874,6 +1966,7 @@ function AssignmentRole({ ctx, job, roleKey }) {
           {busy ? <RefreshCw size={13} className="td-spin" /> : <UserPlus size={13} />} Add
         </button>
       </div>
+      )}
     </div>
   );
 }
@@ -1883,7 +1976,7 @@ function AssignmentRole({ ctx, job, roleKey }) {
  * when clicked — two date inputs sitting open on every row turned a job with
  * four people on it into a wall of grey boxes.
  */
-function AssignmentRow({ a, person, scheduled, onChange, onRemove }) {
+function AssignmentRow({ a, person, scheduled, canManage, onChange, onRemove }) {
   const [editing, setEditing] = useState(false);
   const label = fmtDateRange(a.startDate, a.endDate);
   const color = (person && person.color) || "#4A6070";
@@ -1914,7 +2007,7 @@ function AssignmentRow({ a, person, scheduled, onChange, onRemove }) {
       ))}
 
       <div style={{ flex: 1 }} />
-      <IconBtn icon={Trash2} danger title="Remove from this job" onClick={onRemove} />
+      {canManage && <IconBtn icon={Trash2} danger title="Remove from this job" onClick={onRemove} />}
     </div>
   );
 }
@@ -3060,6 +3153,179 @@ function CalendarPopover({ ev, x, y, assigneeById, onClose, onOpenJob }) {
   );
 }
 
+/* =========================================================================
+   ACCESS — who can sign in, and what they get
+   -------------------------------------------------------------------------
+   Visible only to a super administrator, and only because the Access item is
+   left out of the nav for everyone else. That is not the control: every
+   function this screen calls checks is_super_admin() in Postgres and raises
+   42501 otherwise, and user_roles is writable by nobody else at all. The anon
+   key ships inside the browser bundle, so a screen is never a permission.
+
+   Two things are set here, and they do different jobs:
+
+     Role   — what the person can see. 'admin' is the office: every job, every
+              payment, the reports. 'project_manager' is their own jobs only,
+              with the contract amount but no other money.
+     Person — which name on the assignment lists is this login. can_see_job()
+              matches on exactly that, so a project manager with nobody linked
+              sees an empty board, which is why that case is called out below.
+   ========================================================================= */
+
+function AccessView({ ctx }) {
+  const { assignees, reload } = ctx;
+  const [users, setUsers] = useState(null);
+  const [roles, setRoles] = useState([]);
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState("");
+
+  const load = React.useCallback(async () => {
+    try {
+      const [u, r] = await Promise.all([repo.listUsers(), repo.listAppRoles()]);
+      setUsers(u);
+      setRoles(r);
+      setErr("");
+    } catch (e) {
+      setUsers([]);
+      setErr(e && e.message ? e.message : "Could not read the user list.");
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Every change here alters what somebody else is allowed to load, so the
+  // whole app is re-read afterwards rather than patched in place — including
+  // this user's own role, which they can lower but (by the database guard)
+  // never to the point of leaving nobody in charge.
+  const run = async (key, fn) => {
+    setBusy(key);
+    try {
+      await fn();
+      await load();
+      await reload();
+      setErr("");
+    } catch (e) {
+      setErr(e && e.message ? e.message : "That change was refused.");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const unlinked = assignees.filter((a) => !a.userId && a.active !== false);
+  const linkedTo = (userId) => assignees.filter((a) => a.userId === userId);
+  const roleLabel = (key) => (roles.find((r) => r.key === key) || {}).label || key;
+
+  return (
+    <div className="td-view">
+      <style>{`
+        .td-access-head{margin-bottom:14px;}
+        .td-access-head h2{margin:0 0 4px;font-size:16px;font-weight:650;}
+        .td-access-head p{margin:0;font-size:12.5px;line-height:1.5;color:#6E675C;max-width:66ch;}
+        .td-access-user{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;
+          padding:13px 15px;border-bottom:1px solid #EBE6DC;}
+        .td-access-user:last-child{border-bottom:none;}
+        .td-access-who{min-width:230px;flex:1;}
+        .td-access-email{font-size:13.5px;font-weight:600;word-break:break-all;}
+        .td-access-seen{font-size:11.5px;color:#8A8478;margin-top:2px;}
+        .td-access-people{display:flex;flex-wrap:wrap;align-items:center;gap:6px;flex:2;min-width:260px;}
+        .td-access-chip{display:inline-flex;align-items:center;gap:5px;padding:3px 6px 3px 9px;
+          border-radius:999px;font-size:11.5px;font-weight:600;color:#fff;}
+        .td-access-chip button{border:none;background:transparent;color:inherit;cursor:pointer;
+          padding:0;display:inline-flex;opacity:.75;}
+        .td-access-chip button:hover{opacity:1;}
+        .td-access-warn{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;
+          color:#9B3A20;background:#FBEDE9;border-radius:6px;padding:3px 8px;}
+        .td-access-err{display:flex;align-items:center;gap:8px;margin-bottom:12px;padding:9px 12px;
+          border-radius:8px;background:#FBEDE9;color:#9B3A20;font-size:12.5px;}
+        .td-access-foot{margin-top:14px;font-size:12px;line-height:1.6;color:#6E675C;}
+        .td-access-foot strong{color:#3A352E;}
+      `}</style>
+
+      <div className="td-access-head">
+        <h2>Access</h2>
+        <p>
+          Who can sign in to TradeDesk and what they get once they do. Office staff see
+          everything; a project manager sees only the jobs they are assigned to, with the
+          contract amount but no payments, margin or reports. Accounts themselves are created
+          in Supabase — this is where they are given a role and matched to a name.
+        </p>
+      </div>
+
+      {err && <div className="td-access-err"><AlertTriangle size={14} /> {err}</div>}
+
+      <div className="td-panel">
+        {users === null ? (
+          <div className="td-muted-line" style={{ padding: 16 }}><RefreshCw size={13} className="td-spin" /> Loading…</div>
+        ) : users.length === 0 ? (
+          <EmptyState icon={Users} title="No sign-ins found" sub="Accounts are created in Supabase Authentication." />
+        ) : users.map((u) => {
+          const mine = linkedTo(u.user_id);
+          const blind = u.role === "project_manager" && mine.length === 0;
+          return (
+            <div className="td-access-user" key={u.user_id}>
+              <div className="td-access-who">
+                <div className="td-access-email">{u.email}</div>
+                <div className="td-access-seen">
+                  {u.last_sign_in_at ? "last signed in " + timeAgo(u.last_sign_in_at) : "has never signed in"}
+                </div>
+              </div>
+
+              <select className="td-select" style={{ minWidth: 165 }}
+                value={u.role}
+                disabled={busy === u.user_id}
+                onChange={(e) => run(u.user_id, () => repo.setUserRole(u.user_id, e.target.value))}>
+                {roles.map((r) => <option key={r.key} value={r.key}>{r.label}</option>)}
+              </select>
+
+              <div className="td-access-people">
+                {mine.map((a) => (
+                  <span key={a.id} className="td-access-chip"
+                    style={{ background: a.color, color: textOn(a.color) }}
+                    title={assigneeRole(a.role).label}>
+                    {a.name}
+                    <button type="button" title="Unlink"
+                      onClick={() => run("link-" + a.id, () => repo.linkAssignee(a.id, null))}>
+                      <X size={11} />
+                    </button>
+                  </span>
+                ))}
+
+                <select className="td-select" style={{ minWidth: 170 }} value=""
+                  disabled={busy !== ""}
+                  onChange={(e) => { const id = e.target.value; if (id) run("link-" + id, () => repo.linkAssignee(id, u.user_id)); }}>
+                  <option value="">Link a name…</option>
+                  {assigneeRoleKeys().map((rk) => {
+                    const opts = unlinked.filter((a) => a.role === rk);
+                    if (!opts.length) return null;
+                    return (
+                      <optgroup key={rk} label={assigneeRole(rk).label}>
+                        {opts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+                      </optgroup>
+                    );
+                  })}
+                </select>
+
+                {blind && (
+                  <span className="td-access-warn" title="can_see_job() matches on the linked name">
+                    <AlertTriangle size={11} /> no name linked — sees no jobs
+                  </span>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="td-access-foot">
+        <strong>{roleLabel("super_admin")}</strong> is the only role that can open this screen or
+        change a role, and the database refuses the change that would leave nobody holding it.
+        Hiding a tab is not access control: the same rules run in Postgres, so a restricted login
+        is refused the rows even if it talks to the database directly.
+      </div>
+    </div>
+  );
+}
+
 function GlobalStyle() {
   return (
     <style>{`
@@ -3389,6 +3655,11 @@ function GlobalStyle() {
          grid track decide the width, so nothing truncates mid-word. */
       .td-deal-field .td-select, .td-deal-field .td-input { width: 100%; min-width: 0; }
       .td-deal-field-amount .td-input { font-weight: 700; }
+      /* The same grid for a project manager, with the values set as text. Kept
+         on the identical field frame so the card does not change shape. */
+      .td-deal-ro-value { font-size: 13.5px; font-weight: 600; color: #3A352E;
+        padding: 7px 0; min-height: 19px; display: flex; align-items: center; gap: 6px; }
+      .td-deal-field-amount .td-deal-ro-value { font-weight: 700; }
       .td-hold-toggle { white-space: nowrap; }
       .td-substage-chip { white-space: nowrap; }
 

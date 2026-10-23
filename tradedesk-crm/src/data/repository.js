@@ -151,6 +151,10 @@ const assigneeFromRow = (r) => ({
   // keeps one person one colour on the calendar even after a rename.
   color: r.color,
   active: r.active !== false,
+  // The auth.users row this person signs in as, when they have one. Only the
+  // Access screen uses it; can_see_job() in the database is what it actually
+  // controls.
+  userId: r.user_id || null,
 });
 
 const assignmentFromRow = (r) => ({
@@ -175,6 +179,14 @@ const assignmentFromRow = (r) => ({
 const friendly = (error) => {
   const code = error.code || "";
   const msg = error.message || "";
+  // The access RPCs raise their own messages. They have to be matched before
+  // the generic code table below, which would turn the lockout guard ('23514')
+  // into "the amount is not valid".
+  if (msg.includes("at least one super administrator")) return "there has to be at least one super administrator";
+  if (msg.includes("already linked to")) return msg;
+  if (msg.includes("not authorized")) return "you do not have permission to do that";
+  if (msg.startsWith("only a super administrator")) return msg;
+  if (msg.startsWith("unknown role") || msg.startsWith("unknown user") || msg.startsWith("unknown assignee")) return msg;
   if (code === "23505" && msg.includes("vendors_name_unique")) return "a vendor with that name already exists";
   if (code === "23505" && msg.includes("assignees_role_name_uniq")) return "someone with that name is already on this list";
   if (code === "23505") return "that record already exists";
@@ -199,7 +211,7 @@ const supabaseRepo = {
 
   async loadAll() {
     const [jobRows, vendorRows, cpRows, vpRows, tradeRows, flagRows, payTypeRows, ageRuleRows,
-           roleRows, assigneeRows, assignmentRows] = await Promise.all([
+           roleRows, assigneeRows, assignmentRows, appRole] = await Promise.all([
       supabase.from("jobs").select("*").order("number", { ascending: false }).then(unwrap),
       supabase.from("vendors").select("*").order("name", { ascending: true }).then(unwrap),
       supabase.from("client_payments").select("*").order("payment_date", { ascending: false }).then(unwrap),
@@ -216,6 +228,11 @@ const supabaseRepo = {
       // name or colour is worse than a block for someone who has left.
       supabase.from("assignees").select("*").order("name", { ascending: true }).then(unwrap),
       supabase.from("job_assignments").select("*").then(unwrap),
+      // What this login is allowed to see. Resolved by the database, not by
+      // anything the browser could tamper with — the UI only uses it to avoid
+      // drawing panels that RLS has already emptied. Fails closed: a role that
+      // cannot be read is the most restricted one, never the least.
+      supabase.rpc("current_app_role").then(({ data, error }) => (error ? "project_manager" : (data || "project_manager"))),
     ]);
 
     const jobs = jobRows.map(jobFromRow);
@@ -226,7 +243,8 @@ const supabaseRepo = {
 
     return { jobs, vendors: vendorRows.map(vendorFromRow), trades: tradeRows, jobFlags: flagRows,
              paymentTypes: payTypeRows, ageRules: ageRuleRows,
-             assigneeRoles: roleRows, assignees: assigneeRows.map(assigneeFromRow) };
+             assigneeRoles: roleRows, assignees: assigneeRows.map(assigneeFromRow),
+             role: appRole };
   },
 
   // Seeding is a database concern in Supabase mode, not something the browser
@@ -402,6 +420,33 @@ const supabaseRepo = {
   async deleteAssignment(id) {
     await supabase.from("job_assignments").delete().eq("id", id).then(unwrap);
   },
+
+  /* -------------------------------------------------------------------------
+     Access administration.
+
+     All four go through SECURITY DEFINER functions that check
+     is_super_admin() themselves. auth.users is not reachable over PostgREST at
+     all, and user_roles is writable by nobody else, so these are not a
+     convenience layer over table access — they are the only way in, and a
+     browser calling them without the role gets 42501 from Postgres.
+     ------------------------------------------------------------------------- */
+
+  async listUsers() {
+    return await supabase.rpc("admin_list_users").then(unwrap);
+  },
+
+  async listAppRoles() {
+    return await supabase.from("app_roles").select("*").order("sort_order").then(unwrap);
+  },
+
+  async setUserRole(userId, role) {
+    await supabase.rpc("admin_set_role", { p_user: userId, p_role: role }).then(unwrap);
+  },
+
+  // p_user null unlinks.
+  async linkAssignee(assigneeId, userId) {
+    await supabase.rpc("admin_link_assignee", { p_assignee: assigneeId, p_user: userId || null }).then(unwrap);
+  },
 };
 
 /* ---------------------------------------------------------------------------
@@ -430,6 +475,10 @@ const localRepo = {
     // Blobs written before assignments existed have neither key; fill them in
     // so every caller sees the same shape Supabase mode returns.
     if (cache) {
+      // No auth in the dev fallback, so there is nobody to be restricted —
+      // 'admin' keeps every panel on screen without offering the Access tab,
+      // whose RPCs do not exist here.
+      cache.role = cache.role || "admin";
       cache.assignees = cache.assignees || [];
       cache.jobs = (cache.jobs || []).map((j) => ({ ...j, assignments: j.assignments || [] }));
     }
@@ -512,6 +561,11 @@ const localRepo = {
     }));
     return persistLocal();
   },
+
+  async listUsers() { return []; },
+  async listAppRoles() { return []; },
+  async setUserRole() { throw new Error("user accounts only exist against Supabase"); },
+  async linkAssignee() { throw new Error("user accounts only exist against Supabase"); },
 
   async createVendor(vendor) { cache.vendors = [vendor, ...cache.vendors]; return persistLocal(); },
   async updateVendor(id, patch) {
