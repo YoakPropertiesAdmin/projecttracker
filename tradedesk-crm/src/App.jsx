@@ -1522,6 +1522,8 @@ function JobDetailModal({ ctx, job, onClose }) {
   const { updateJob, deleteJob, addClientPayment, deleteClientPayment, addVendorPayment, updateVendorPayment, deleteVendorPayment, vendorNames } = ctx;
   const [notes, setNotes] = useState(job?.notes || "");
   const [name, setName] = useState(job?.customerName || "");
+  const [phone, setPhone] = useState(job?.customerPhone || "");
+  const [email, setEmail] = useState(job?.customerEmail || "");
   const [cpForm, setCpForm] = useState({ amount: "", date: new Date().toISOString().slice(0, 10), method: PAYMENT_METHODS[0], note: "", paymentType: "" });
   const [vpForm, setVpForm] = useState({ vendorName: "", category: VENDOR_CATEGORIES[0], amount: "", date: new Date().toISOString().slice(0, 10), status: "pending", note: "" });
 
@@ -1542,6 +1544,14 @@ function JobDetailModal({ ctx, job, onClose }) {
     const next = name.trim();
     if (!next) { setName(job.customerName); return; }
     if (next !== job.customerName) updateJob(job.id, { customerName: next });
+  };
+
+  // Phone and email are the same deal minus the empty-value rule: clearing a
+  // wrong number is a real edit, and both columns default to ''. Compared
+  // against the stored value so tabbing through a field writes nothing.
+  const commitContact = (key, value, current) => {
+    const next = value.trim();
+    if (next !== (current || "")) updateJob(job.id, { [key]: next });
   };
 
   const received = clientReceived(job);
@@ -1607,6 +1617,8 @@ function JobDetailModal({ ctx, job, onClose }) {
           const next = name.trim();
           const patch = { notes };
           if (next && next !== job.customerName) patch.customerName = next;
+          if (phone.trim() !== (job.customerPhone || "")) patch.customerPhone = phone.trim();
+          if (email.trim() !== (job.customerEmail || "")) patch.customerEmail = email.trim();
           updateJob(job.id, patch);
           onClose();
         }}>Save & close</button>
@@ -1695,7 +1707,22 @@ function JobDetailModal({ ctx, job, onClose }) {
         </div>
 
         <div className="td-info-row"><Building2 size={14} /> {job.customerAddress}</div>
-        <div className="td-info-row"><Phone size={14} /> {job.customerPhone || "—"}<Mail size={14} style={{ marginLeft: 14 }} /> {job.customerEmail || "—"}</div>
+        {canManage ? (
+          <div className="td-info-row td-contact-edit">
+            <Phone size={14} />
+            <input className="td-input" type="tel" value={phone} placeholder="Phone"
+              onChange={(e) => setPhone(e.target.value)}
+              onBlur={() => commitContact("customerPhone", phone, job.customerPhone)}
+              onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }} />
+            <Mail size={14} />
+            <input className="td-input" type="email" value={email} placeholder="Email"
+              onChange={(e) => setEmail(e.target.value)}
+              onBlur={() => commitContact("customerEmail", email, job.customerEmail)}
+              onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }} />
+          </div>
+        ) : (
+          <div className="td-info-row"><Phone size={14} /> {job.customerPhone || "—"}<Mail size={14} style={{ marginLeft: 14 }} /> {job.customerEmail || "—"}</div>
+        )}
 
         <JobAssignments ctx={ctx} job={job} />
 
@@ -3681,6 +3708,12 @@ function GlobalStyle() {
       .td-deal-field .td-select, .td-deal-field .td-input { width: 100%; min-width: 0; }
       .td-deal-field-amount .td-input { font-weight: 700; }
       .td-deal-field-name { grid-column: 1 / -1; }
+      /* The contact line keeps its icons and its place; only the two values
+         become boxes. Capped so a short phone number does not stretch to the
+         width of the card. */
+      .td-contact-edit { flex-wrap: wrap; margin-bottom: 8px; }
+      .td-contact-edit .td-input { flex: 1 1 150px; min-width: 0; max-width: 250px;
+        padding: 5px 8px; font-size: 13px; }
       /* The same grid for a project manager, with the values set as text. Kept
          on the identical field frame so the card does not change shape. */
       .td-deal-ro-value { font-size: 13.5px; font-weight: 600; color: #3A352E;
