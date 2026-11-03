@@ -1521,6 +1521,7 @@ function JobFormModal({ onClose, onSave }) {
 function JobDetailModal({ ctx, job, onClose }) {
   const { updateJob, deleteJob, addClientPayment, deleteClientPayment, addVendorPayment, updateVendorPayment, deleteVendorPayment, vendorNames } = ctx;
   const [notes, setNotes] = useState(job?.notes || "");
+  const [name, setName] = useState(job?.customerName || "");
   const [cpForm, setCpForm] = useState({ amount: "", date: new Date().toISOString().slice(0, 10), method: PAYMENT_METHODS[0], note: "", paymentType: "" });
   const [vpForm, setVpForm] = useState({ vendorName: "", category: VENDOR_CATEGORIES[0], amount: "", date: new Date().toISOString().slice(0, 10), status: "pending", note: "" });
 
@@ -1531,6 +1532,17 @@ function JobDetailModal({ ctx, job, onClose }) {
   // that; this keeps the controls off the screen rather than letting someone
   // type into a field whose save will be refused.
   const canManage = ctx.isAdmin;
+
+  // The customer name identifies nothing — a job is keyed by its number and
+  // matched to the CRM on the opportunity id — so a name the sync got wrong,
+  // or sent as the site address, is just text to correct. Committed on blur
+  // rather than onChange, which would be one write per keystroke, and an empty
+  // box snaps back: the column is NOT NULL and a nameless card is unusable.
+  const commitName = () => {
+    const next = name.trim();
+    if (!next) { setName(job.customerName); return; }
+    if (next !== job.customerName) updateJob(job.id, { customerName: next });
+  };
 
   const received = clientReceived(job);
   const balance = clientBalance(job);
@@ -1591,7 +1603,13 @@ function JobDetailModal({ ctx, job, onClose }) {
           <button className="td-btn td-btn-danger" onClick={() => { if (confirm("Delete this job? This can't be undone.")) deleteJob(job.id); }}><Trash2 size={13} /> Delete job</button>
         )}
         <div style={{ flex: 1 }} />
-        <button className="td-btn td-btn-primary" onClick={() => { updateJob(job.id, { notes }); onClose(); }}>Save & close</button>
+        <button className="td-btn td-btn-primary" onClick={() => {
+          const next = name.trim();
+          const patch = { notes };
+          if (next && next !== job.customerName) patch.customerName = next;
+          updateJob(job.id, patch);
+          onClose();
+        }}>Save & close</button>
       </>}>
       <div className="td-job-detail">
 
@@ -1618,6 +1636,13 @@ function JobDetailModal({ ctx, job, onClose }) {
           </div>
           {canManage ? (
           <div className="td-deal-fields">
+            <label className="td-deal-field td-deal-field-name">
+              <span className="td-field-label">Customer</span>
+              <input className="td-input" value={name} placeholder="Customer or site"
+                onChange={(e) => setName(e.target.value)}
+                onBlur={commitName}
+                onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }} />
+            </label>
             <label className="td-deal-field">
               <span className="td-field-label">Stage</span>
               <select className="td-select" value={job.stage} onChange={(e) => updateJob(job.id, { stage: e.target.value })}>
@@ -3655,6 +3680,7 @@ function GlobalStyle() {
          grid track decide the width, so nothing truncates mid-word. */
       .td-deal-field .td-select, .td-deal-field .td-input { width: 100%; min-width: 0; }
       .td-deal-field-amount .td-input { font-weight: 700; }
+      .td-deal-field-name { grid-column: 1 / -1; }
       /* The same grid for a project manager, with the values set as text. Kept
          on the identical field frame so the card does not change shape. */
       .td-deal-ro-value { font-size: 13.5px; font-weight: 600; color: #3A352E;
