@@ -68,6 +68,10 @@ const jobFromRow = (r) => ({
   // Project manager / installers / services working this job. Filled by
   // loadAll from job_assignments; the calendar reads the same rows.
   assignments: [],
+  // The most recent GP finalization, when the office has taken one. Null on
+  // every job nobody has finalized, and on every job for a project manager,
+  // whose RLS returns no rows from that table at all.
+  finalization: null,
 });
 
 const jobToRow = (j) => {
@@ -157,6 +161,24 @@ const assigneeFromRow = (r) => ({
   userId: r.user_id || null,
 });
 
+// A frozen snapshot of a job's money at the moment the office finalized it.
+// Deliberately not recomputed: the point of finalizing is to have a figure that
+// a vendor bill arriving next week cannot quietly change.
+const finalizationFromRow = (r) => ({
+  id: r.id,
+  jobId: r.job_id,
+  seq: Number(r.seq),
+  contractAmount: Number(r.contract_amount || 0),
+  clientReceived: Number(r.client_received || 0),
+  vendorPaid: Number(r.vendor_paid || 0),
+  vendorPending: Number(r.vendor_pending || 0),
+  vendorTotal: Number(r.vendor_total || 0),
+  margin: Number(r.margin || 0),
+  marginPct: Number(r.margin_pct || 0),
+  priorMargin: r.prior_margin === null || r.prior_margin === undefined ? null : Number(r.prior_margin),
+  finalizedAt: toIso(r.finalized_at),
+});
+
 const assignmentFromRow = (r) => ({
   id: r.id,
   jobId: r.job_id,
@@ -211,7 +233,7 @@ const supabaseRepo = {
 
   async loadAll() {
     const [jobRows, vendorRows, cpRows, vpRows, tradeRows, flagRows, payTypeRows, ageRuleRows,
-           roleRows, assigneeRows, assignmentRows, appRole] = await Promise.all([
+           roleRows, assigneeRows, assignmentRows, finalRows, appRole] = await Promise.all([
       supabase.from("jobs").select("*").order("number", { ascending: false }).then(unwrap),
       supabase.from("vendors").select("*").order("name", { ascending: true }).then(unwrap),
       supabase.from("client_payments").select("*").order("payment_date", { ascending: false }).then(unwrap),
@@ -228,6 +250,10 @@ const supabaseRepo = {
       // name or colour is worse than a block for someone who has left.
       supabase.from("assignees").select("*").order("name", { ascending: true }).then(unwrap),
       supabase.from("job_assignments").select("*").then(unwrap),
+      // Ascending by seq so the last one written for a job wins below. A job
+      // finalized twice keeps both rows; only the latest is the number of
+      // record, and the earlier ones are the audit trail.
+      supabase.from("job_finalizations").select("*").order("seq", { ascending: true }).then(unwrap),
       // What this login is allowed to see. Resolved by the database, not by
       // anything the browser could tamper with — the UI only uses it to avoid
       // drawing panels that RLS has already emptied. Fails closed: a role that
@@ -240,6 +266,7 @@ const supabaseRepo = {
     cpRows.forEach((r) => byId.get(r.job_id)?.clientPayments.push(clientPaymentFromRow(r)));
     vpRows.forEach((r) => byId.get(r.job_id)?.vendorPayments.push(vendorPaymentFromRow(r)));
     assignmentRows.forEach((r) => byId.get(r.job_id)?.assignments.push(assignmentFromRow(r)));
+    finalRows.forEach((r) => { const j = byId.get(r.job_id); if (j) j.finalization = finalizationFromRow(r); });
 
     return { jobs, vendors: vendorRows.map(vendorFromRow), trades: tradeRows, jobFlags: flagRows,
              paymentTypes: payTypeRows, ageRules: ageRuleRows,
@@ -431,6 +458,19 @@ const supabaseRepo = {
      browser calling them without the role gets 42501 from Postgres.
      ------------------------------------------------------------------------- */
 
+  /**
+   * Freeze this job's gross profit and send the notification.
+   *
+   * One call because the two have to be one transaction: a snapshot nobody is
+   * told about, or a notification with no snapshot behind it, are both worse
+   * than neither. The RPC writes the row and queues the email together; the
+   * send itself is a separate retrying job, so Resend being down delays the
+   * email rather than failing the finalization.
+   */
+  async finalizeGp(jobId) {
+    return await supabase.rpc("finalize_job_gp", { p_job: jobId }).then(unwrap);
+  },
+
   async listUsers() {
     return await supabase.rpc("admin_list_users").then(unwrap);
   },
@@ -480,7 +520,8 @@ const localRepo = {
       // whose RPCs do not exist here.
       cache.role = cache.role || "admin";
       cache.assignees = cache.assignees || [];
-      cache.jobs = (cache.jobs || []).map((j) => ({ ...j, assignments: j.assignments || [] }));
+      cache.jobs = (cache.jobs || []).map((j) => ({
+        ...j, assignments: j.assignments || [], finalization: j.finalization || null }));
     }
     return cache;
   },
@@ -562,6 +603,7 @@ const localRepo = {
     return persistLocal();
   },
 
+  async finalizeGp() { throw new Error("finalizing gross profit needs Supabase"); },
   async listUsers() { return []; },
   async listAppRoles() { return []; },
   async setUserRole() { throw new Error("user accounts only exist against Supabase"); },

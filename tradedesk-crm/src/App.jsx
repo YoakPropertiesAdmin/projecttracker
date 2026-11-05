@@ -9,7 +9,7 @@ import {
   AlertTriangle, Tag, Building2, Menu, ClipboardList, RefreshCw,
   Wallet, HandCoins, Percent, Calendar as CalendarIcon, LogOut,
   Hammer, Wrench, PaintBucket, Droplets, Thermometer, PackageCheck, ShoppingCart,
-  Download, FileSpreadsheet, SlidersHorizontal, ArrowDownUp, ShieldCheck, Link2
+  Download, FileSpreadsheet, SlidersHorizontal, ArrowDownUp, ShieldCheck, Link2, Lock, Send
 } from "lucide-react";
 
 /* =========================================================================
@@ -1560,6 +1560,9 @@ function JobDetailModal({ ctx, job, onClose }) {
   const vPending = vendorPending(job);
   const margin = jobMargin(job);
   const marginPercent = jobMarginPct(job);
+  const fin = job.finalization || null;
+  // Half a cent of float noise is not drift worth showing.
+  const gpDrift = Boolean(fin) && Math.abs(fin.margin - margin) >= 0.01;
 
   // Overpayment is allowed on purpose — a change order raises what the client
   // owes without the contract amount having been updated yet. So this warns
@@ -1741,11 +1744,20 @@ function JobDetailModal({ ctx, job, onClose }) {
             <span className={cls("td-payment-summary-value", vPending > 0 && "td-text-red")}>{money(vPending)}</span>
           </div>
           <div className="td-payment-summary-item">
-            <span className="td-field-label">Margin</span>
-            <span className={cls("td-payment-summary-value", margin < 0 && "td-text-red")}>{money(margin)} <span className="td-cell-sub">({pct(marginPercent)})</span></span>
+            <span className="td-field-label">{fin ? "Final GP" : "Margin"}</span>
+            <span className={cls("td-payment-summary-value", (fin ? fin.margin : margin) < 0 && "td-text-red")}>
+              {money(fin ? fin.margin : margin)} <span className="td-cell-sub">({pct(fin ? fin.marginPct : marginPercent)})</span>
+            </span>
+            {/* The frozen number is the one of record. When later costs have
+                moved the live figure the two are shown together, because a
+                silent gap between what was reported and what the job now says
+                is the thing finalizing was meant to prevent. */}
+            {gpDrift && <span className="td-gp-drift" title="Costs have changed since this was finalized">live {money(margin)}</span>}
           </div>
         </div>
         <ProgressBar value={paidPct(job)} tone={balance <= 0 ? "green" : undefined} />
+
+        <JobGpFinalize ctx={ctx} job={job} liveMargin={margin} drifted={gpDrift} />
 
         <div className="td-job-detail-cols">
           <div className="td-job-detail-col">
@@ -1868,6 +1880,84 @@ function JobDetailModal({ ctx, job, onClose }) {
         </Field>
       </div>
     </Modal>
+  );
+}
+
+/**
+ * Finalize GP — the moment the office declares a job's gross profit final.
+ *
+ * Margin is otherwise a live calculation that moves every time a vendor bill
+ * is entered, so there is no natural instant at which it is "the" number.
+ * This button creates one: it freezes the figure, records who froze it and
+ * when, and emails it out. A bill that arrives afterwards does not rewrite
+ * history — it shows up as drift against the frozen figure, and re-finalizing
+ * sends a clearly marked revision rather than quietly replacing the first.
+ *
+ * Office-only, like every other money control on this card. finalize_job_gp()
+ * checks is_admin() in Postgres; this only decides what gets drawn.
+ */
+function JobGpFinalize({ ctx, job, liveMargin, drifted }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [sent, setSent] = useState("");
+  const fin = job.finalization || null;
+
+  const run = async () => {
+    if (busy) return;
+    const again = Boolean(fin);
+    if (!confirm(
+      again
+        ? "Re-finalize " + jobRef(job) + " at " + money(liveMargin) + "?\n\n" +
+          "The gross profit on record becomes " + money(liveMargin) + ", was " + money(fin.margin) +
+          ". A revised email goes out showing both figures."
+        : "Finalize " + jobRef(job) + " at a gross profit of " + money(liveMargin) + "?\n\n" +
+          "This freezes the figure and emails it out. Costs entered later will show as drift " +
+          "against it rather than changing it."
+    )) return;
+
+    setBusy(true); setErr(""); setSent("");
+    try {
+      const res = await repo.finalizeGp(job.id);
+      const to = (res && res.recipients) || [];
+      setSent(res && res.queued
+        ? "Sent to " + to.join(", ")
+        : "Finalized, but no active recipient is configured — nothing was emailed.");
+      await ctx.reload();
+    } catch (e) {
+      setErr(e && e.message ? e.message : "The finalization was refused.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="td-gp-final">
+      <div className="td-gp-final-main">
+        {fin ? (
+          <>
+            <span className="td-gp-badge"><Lock size={11} /> Final GP {money(fin.margin)}</span>
+            <span className="td-gp-when">
+              finalized {fmtDate(fin.finalizedAt)}{fin.seq > 1 ? " · revision " + fin.seq : ""}
+            </span>
+          </>
+        ) : (
+          <span className="td-gp-when">Gross profit is still live — it moves with every cost entered.</span>
+        )}
+        {drifted && (
+          <span className="td-gp-drift-note">
+            <AlertTriangle size={11} /> costs have changed since — now {money(liveMargin)}
+          </span>
+        )}
+      </div>
+      <button type="button" className={cls("td-btn", "td-btn-sm", !fin && "td-btn-primary")}
+        onClick={run} disabled={busy}>
+        {busy ? <RefreshCw size={13} className="td-spin" /> : <Send size={13} />}
+        {fin ? " Re-finalize GP" : " Finalize GP"}
+      </button>
+      {(err || sent) && (
+        <div className={cls("td-gp-msg", err && "td-gp-msg-err")}>{err || sent}</div>
+      )}
+    </div>
   );
 }
 
@@ -3711,6 +3801,19 @@ function GlobalStyle() {
       /* The contact line keeps its icons and its place; only the two values
          become boxes. Capped so a short phone number does not stretch to the
          width of the card. */
+      .td-gp-final { display: flex; align-items: center; flex-wrap: wrap; gap: 9px 12px;
+        margin: 10px 0 2px; padding: 10px 13px; border: 1px solid #EBE6DC; border-radius: 9px;
+        background: #FBFAF7; }
+      .td-gp-final-main { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; flex: 1; min-width: 0; }
+      .td-gp-final > button { flex: none; }
+      .td-gp-badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px;
+        border-radius: 999px; background: #E6EFE8; color: #2F6B46; font-size: 12px; font-weight: 650; }
+      .td-gp-when { font-size: 12px; color: #6E675C; }
+      .td-gp-drift-note { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px;
+        border-radius: 999px; background: #FDF3E3; color: #8A5A12; font-size: 12px; font-weight: 600; }
+      .td-gp-drift { font-size: 11.5px; color: #8A5A12; margin-top: 2px; }
+      .td-gp-msg { flex-basis: 100%; font-size: 12px; color: #2F6B46; }
+      .td-gp-msg-err { color: #9B3A20; }
       .td-contact-edit { flex-wrap: wrap; margin-bottom: 8px; }
       .td-contact-edit .td-input { flex: 1 1 150px; min-width: 0; max-width: 250px;
         padding: 5px 8px; font-size: 13px; }
