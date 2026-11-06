@@ -2678,7 +2678,7 @@ function scCoverageLines(c) {
   return [
     ["Booked", c.jobs_with_signed_date + " of " + c.jobs_live + " live jobs have a contract signed date. Jobs without one are not in any month."],
     ["Completed", "Stage history started " + since + ". " + c.complete_with_completion_date + " of " + c.complete_stage_jobs +
-      " completed/closed jobs have a completion date; earlier ones cannot be dated and are left out."],
+      " completed/closed jobs have a completion date, from the Completion Log sheet or, failing that, the first move into a done stage. The rest are left out."],
     ["GP finalized", c.finalized_jobs + " job" + (c.finalized_jobs === 1 ? "" : "s") + " finalized. Each finalization counts in the month it was made, so past months do not move."],
     ["GP provisional", "Live margin on completed jobs not yet finalized: " + c.provisional_by_completion + " dated by completion, " +
       c.provisional_by_signed + " by signed date. " + c.provisional_undated + " more (" + money(c.provisional_undated_revenue) +
