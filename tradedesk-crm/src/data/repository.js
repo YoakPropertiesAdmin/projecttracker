@@ -573,6 +573,13 @@ const supabaseRepo = {
     return await supabase.rpc("report_monthly_scorecard", { p_from: from, p_to: to }).then(unwrap);
   },
 
+  // Admin-only (report_balances_owed raises 42501 for anyone else). One row per
+  // live job: contract, collected (larger of TradeDesk payments and the
+  // Completion Log sheet), balance, and which source the collected figure used.
+  async reportBalancesOwed() {
+    return await supabase.rpc("report_balances_owed").then(unwrap);
+  },
+
   async listUsers() {
     return await supabase.rpc("admin_list_users").then(unwrap);
   },
@@ -707,6 +714,7 @@ const localRepo = {
 
   async finalizeGp() { throw new Error("finalizing gross profit needs Supabase"); },
   async reportMonthlyScorecard() { throw new Error("reports need Supabase"); },
+  async reportBalancesOwed() { throw new Error("reports need Supabase"); },
   async loadScheduleReview() { return []; },
   async loadScheduleReviewRecent() { return []; },
   async whoAmI() { return "local"; },

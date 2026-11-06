@@ -2616,10 +2616,25 @@ function ReportsView() {
   );
 }
 
+const LEDGER_TABS = [
+  { key: "balances", label: "Balances owed" },
+  { key: "payments", label: "Payment reports" },
+];
+
 function LedgerView({ ctx }) {
+  const [tab, setTab] = useState(LEDGER_TABS[0].key);
   return (
     <div className="td-view">
-      <TransactionReport jobs={ctx.jobs} />
+      <div className="td-rpt-tabs" role="tablist">
+        {LEDGER_TABS.map((t) => (
+          <button key={t.key} role="tab" aria-selected={t.key === tab}
+            className={cls("td-rpt-tab", t.key === tab && "td-rpt-tab-on")} onClick={() => setTab(t.key)}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+      {tab === "balances" && <BalancesOwedReport onOpenJob={ctx.setSelectedJobId} />}
+      {tab === "payments" && <TransactionReport jobs={ctx.jobs} />}
     </div>
   );
 }
@@ -2916,6 +2931,439 @@ function TrendChart({ months, series }) {
       </svg>
       <div className="td-sc-legend">
         {series.map((s) => <span key={s.key}><i style={{ background: s.color }} />{s.label}</span>)}
+      </div>
+    </div>
+  );
+}
+
+/* =========================================================================
+   BALANCES OWED — what is still owed on each job
+   =========================================================================
+   Computed in the database by report_balances_owed() (admin only). Per job:
+     balance   = contract - collected
+     collected = the larger of the TradeDesk client payments and the amount the
+                 Completion Log sheet says was collected. Older jobs often have
+                 no payments entered in TradeDesk, and the sheet is the office's
+                 record of them; `collected_source` says which figure won.
+   Finished jobs (a complete stage) are true receivables. Open jobs are the
+   contract still to be collected as the work proceeds — kept as a separate
+   total so the two are never added together by accident. */
+
+const BAL_SCOPES = [
+  { key: "finished", label: "Finished jobs (receivables)" },
+  { key: "open", label: "Open jobs (left to collect)" },
+  { key: "all", label: "All jobs" },
+];
+const BAL_SHOW = [
+  { key: "owing", label: "Still owing" },
+  { key: "credit", label: "Overpaid / credits" },
+  { key: "all", label: "Everything" },
+];
+const BAL_GROUPS = [
+  { key: "none", label: "No grouping" },
+  { key: "age", label: "By age since completion" },
+  { key: "stage", label: "By stage" },
+  { key: "trade", label: "By trade" },
+  { key: "source", label: "By where 'collected' came from" },
+];
+const BAL_AGE = [
+  { key: "a0", label: "0–30 days", max: 30 },
+  { key: "a1", label: "31–60 days", max: 60 },
+  { key: "a2", label: "61–90 days", max: 90 },
+  { key: "a3", label: "Over 90 days", max: Infinity },
+];
+const BAL_SOURCE_LABEL = {
+  tradedesk: "TradeDesk payments",
+  sheet: "Completion Log sheet",
+  none: "Nothing collected",
+};
+
+const balAgeKey = (r) => {
+  if (!r.finished) return "open";
+  if (r.days_since_complete === null || r.days_since_complete === undefined) return "nodate";
+  return (BAL_AGE.find((b) => r.days_since_complete <= b.max) || BAL_AGE[3]).key;
+};
+const balAgeLabel = (k) =>
+  k === "open" ? "Not finished" : k === "nodate" ? "No completion date" : (BAL_AGE.find((b) => b.key === k) || {}).label || k;
+
+/** The things worth a second look on one row, as short labels. */
+function balFlags(r) {
+  const f = [];
+  if (r.collected_source === "sheet") f.push({ tone: "amber", text: "Sheet shows " + money(r.paid_sheet - r.paid_tradedesk) + " more collected than TradeDesk" });
+  if (r.sheet_awaiting) f.push({ tone: "red", text: "Sheet: awaiting payment" });
+  if (r.finished && !r.tradedesk_payments && r.collected_source !== "sheet") f.push({ tone: "red", text: "No payments in TradeDesk" + (r.in_sheet ? "" : " or the sheet") });
+  if (!Number(r.contract)) f.push({ tone: "amber", text: "No contract amount" });
+  if (r.contract_sheet !== null && r.contract_sheet !== undefined && Math.abs(Number(r.contract_sheet) - Number(r.contract)) >= 1)
+    f.push({ tone: "grey", text: "Sheet contract " + money(r.contract_sheet) });
+  return f;
+}
+
+const BAL_EXPORT = [
+  { key: "job", header: "Job #", get: (r) => jobNo(r.number) },
+  { key: "project", header: "GHL Project #", get: (r) => r.project_ref || "" },
+  { key: "customer", header: "Customer", get: (r) => r.customer || "" },
+  { key: "address", header: "Address", get: (r) => r.address || "" },
+  { key: "trade", header: "Trade", get: (r) => (TRADES[r.trade] ? TRADES[r.trade].label : r.trade || "") },
+  { key: "stage", header: "Stage", get: (r) => r.stage_label || r.stage || "" },
+  { key: "kind", header: "Finished?", get: (r) => (r.finished ? "Finished" : "Open") },
+  { key: "contract", header: "Contract", money: true, get: (r) => Number(r.contract || 0) },
+  { key: "paid_td", header: "Paid (TradeDesk)", money: true, get: (r) => Number(r.paid_tradedesk || 0) },
+  { key: "paid_sheet", header: "Collected (sheet)", money: true, get: (r) => (r.paid_sheet === null || r.paid_sheet === undefined ? "" : Number(r.paid_sheet)) },
+  { key: "collected", header: "Collected (used)", money: true, get: (r) => Number(r.collected || 0) },
+  { key: "source", header: "Collected from", get: (r) => BAL_SOURCE_LABEL[r.collected_source] || r.collected_source },
+  { key: "balance", header: "Balance owed", money: true, get: (r) => Number(r.balance || 0) },
+  { key: "completed", header: "Completed", get: (r) => (r.completed_at ? isoDay(r.completed_at) : "") },
+  { key: "days", header: "Days since completed", get: (r) => (r.days_since_complete === null || r.days_since_complete === undefined ? "" : r.days_since_complete) },
+  { key: "last_td", header: "Last TradeDesk payment", get: (r) => (r.last_paid_tradedesk ? isoDay(r.last_paid_tradedesk) : "") },
+  { key: "last_sheet", header: "Sheet collected date", get: (r) => r.last_paid_sheet || "" },
+  { key: "flags", header: "Check", get: (r) => balFlags(r).map((f) => f.text).join("; ") },
+];
+
+function exportBalancesCsv(rows, filename) {
+  const cell = (v) => {
+    let s = v === null || v === undefined ? "" : String(v);
+    if (/^[=+\-@\t\r]/.test(s) && !/^-?\d+(\.\d+)?$/.test(s)) s = "'" + s;
+    return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const lines = [BAL_EXPORT.map((c) => cell(c.header)).join(",")];
+  rows.forEach((r) => lines.push(BAL_EXPORT.map((c) => cell(c.get(r))).join(",")));
+  downloadBlob(new Blob(["﻿" + lines.join("\r\n")], { type: "text/csv;charset=utf-8;" }), filename);
+}
+
+async function exportBalancesXlsx(rows, groups, filename) {
+  const XLSX = await import("xlsx");
+  const fmt = '"$"#,##0.00;[Red]-"$"#,##0.00';
+  const aoa = [BAL_EXPORT.map((c) => c.header)];
+  rows.forEach((r) => aoa.push(BAL_EXPORT.map((c) => c.get(r))));
+  const sum = (k) => rows.reduce((s, r) => s + Number(r[k] || 0), 0);
+  aoa.push([]);
+  const tot = BAL_EXPORT.map(() => "");
+  tot[0] = "TOTAL";
+  tot[BAL_EXPORT.findIndex((c) => c.key === "contract")] = sum("contract");
+  tot[BAL_EXPORT.findIndex((c) => c.key === "collected")] = sum("collected");
+  tot[BAL_EXPORT.findIndex((c) => c.key === "balance")] = sum("balance");
+  aoa.push(tot);
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  BAL_EXPORT.forEach((c, ci) => {
+    if (!c.money) return;
+    for (let i = 1; i < aoa.length; i++) {
+      const ref = XLSX.utils.encode_cell({ r: i, c: ci });
+      if (ws[ref] && typeof ws[ref].v === "number") ws[ref].z = fmt;
+    }
+  });
+  ws["!cols"] = BAL_EXPORT.map((c) => ({ wch: c.key === "address" || c.key === "flags" ? 32 : c.key === "customer" ? 22 : 14 }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Balances");
+
+  const sAoa = [["Group", "Jobs", "Contract", "Collected", "Balance owed"]];
+  groups.forEach((g) => sAoa.push([g.label, g.count, g.contract, g.collected, g.balance]));
+  const sws = XLSX.utils.aoa_to_sheet(sAoa);
+  for (let i = 1; i < sAoa.length; i++) [2, 3, 4].forEach((c) => {
+    const ref = XLSX.utils.encode_cell({ r: i, c });
+    if (sws[ref] && typeof sws[ref].v === "number") sws[ref].z = fmt;
+  });
+  sws["!cols"] = [{ wch: 28 }, { wch: 8 }, { wch: 14 }, { wch: 14 }, { wch: 14 }];
+  XLSX.utils.book_append_sheet(wb, sws, "Summary");
+  const out = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+  downloadBlob(new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), filename);
+}
+
+function BalancesOwedReport({ onOpenJob }) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [reloadKey, setReloadKey] = useState(0);
+  const [scope, setScope] = useState("finished");
+  const [show, setShow] = useState("owing");
+  const [groupBy, setGroupBy] = useState("age");
+  const [fTrade, setFTrade] = useState("");
+  const [fStage, setFStage] = useState("");
+  const [fSource, setFSource] = useState("");
+  const [search, setSearch] = useState("");
+  const [busy, setBusy] = useState("");
+
+  useEffect(() => {
+    let live = true;
+    setLoading(true); setError("");
+    repo.reportBalancesOwed()
+      .then((d) => { if (live) setData(d); })
+      .catch((e) => { if (live) { setData(null); setError(e.message || String(e)); } })
+      .finally(() => { if (live) setLoading(false); });
+    return () => { live = false; };
+  }, [reloadKey]);
+
+  const all = useMemo(() => ((data && data.rows) || []).map((r) => ({
+    ...r,
+    contract: Number(r.contract || 0), collected: Number(r.collected || 0), balance: Number(r.balance || 0),
+    paid_tradedesk: Number(r.paid_tradedesk || 0),
+    paid_sheet: r.paid_sheet === null || r.paid_sheet === undefined ? null : Number(r.paid_sheet),
+  })), [data]);
+
+  // Headline figures ignore the filters on purpose: they are the answer to
+  // "how much is owed", and should read the same however the table is cut.
+  const head = useMemo(() => {
+    const owing = (r) => r.balance >= 1;
+    const fin = all.filter((r) => r.finished && owing(r));
+    const open = all.filter((r) => !r.finished && owing(r));
+    const sheetOnly = all.filter((r) => r.finished && r.collected_source === "sheet");
+    const credits = all.filter((r) => r.balance <= -1);
+    const s = (xs, k = "balance") => xs.reduce((t, r) => t + r[k], 0);
+    return {
+      finished: s(fin), finishedJobs: fin.length,
+      over90: s(fin.filter((r) => r.days_since_complete > 90)),
+      open: s(open), openJobs: open.length,
+      sheetOnlyJobs: sheetOnly.length, sheetOnlyGap: sheetOnly.reduce((t, r) => t + (r.paid_sheet - r.paid_tradedesk), 0),
+      credits: -s(credits), creditJobs: credits.length,
+    };
+  }, [all]);
+
+  const rows = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return all.filter((r) => {
+      if (scope === "finished" && !r.finished) return false;
+      if (scope === "open" && r.finished) return false;
+      if (show === "owing" && !(r.balance >= 1)) return false;
+      if (show === "credit" && !(r.balance <= -1)) return false;
+      if (fTrade && r.trade !== fTrade) return false;
+      if (fStage && r.stage !== fStage) return false;
+      if (fSource && r.collected_source !== fSource) return false;
+      if (q && ![r.customer, r.address, r.project_ref, jobNo(r.number)].some((v) => String(v || "").toLowerCase().includes(q))) return false;
+      return true;
+    }).sort((a, b) => (show === "credit" ? a.balance - b.balance : b.balance - a.balance));
+  }, [all, scope, show, fTrade, fStage, fSource, search]);
+
+  const groups = useMemo(() => {
+    const keyOf = {
+      none: () => "all",
+      age: balAgeKey,
+      stage: (r) => r.stage,
+      trade: (r) => r.trade || "",
+      source: (r) => r.collected_source,
+    }[groupBy];
+    const labelOf = {
+      none: () => "All jobs shown",
+      age: balAgeLabel,
+      stage: (k, r) => r.stage_label || k,
+      trade: (k) => (TRADES[k] ? TRADES[k].label : k || "—"),
+      source: (k) => BAL_SOURCE_LABEL[k] || k,
+    }[groupBy];
+    const order = { a0: 0, a1: 1, a2: 2, a3: 3, nodate: 4, open: 5 };
+    const map = new Map();
+    rows.forEach((r) => {
+      const k = keyOf(r);
+      const e = map.get(k) || { key: k, label: labelOf(k, r), count: 0, contract: 0, collected: 0, balance: 0 };
+      e.count += 1; e.contract += r.contract; e.collected += r.collected; e.balance += r.balance;
+      map.set(k, e);
+    });
+    return [...map.values()].sort((a, b) =>
+      groupBy === "age" ? (order[a.key] ?? 9) - (order[b.key] ?? 9) : Math.abs(b.balance) - Math.abs(a.balance));
+  }, [rows, groupBy]);
+
+  const tot = rows.reduce((t, r) => ({ contract: t.contract + r.contract, collected: t.collected + r.collected, balance: t.balance + r.balance }),
+    { contract: 0, collected: 0, balance: 0 });
+
+  const tradeKeys = useMemo(() => [...new Set(all.map((r) => r.trade).filter(Boolean))].sort(), [all]);
+  const stageOpts = useMemo(() => {
+    const m = new Map();
+    all.forEach((r) => { if (!m.has(r.stage)) m.set(r.stage, r.stage_label || r.stage); });
+    return [...m.entries()];
+  }, [all]);
+
+  const activeFilters = [fTrade, fStage, fSource, search].filter(Boolean).length;
+  const reset = () => { setFTrade(""); setFStage(""); setFSource(""); setSearch(""); };
+  const filenameBase = "tradedesk_balances-owed_" + scope + "_" + isoDay(new Date());
+  const doExport = async (kind) => {
+    if (!rows.length) return;
+    setBusy(kind);
+    try {
+      if (kind === "csv") exportBalancesCsv(rows, filenameBase + ".csv");
+      else await exportBalancesXlsx(rows, groups, filenameBase + ".xlsx");
+    } catch (e) { setError("Export failed: " + (e.message || e)); }
+    finally { setBusy(""); }
+  };
+
+  return (
+    <div className="td-sc td-bal">
+      <div className="td-panel td-report">
+        <div className="td-panel-head">
+          <span><Wallet size={14} style={{ verticalAlign: -2, marginRight: 6 }} />Balances owed</span>
+          <div className="td-report-actions">
+            <button className="td-btn" disabled={loading} onClick={() => setReloadKey((k) => k + 1)} title="Reload from the database">
+              <RefreshCw size={13} /> Refresh
+            </button>
+            <button className="td-btn" disabled={!rows.length || !!busy} onClick={() => doExport("csv")}>
+              <Download size={13} /> {busy === "csv" ? "Exporting…" : "CSV"}
+            </button>
+            <button className="td-btn" disabled={!rows.length || !!busy} onClick={() => doExport("xlsx")}>
+              <FileSpreadsheet size={13} /> {busy === "xlsx" ? "Building…" : "Excel"}
+            </button>
+          </div>
+        </div>
+
+        {error && <div className="td-sync-banner"><AlertTriangle size={15} /><span>{error}</span></div>}
+        {loading && !data && <div className="td-sc-loading">Loading…</div>}
+
+        {data && (
+          <>
+            <div className="td-stat-row">
+              <TicketStat label="Owed on finished jobs" value={money(head.finished)} icon={Wallet} accent="#C1440E"
+                footnote={head.finishedJobs + " jobs · " + money(head.over90) + " over 90 days"} />
+              <TicketStat label="Left to collect on open jobs" value={money(head.open)} icon={ClipboardList} accent="#B8860B"
+                footnote={head.openJobs + " jobs not finished yet"} />
+              <TicketStat label="Paid per sheet, not in TradeDesk" value={String(head.sheetOnlyJobs)} icon={AlertTriangle} accent="#8A5A12"
+                footnote={money(head.sheetOnlyGap) + " of payments to enter"} />
+              <TicketStat label="Overpaid / credits" value={money(head.credits)} icon={HandCoins} accent="#3F7D58"
+                footnote={head.creditJobs + " jobs collected more than contract"} />
+            </div>
+
+            <div className="td-report-controls">
+              <label className="td-deal-field">
+                <span className="td-field-label">Jobs</span>
+                <select className="td-select" value={scope} onChange={(e) => setScope(e.target.value)}>
+                  {BAL_SCOPES.map((o) => <option key={o.key} value={o.key}>{o.label}</option>)}
+                </select>
+              </label>
+              <label className="td-deal-field">
+                <span className="td-field-label">Show</span>
+                <select className="td-select" value={show} onChange={(e) => setShow(e.target.value)}>
+                  {BAL_SHOW.map((o) => <option key={o.key} value={o.key}>{o.label}</option>)}
+                </select>
+              </label>
+              <label className="td-deal-field">
+                <span className="td-field-label">Group</span>
+                <select className="td-select" value={groupBy} onChange={(e) => setGroupBy(e.target.value)}>
+                  {BAL_GROUPS.map((o) => <option key={o.key} value={o.key}>{o.label}</option>)}
+                </select>
+              </label>
+              <label className="td-deal-field">
+                <span className="td-field-label">Trade</span>
+                <select className="td-select" value={fTrade} onChange={(e) => setFTrade(e.target.value)}>
+                  <option value="">All trades</option>
+                  {tradeKeys.map((k) => <option key={k} value={k}>{TRADES[k] ? TRADES[k].label : k}</option>)}
+                </select>
+              </label>
+              <label className="td-deal-field">
+                <span className="td-field-label">Stage</span>
+                <select className="td-select" value={fStage} onChange={(e) => setFStage(e.target.value)}>
+                  <option value="">All stages</option>
+                  {stageOpts.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+                </select>
+              </label>
+              <label className="td-deal-field">
+                <span className="td-field-label">Collected from</span>
+                <select className="td-select" value={fSource} onChange={(e) => setFSource(e.target.value)}>
+                  <option value="">Any source</option>
+                  {Object.entries(BAL_SOURCE_LABEL).map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+                </select>
+              </label>
+              <label className="td-deal-field td-report-search">
+                <span className="td-field-label">Search</span>
+                <input className="td-input" placeholder="Customer, address, job #, project #" value={search}
+                  onChange={(e) => setSearch(e.target.value)} />
+              </label>
+              {activeFilters > 0 && (
+                <button className="td-btn td-report-reset" onClick={reset}>
+                  <X size={13} /> Clear {activeFilters} filter{activeFilters === 1 ? "" : "s"}
+                </button>
+              )}
+            </div>
+
+            {rows.length === 0 ? (
+              <EmptyState icon={Wallet} title="Nothing matches" sub="Change the job scope or clear a filter." />
+            ) : (
+              <>
+                <div className="td-table-wrap">
+                  <table className="td-table td-sc-table">
+                    <thead>
+                      <tr>
+                        <th>{(BAL_GROUPS.find((g) => g.key === groupBy) || {}).label.replace(/^By /, "").replace(/^No grouping$/, "Total")}</th>
+                        <th className="td-num">Jobs</th><th className="td-num">Contract</th>
+                        <th className="td-num">Collected</th><th className="td-num">Balance owed</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {groups.map((g) => (
+                        <tr key={g.key}>
+                          <td>{g.label}</td>
+                          <td className="td-num">{g.count}</td>
+                          <td className="td-num">{money(g.contract)}</td>
+                          <td className="td-num">{money(g.collected)}</td>
+                          <td className={"td-num " + (g.balance < 0 ? "td-text-green" : "td-text-red")}><strong>{money(g.balance)}</strong></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot>
+                      <tr>
+                        <td><strong>Total</strong></td>
+                        <td className="td-num"><strong>{rows.length}</strong></td>
+                        <td className="td-num"><strong>{money(tot.contract)}</strong></td>
+                        <td className="td-num"><strong>{money(tot.collected)}</strong></td>
+                        <td className="td-num"><strong>{money(tot.balance)}</strong></td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+
+                <div className="td-table-wrap td-bal-jobs">
+                  <table className="td-table">
+                    <thead>
+                      <tr>
+                        <th>Job</th><th>Customer</th><th>Stage</th>
+                        <th className="td-num">Contract</th><th className="td-num">Collected</th><th className="td-num">Balance</th>
+                        <th>Completed</th><th>Last payment</th><th>Check</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {rows.map((r) => {
+                        const flags = balFlags(r);
+                        return (
+                          <tr key={r.job_id} className="td-bal-row" onClick={() => onOpenJob && onOpenJob(r.job_id)} title="Open this job">
+                            <td>
+                              <div className="td-bal-job">{jobNo(r.number)}</div>
+                              {r.project_ref && <div className="td-bal-sub">GHL #{r.project_ref}</div>}
+                            </td>
+                            <td>
+                              <div>{r.customer}</div>
+                              <div className="td-bal-sub">{String(r.address || "").split(",")[0]}</div>
+                            </td>
+                            <td>{r.stage_label}</td>
+                            <td className="td-num">{money(r.contract)}</td>
+                            <td className="td-num">
+                              {money(r.collected)}
+                              {r.collected_source === "sheet" && <span className="td-bal-src" title={"TradeDesk has " + money(r.paid_tradedesk) + "; the Completion Log says " + money(r.paid_sheet)}>sheet</span>}
+                            </td>
+                            <td className={"td-num " + (r.balance < 0 ? "td-text-green" : r.balance >= 1 ? "td-text-red" : "")}><strong>{money(r.balance)}</strong></td>
+                            <td>
+                              {r.completed_at ? fmtDate(r.completed_at) : <span className="td-bal-sub">—</span>}
+                              {r.days_since_complete !== null && r.days_since_complete !== undefined &&
+                                <div className={cls("td-bal-sub", r.days_since_complete > 90 && r.balance >= 1 && "td-text-red")}>{r.days_since_complete} days</div>}
+                            </td>
+                            <td>
+                              {r.last_paid_tradedesk ? fmtDate(r.last_paid_tradedesk)
+                                : r.last_paid_sheet ? <span>{fmtDate(r.last_paid_sheet + "T00:00:00")} <span className="td-bal-sub">(sheet)</span></span>
+                                : <span className="td-bal-sub">none</span>}
+                            </td>
+                            <td>
+                              <div className="td-bal-flags">
+                                {flags.map((f, i) => <span key={i} className={"td-bal-flag td-bal-flag-" + f.tone}>{f.text}</span>)}
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+            <p className="td-sc-key">
+              Balance = contract − collected. Collected is the larger of the payments entered in TradeDesk and the
+              Completion Log's AMOUNT COLLECTED; rows marked <em>sheet</em> took the sheet's figure, so those payments
+              still need entering in TradeDesk. Change orders not yet added to a job's contract show up as credits.
+              Lost and abandoned jobs are left out. Click a row to open the job.
+            </p>
+          </>
+        )}
       </div>
     </div>
   );
@@ -4391,6 +4839,20 @@ function GlobalStyle() {
       .td-sc-sub { display: inline-block; min-width: 18px; margin-left: 6px; font-size: 10.5px; color: #8A8478; }
       .td-sc-prov { color: #8A5A12; }
       .td-sc-key { font-size: 12px; color: var(--td-muted); margin: 10px 0 0; }
+      .td-bal-jobs { margin-top: 14px; }
+      .td-bal-row { cursor: pointer; }
+      .td-bal-row:hover td { background: #FAF7F1; }
+      .td-bal-job { font-family: 'IBM Plex Mono', monospace; font-size: 12px; white-space: nowrap; }
+      .td-bal-sub { font-size: 11.5px; color: var(--td-muted); }
+      .td-bal-jobs td { vertical-align: top; }
+      .td-bal-jobs .td-num { white-space: nowrap; }
+      .td-bal-src { display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 3px; font-size: 10px; font-weight: 700;
+        text-transform: uppercase; letter-spacing: .03em; background: #F6E7C8; color: #8A5A12; vertical-align: 1px; }
+      .td-bal-flags { display: flex; flex-wrap: wrap; gap: 4px; max-width: 280px; }
+      .td-bal-flag { font-size: 11px; padding: 1px 6px; border-radius: 3px; line-height: 1.5; }
+      .td-bal-flag-red { background: #F8E1DC; color: #9A2E1C; }
+      .td-bal-flag-amber { background: #F6E7C8; color: #7A4F0E; }
+      .td-bal-flag-grey { background: #EFEBE3; color: #5E594F; }
       .td-sc-loading { padding: 24px 0; color: var(--td-muted); font-size: 13px; }
       .td-sc-coverage dl { display: grid; grid-template-columns: max-content 1fr; gap: 8px 16px; margin: 0; font-size: 13px; }
       .td-sc-coverage dt { font-weight: 650; }
