@@ -9,7 +9,7 @@ import {
   AlertTriangle, Tag, Building2, Menu, ClipboardList, RefreshCw,
   Wallet, HandCoins, Percent, Calendar as CalendarIcon, LogOut,
   Hammer, Wrench, PaintBucket, Droplets, Thermometer, PackageCheck, ShoppingCart,
-  Download, FileSpreadsheet, SlidersHorizontal, ArrowDownUp, ShieldCheck, Link2, Lock, Send
+  Download, FileSpreadsheet, SlidersHorizontal, ArrowDownUp, ShieldCheck, Link2, Lock, Send, CalendarCheck, ExternalLink
 } from "lucide-react";
 
 /* =========================================================================
@@ -379,6 +379,18 @@ const fmtDate = (iso) => {
   if (!iso) return "—";
   const d = new Date(iso);
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+};
+
+// A calendar event is an instant, not a day, so the review queue needs the
+// time as well. Rendered in the browser's own zone, which is the crew's.
+const fmtDateTime = (iso) => {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (isNaN(d)) return "—";
+  return d.toLocaleString("en-US", {
+    weekday: "short", month: "short", day: "numeric",
+    hour: "numeric", minute: "2-digit",
+  });
 };
 
 const fmtDateShort = (iso) => {
@@ -782,6 +794,14 @@ export default function App() {
   // presentation only — RLS has already decided what rows arrive, and these
   // flags exist so a project manager sees no panel at all rather than a panel
   // reading $0. Anything gated on them must also be gated in Postgres.
+  // The review queue is read on its own rather than through loadAll: the
+  // scheduled task writes to it between page loads, so it has to be
+  // refreshable without re-reading every job in the business.
+  const [reviewRows, setReviewRows] = useState([]);
+  const [reviewRecent, setReviewRecent] = useState([]);
+  const [reviewLoading, setReviewLoading] = useState(false);
+  const [reviewError, setReviewError] = useState("");
+
   const role = safeData.role || "project_manager";
   const isAdmin = role === "admin" || role === "super_admin";
   const isSuperAdmin = role === "super_admin";
@@ -984,12 +1004,31 @@ export default function App() {
     persist(() => repo.deleteAssignment(assignmentId), "Removing the assignment");
   };
 
+  const loadReview = React.useCallback(async () => {
+    if (!isAdmin) { setReviewRows([]); setReviewRecent([]); return; }
+    setReviewLoading(true);
+    try {
+      const [pending, recent] = await Promise.all([
+        repo.loadScheduleReview(), repo.loadScheduleReviewRecent()]);
+      setReviewRows(pending);
+      setReviewRecent(recent);
+      setReviewError("");
+    } catch (e) {
+      setReviewError(e && e.message ? e.message : "Could not read the review queue.");
+    } finally {
+      setReviewLoading(false);
+    }
+  }, [isAdmin]);
+
+  useEffect(() => { loadReview(); }, [loadReview]);
+
   const signOut = () => { if (isSupabaseConfigured) supabase.auth.signOut(); };
 
   const ctx = {
     data: safeData, jobs, vendors, vendorNames, vendorSpend,
     assignees, assigneeById,
     role, isAdmin, isSuperAdmin, reload,
+    reviewRows, reviewRecent, reviewLoading, reviewError, loadReview,
     addJob, updateJob, deleteJob,
     addClientPayment, deleteClientPayment,
     addVendorPayment, updateVendorPayment, deleteVendorPayment,
@@ -1009,6 +1048,9 @@ export default function App() {
     ...(isAdmin ? [
       { key: "vendors", label: "Vendors", icon: Truck },
       { key: "reports", label: "Reports", icon: TrendingUp },
+      // The badge is the whole point of the nav entry: nobody opens a queue
+      // page speculatively, so the count has to come to them.
+      { key: "schedule", label: "Schedule review", icon: CalendarCheck, badge: reviewRows.length },
     ] : []),
     ...(isSuperAdmin ? [{ key: "access", label: "Access", icon: ShieldCheck }] : []),
   ];
@@ -1062,6 +1104,7 @@ export default function App() {
                 onClick={() => { setView(n.key); setSidebarOpen(false); }}>
                 <n.icon size={16} strokeWidth={2.2} />
                 <span>{n.label}</span>
+                {n.badge > 0 && <span className="td-nav-badge">{n.badge}</span>}
               </button>
             ))}
           </nav>
@@ -1111,6 +1154,7 @@ export default function App() {
             {safeView === "calendar" && <CalendarView ctx={ctx} />}
             {safeView === "vendors" && isAdmin && <VendorsView ctx={ctx} />}
             {safeView === "reports" && isAdmin && <ReportsView ctx={ctx} />}
+            {safeView === "schedule" && isAdmin && <ScheduleReviewView ctx={ctx} />}
             {safeView === "access" && isSuperAdmin && <AccessView ctx={ctx} />}
           </main>
         </div>
@@ -1886,6 +1930,12 @@ function JobDetailModal({ ctx, job, onClose }) {
 /**
  * Finalize GP — the moment the office declares a job's gross profit final.
  *
+ * Finalizing always records the snapshot. Whether it also emails is a separate
+ * question answered in the database, and it goes out in two cases: the gross
+ * profit came in under the threshold in email_config, or the figure moved
+ * since the last finalization. A healthy job is finalized silently, but once a
+ * number has been stated, any correction to it is stated too.
+ *
  * Margin is otherwise a live calculation that moves every time a vendor bill
  * is entered, so there is no natural instant at which it is "the" number.
  * This button creates one: it freezes the figure, records who froze it and
@@ -1908,20 +1958,29 @@ function JobGpFinalize({ ctx, job, liveMargin, drifted }) {
     if (!confirm(
       again
         ? "Re-finalize " + jobRef(job) + " at " + money(liveMargin) + "?\n\n" +
-          "The gross profit on record becomes " + money(liveMargin) + ", was " + money(fin.margin) +
-          ". A revised email goes out showing both figures."
+          "The gross profit on record becomes " + money(liveMargin) + ", was " + money(fin.margin) + "."
         : "Finalize " + jobRef(job) + " at a gross profit of " + money(liveMargin) + "?\n\n" +
-          "This freezes the figure and emails it out. Costs entered later will show as drift " +
-          "against it rather than changing it."
+          "This freezes the figure. Costs entered later will show as drift against it rather " +
+          "than changing it."
     )) return;
 
     setBusy(true); setErr(""); setSent("");
     try {
       const res = await repo.finalizeGp(job.id);
       const to = (res && res.recipients) || [];
-      setSent(res && res.queued
-        ? "Sent to " + to.join(", ")
-        : "Finalized, but no active recipient is configured — nothing was emailed.");
+      if (res && res.queued) {
+        const why = res.reason === "gp_changed"
+          ? "the figure changed"
+          : "gross profit is under " + Math.round(Number(res.threshold_margin_pct || 0) * 100) + "%";
+        setSent("Finalized. Emailed to " + to.join(", ") + " — " + why + ".");
+      } else if (res && !res.reason) {
+        // Not a failure, and worth saying out loud: silence here is the
+        // feature, not a send that went missing.
+        const t = Math.round(Number(res.threshold_margin_pct || 0) * 100);
+        setSent("Finalized. No email — gross profit is at or above " + t + "% and nothing changed.");
+      } else {
+        setSent("Finalized, but no active recipient is configured — nothing was emailed.");
+      }
       await ctx.reload();
     } catch (e) {
       setErr(e && e.message ? e.message : "The finalization was refused.");
@@ -1941,7 +2000,10 @@ function JobGpFinalize({ ctx, job, liveMargin, drifted }) {
             </span>
           </>
         ) : (
-          <span className="td-gp-when">Gross profit is still live — it moves with every cost entered.</span>
+          <span className="td-gp-when">
+            Gross profit is still live — it moves with every cost entered. Finalizing freezes
+            it, and emails ownership if it comes in thin or if a frozen figure later changes.
+          </span>
         )}
         {drifted && (
           <span className="td-gp-drift-note">
@@ -3296,6 +3358,320 @@ function CalendarPopover({ ev, x, y, assigneeById, onClose, onOpenJob }) {
 }
 
 /* =========================================================================
+   SCHEDULE MATCH REVIEW
+   -------------------------------------------------------------------------
+   A scheduled task reads the installer calendars and ties each event back to
+   a job. Event titles are typed by people, so they come in every shape:
+   "Solid Shield-Thompson Roof", "Mario - 1219 Winton Roof Install". When the
+   task can narrow an event to several jobs but not one, it parks it here with
+   its candidates.
+
+   This page records which job was meant, and nothing else. It does not touch
+   the job, the calendars or the CRM — the task does all of that on its next
+   run, reading the decision made here. Keep it that way: a page that both
+   decides and acts would double-apply the moment the task retried.
+   ========================================================================= */
+
+// Loose containment either way, so "Roof" matches "Roofing" and
+// "27800 Parkview Dr" matches "27800 Parkview Dr, Euclid OH 44132". Only ever
+// used to tint a field as corroborating — never to pick for anyone.
+const looseHit = (a, b) => {
+  const norm = (v) => String(v || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const x = norm(a), y = norm(b);
+  if (!x || !y) return false;
+  return x === y || x.includes(y) || y.includes(x);
+};
+
+function ScheduleReviewView({ ctx }) {
+  const { reviewRows, reviewRecent, reviewLoading, reviewError, loadReview } = ctx;
+  const [tab, setTab] = useState("pending");
+
+  return (
+    <div className="td-view">
+      <style>{`
+        .td-rev-head{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:14px;}
+        .td-rev-head p{margin:0;font-size:12.5px;line-height:1.5;color:#6E675C;max-width:70ch;flex-basis:100%;}
+        .td-rev-card{border:1px solid #EBE6DC;border-radius:11px;background:#fff;
+          padding:15px 16px;margin-bottom:13px;}
+        .td-rev-title{font-size:15px;font-weight:650;line-height:1.35;word-break:break-word;}
+        .td-rev-meta{display:flex;flex-wrap:wrap;gap:5px 11px;margin-top:4px;
+          font-size:12px;color:#6E675C;}
+        .td-rev-src{display:inline-flex;align-items:center;padding:1px 7px;border-radius:999px;
+          background:#EEF3F5;color:#3F6E80;font-size:11px;font-weight:650;letter-spacing:.03em;}
+        .td-rev-parsed{display:flex;flex-wrap:wrap;gap:6px;margin:11px 0 3px;}
+        .td-rev-chip{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;
+          background:#F5F2EC;font-size:11.5px;color:#4A443B;}
+        .td-rev-chip b{font-weight:650;color:#8A8478;font-weight:600;}
+        .td-rev-cands{display:grid;gap:9px;margin-top:12px;
+          grid-template-columns:repeat(auto-fit,minmax(240px,1fr));}
+        .td-rev-cand{text-align:left;border:1.5px solid #EBE6DC;border-radius:9px;background:#fff;
+          padding:11px 12px;font:inherit;cursor:pointer;display:block;width:100%;}
+        .td-rev-cand:hover{border-color:#C9C1B2;}
+        .td-rev-cand.sel{border-color:#3F8EA6;background:#F2F8FA;}
+        .td-rev-cand-name{font-size:13.5px;font-weight:650;}
+        .td-rev-cand-row{font-size:12px;color:#6E675C;margin-top:3px;line-height:1.45;
+          word-break:break-word;}
+        .td-rev-hit{background:#E6EFE8;color:#2F6B46;border-radius:4px;padding:0 4px;font-weight:600;}
+        .td-rev-open{display:inline-flex;align-items:center;gap:4px;margin-top:7px;
+          font-size:11.5px;color:#3F6E80;background:none;border:none;padding:0;cursor:pointer;}
+        .td-rev-none{margin-top:9px;}
+        .td-rev-empty{margin-top:10px;padding:9px 12px;border-radius:8px;background:#FDF3E3;
+          color:#8A5A12;font-size:12.5px;line-height:1.5;}
+        .td-rev-actions{display:flex;align-items:center;flex-wrap:wrap;gap:9px;margin-top:13px;
+          padding-top:12px;border-top:1px solid #F0ECE3;}
+        .td-rev-msg{font-size:12px;flex-basis:100%;}
+        .td-rev-msg-err{color:#9B3A20;}
+        .td-rev-msg-ok{color:#2F6B46;}
+        .td-rev-recent{width:100%;border-collapse:collapse;}
+        .td-rev-recent td,.td-rev-recent th{text-align:left;font-size:12.5px;padding:9px 10px 9px 0;
+          border-bottom:1px solid #F0ECE3;vertical-align:top;}
+        .td-rev-recent th{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#8A8478;}
+        .td-rev-stale{color:#8A5A12;font-size:11.5px;}
+        @media (max-width:560px){
+          .td-rev-cands{grid-template-columns:1fr;}
+          .td-rev-actions .td-btn{flex:1;justify-content:center;}
+        }
+      `}</style>
+
+      <div className="td-rev-head">
+        <div className="td-segment">
+          <button className={cls("td-segment-btn", tab === "pending" && "active")}
+            onClick={() => setTab("pending")}>
+            Needs a decision{reviewRows.length ? " (" + reviewRows.length + ")" : ""}
+          </button>
+          <button className={cls("td-segment-btn", tab === "recent" && "active")}
+            onClick={() => setTab("recent")}>Recent</button>
+        </div>
+        <button className="td-btn td-btn-sm" onClick={loadReview} disabled={reviewLoading}>
+          <RefreshCw size={13} className={cls(reviewLoading && "td-spin")} /> Refresh
+        </button>
+        <p>
+          Calendar events the sync could not tie to one job. Picking the right job here is
+          all this page does — the scheduled task reads the decision on its next run and
+          does the scheduling.
+        </p>
+      </div>
+
+      {reviewError && <div className="td-access-err"><AlertTriangle size={14} /> {reviewError}</div>}
+
+      {tab === "pending" ? (
+        reviewLoading && reviewRows.length === 0 ? (
+          <div className="td-muted-line"><RefreshCw size={13} className="td-spin" /> Loading…</div>
+        ) : reviewRows.length === 0 ? (
+          <EmptyState icon={CalendarCheck} title="Nothing waiting"
+            sub="Every calendar event matched a job on its own." />
+        ) : reviewRows.map((row) => (
+          <ScheduleReviewRow key={row.id} ctx={ctx} row={row} />
+        ))
+      ) : (
+        <ScheduleReviewRecent ctx={ctx} rows={reviewRecent} />
+      )}
+    </div>
+  );
+}
+
+function ScheduleReviewRow({ ctx, row }) {
+  const [picked, setPicked] = useState(null); // job_id | "__none"
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null);       // { text, err }
+  const empty = row.candidates.length === 0;
+
+  const confirm = async () => {
+    if (!picked || busy) return;
+    setBusy(true); setMsg(null);
+    try {
+      const saved = await repo.resolveScheduleReview(row.id, picked === "__none" ? null : picked);
+      if (!saved) {
+        // Someone else decided it, or the task moved it on. Saying "saved"
+        // here would be a lie the next run would expose.
+        setMsg({ text: "This one was already handled or the event changed — refreshing.", err: true });
+        await ctx.loadReview();
+        return;
+      }
+      await ctx.loadReview();
+    } catch (e) {
+      setMsg({ text: e && e.message ? e.message : "That could not be saved.", err: true });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="td-rev-card">
+      <div className="td-rev-title">{row.eventTitle}</div>
+      <div className="td-rev-meta">
+        <span className="td-rev-src">{row.source === "ghl" ? "GHL" : "GOOGLE"}</span>
+        <span>{row.eventStart ? fmtDateTime(row.eventStart) : "no date on the event"}</span>
+        {row.otherEventId && <span>· linked to the other calendar</span>}
+      </div>
+
+      <div className="td-rev-parsed">
+        {[["Installer", row.parsed.installer], ["Customer", row.parsed.customer],
+          ["Address", row.parsed.address], ["Job type", row.parsed.jobType]]
+          .filter(([, v]) => v)
+          .map(([k, v]) => <span key={k} className="td-rev-chip"><b>{k}</b> {v}</span>)}
+        {!row.parsed.installer && !row.parsed.customer && !row.parsed.address && !row.parsed.jobType && (
+          <span className="td-rev-chip">nothing could be read out of the title</span>
+        )}
+      </div>
+
+      {empty ? (
+        <div className="td-rev-empty">
+          No job in TradeDesk looked like a match for this event. Marking it "none of these"
+          tells the sync to leave it alone.
+        </div>
+      ) : (
+        <div className="td-rev-cands">
+          {row.candidates.map((c, i) => (
+            <ScheduleReviewCandidate key={c.job_id || i} ctx={ctx} c={c} parsed={row.parsed}
+              selected={picked === c.job_id} onPick={() => setPicked(c.job_id)} />
+          ))}
+        </div>
+      )}
+
+      <div className="td-rev-none">
+        <button type="button"
+          className={cls("td-rev-cand", picked === "__none" && "sel")}
+          onClick={() => setPicked("__none")}>
+          <span className="td-rev-cand-name">None of these</span>
+          <span className="td-rev-cand-row">Leave this event unscheduled and out of the sync.</span>
+        </button>
+      </div>
+
+      <div className="td-rev-actions">
+        <button className="td-btn td-btn-primary td-btn-sm" onClick={confirm} disabled={!picked || busy}>
+          {busy ? <RefreshCw size={13} className="td-spin" /> : <Check size={13} />} Confirm
+        </button>
+        {picked && !busy && (
+          <button className="td-btn td-btn-sm td-btn-ghost" onClick={() => setPicked(null)}>Clear</button>
+        )}
+        {msg && <div className={cls("td-rev-msg", msg.err ? "td-rev-msg-err" : "td-rev-msg-ok")}>{msg.text}</div>}
+      </div>
+    </div>
+  );
+}
+
+function ScheduleReviewCandidate({ ctx, c, parsed, selected, onPick }) {
+  // Only offer to open a job this browser actually has; a candidate the task
+  // wrote for a job since deleted would otherwise open an empty modal.
+  const known = ctx.jobs.some((j) => j.id === c.job_id);
+  const hit = (field, against) => looseHit(field, against);
+
+  return (
+    <div className={cls("td-rev-cand", selected && "sel")} onClick={onPick}
+      role="button" tabIndex={0}
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onPick(); } }}>
+      <div className="td-rev-cand-name">
+        <span className={cls(hit(c.customer_name, parsed.customer) && "td-rev-hit")}>
+          {c.customer_name || "(no name)"}
+        </span>
+      </div>
+      {c.address && (
+        <div className="td-rev-cand-row">
+          <span className={cls(hit(c.address, parsed.address) && "td-rev-hit")}>{c.address}</span>
+        </div>
+      )}
+      <div className="td-rev-cand-row">
+        {c.job_number ? "Job " + c.job_number : "no job number"}
+        {c.job_type ? " · " : ""}
+        {c.job_type && (
+          <span className={cls(hit(c.job_type, parsed.jobType) && "td-rev-hit")}>{c.job_type}</span>
+        )}
+      </div>
+      {(c.assigned_installer || c.scheduled_date) && (
+        <div className="td-rev-cand-row">
+          {c.assigned_installer && (
+            <span className={cls(hit(c.assigned_installer, parsed.installer) && "td-rev-hit")}>
+              {c.assigned_installer}
+            </span>
+          )}
+          {c.assigned_installer && c.scheduled_date ? " · " : ""}
+          {c.scheduled_date && fmtDateNum(c.scheduled_date)}
+        </div>
+      )}
+      {known && (
+        <button type="button" className="td-rev-open"
+          onClick={(e) => { e.stopPropagation(); ctx.setSelectedJobId(c.job_id); }}>
+          <ExternalLink size={11} /> Open this job
+        </button>
+      )}
+    </div>
+  );
+}
+
+function ScheduleReviewRecent({ ctx, rows }) {
+  const [busy, setBusy] = useState("");
+  const [err, setErr] = useState("");
+
+  const undo = async (row) => {
+    setBusy(row.id); setErr("");
+    try {
+      const back = await repo.undoScheduleReview(row.id);
+      if (!back) setErr("That one has already been carried out, so it cannot be undone.");
+      await ctx.loadReview();
+    } catch (e) {
+      setErr(e && e.message ? e.message : "That could not be undone.");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  if (rows.length === 0) {
+    return <EmptyState icon={CalendarCheck} title="Nothing in the last 14 days" />;
+  }
+
+  const label = { resolved: "Matched", no_match: "No match", applied: "Scheduled", stale: "Stale" };
+
+  return (
+    <div className="td-panel">
+      {err && <div className="td-access-err"><AlertTriangle size={14} /> {err}</div>}
+      <table className="td-rev-recent">
+        <thead>
+          <tr><th>Event</th><th>Decision</th><th>Who</th><th /></tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.id}>
+              <td>
+                <div style={{ fontWeight: 600 }}>{r.eventTitle}</div>
+                <div className="td-cell-sub">
+                  {r.source === "ghl" ? "GHL" : "Google"}
+                  {r.eventStart ? " · " + fmtDateTime(r.eventStart) : ""}
+                </div>
+                {r.status === "stale" && (
+                  <div className="td-rev-stale">
+                    The calendar event changed after this was queued — it will be re-checked
+                    on the next run.
+                  </div>
+                )}
+              </td>
+              <td>
+                {label[r.status] || r.status}
+                {r.appliedAt && <div className="td-cell-sub">carried out {fmtDate(r.appliedAt)}</div>}
+              </td>
+              <td>
+                {r.resolvedBy || "—"}
+                {r.resolvedAt && <div className="td-cell-sub">{fmtDate(r.resolvedAt)}</div>}
+              </td>
+              <td>
+                {/* Undo is gone the moment the task has acted: the schedule is
+                    out in the world by then and this page cannot pull it back. */}
+                {!r.appliedAt && (r.status === "resolved" || r.status === "no_match") && (
+                  <button className="td-btn td-btn-sm td-btn-ghost" disabled={busy === r.id}
+                    onClick={() => undo(r)}>
+                    {busy === r.id ? <RefreshCw size={12} className="td-spin" /> : null} Undo
+                  </button>
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* =========================================================================
    ACCESS — who can sign in, and what they get
    -------------------------------------------------------------------------
    Visible only to a super administrator, and only because the Access item is
@@ -3801,6 +4177,9 @@ function GlobalStyle() {
       /* The contact line keeps its icons and its place; only the two values
          become boxes. Capped so a short phone number does not stretch to the
          width of the card. */
+      .td-nav-badge { margin-left: auto; min-width: 19px; height: 19px; padding: 0 6px;
+        border-radius: 999px; background: #C1440E; color: #fff; font-size: 11px; font-weight: 700;
+        display: inline-flex; align-items: center; justify-content: center; }
       .td-gp-final { display: flex; align-items: center; flex-wrap: wrap; gap: 9px 12px;
         margin: 10px 0 2px; padding: 10px 13px; border: 1px solid #EBE6DC; border-radius: 9px;
         background: #FBFAF7; }

@@ -191,6 +191,34 @@ const assignmentFromRow = (r) => ({
   note: r.note || "",
 });
 
+// A calendar event the scheduled task could not tie to exactly one job, with
+// the jobs it might be. Written by the task, read here, decided by the office.
+// `candidates` arrives as the task wrote it, so it is passed through rather
+// than re-shaped — a key this app invents would be a key the task never reads.
+const scheduleReviewFromRow = (r) => ({
+  id: r.id,
+  source: r.source,
+  eventId: r.event_id,
+  otherEventId: r.other_event_id || null,
+  eventTitle: r.event_title,
+  eventStart: r.event_start || null,
+  eventEnd: r.event_end || null,
+  eventUpdatedAt: r.event_updated_at || null,
+  parsed: {
+    installer: r.parsed_installer || "",
+    customer: r.parsed_customer || "",
+    address: r.parsed_address || "",
+    jobType: r.parsed_job_type || "",
+  },
+  candidates: Array.isArray(r.candidates) ? r.candidates : [],
+  status: r.status,
+  selectedJobId: r.selected_job_id || null,
+  resolvedBy: r.resolved_by || null,
+  resolvedAt: r.resolved_at || null,
+  appliedAt: r.applied_at || null,
+  createdAt: r.created_at || null,
+});
+
 /* ---------------------------------------------------------------------------
    Supabase implementation
    --------------------------------------------------------------------------- */
@@ -467,6 +495,74 @@ const supabaseRepo = {
    * send itself is a separate retrying job, so Resend being down delays the
    * email rather than failing the finalization.
    */
+  /* -------------------------------------------------------------------------
+     Schedule match review.
+
+     This app only records a decision. It never writes a job, a calendar or a
+     message — the scheduled task reads the decision on its next run and does
+     all of that. Nothing here should ever grow a side effect.
+     ------------------------------------------------------------------------- */
+
+  async loadScheduleReview() {
+    const rows = await supabase.from("schedule_match_review").select("*")
+      .eq("status", "pending")
+      // Soonest first: the event happening tomorrow matters more than the one
+      // queued first. Nulls last so an undated event never leads the list.
+      .order("event_start", { ascending: true, nullsFirst: false })
+      .then(unwrap);
+    return rows.map(scheduleReviewFromRow);
+  },
+
+  async loadScheduleReviewRecent() {
+    const since = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+    const rows = await supabase.from("schedule_match_review").select("*")
+      .in("status", ["resolved", "no_match", "applied", "stale"])
+      .gte("created_at", since)
+      .order("resolved_at", { ascending: false, nullsFirst: false })
+      .then(unwrap);
+    return rows.map(scheduleReviewFromRow);
+  },
+
+  async whoAmI() {
+    const { data } = await supabase.auth.getUser();
+    return (data && data.user && data.user.email) || "unknown";
+  },
+
+  /**
+   * Record the decision, but only if nobody got there first.
+   *
+   * The `status = pending` in the filter is the whole guard: two people with
+   * the page open, or a run of the task that has already moved the row on,
+   * must not quietly overwrite each other. PostgREST returns the rows it
+   * actually changed, so an empty array means this row was no longer pending
+   * and the caller has to say so rather than pretend it saved.
+   */
+  async resolveScheduleReview(id, jobId) {
+    const who = await this.whoAmI();
+    const rows = await supabase.from("schedule_match_review")
+      .update({
+        status: jobId ? "resolved" : "no_match",
+        selected_job_id: jobId || null,
+        resolved_by: who,
+        resolved_at: new Date().toISOString(),
+      })
+      .eq("id", id).eq("status", "pending")
+      .select()
+      .then(unwrap);
+    return rows.length ? scheduleReviewFromRow(rows[0]) : null;
+  },
+
+  // Only while the task has not acted on it. applied_at is in the policy as
+  // well as here, so a stale tab cannot undo something already carried out.
+  async undoScheduleReview(id) {
+    const rows = await supabase.from("schedule_match_review")
+      .update({ status: "pending", selected_job_id: null, resolved_by: null, resolved_at: null })
+      .eq("id", id).in("status", ["resolved", "no_match"]).is("applied_at", null)
+      .select()
+      .then(unwrap);
+    return rows.length ? scheduleReviewFromRow(rows[0]) : null;
+  },
+
   async finalizeGp(jobId) {
     return await supabase.rpc("finalize_job_gp", { p_job: jobId }).then(unwrap);
   },
@@ -604,6 +700,11 @@ const localRepo = {
   },
 
   async finalizeGp() { throw new Error("finalizing gross profit needs Supabase"); },
+  async loadScheduleReview() { return []; },
+  async loadScheduleReviewRecent() { return []; },
+  async whoAmI() { return "local"; },
+  async resolveScheduleReview() { throw new Error("the review queue needs Supabase"); },
+  async undoScheduleReview() { throw new Error("the review queue needs Supabase"); },
   async listUsers() { return []; },
   async listAppRoles() { return []; },
   async setUserRole() { throw new Error("user accounts only exist against Supabase"); },
