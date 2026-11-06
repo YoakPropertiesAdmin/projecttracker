@@ -567,6 +567,12 @@ const supabaseRepo = {
     return await supabase.rpc("finalize_job_gp", { p_job: jobId }).then(unwrap);
   },
 
+  // Admin-only in the database (report_monthly_scorecard raises 42501 for
+  // anyone else). Dates are YYYY-MM-DD; months are bucketed in Eastern time.
+  async reportMonthlyScorecard(from, to) {
+    return await supabase.rpc("report_monthly_scorecard", { p_from: from, p_to: to }).then(unwrap);
+  },
+
   async listUsers() {
     return await supabase.rpc("admin_list_users").then(unwrap);
   },
@@ -700,6 +706,7 @@ const localRepo = {
   },
 
   async finalizeGp() { throw new Error("finalizing gross profit needs Supabase"); },
+  async reportMonthlyScorecard() { throw new Error("reports need Supabase"); },
   async loadScheduleReview() { return []; },
   async loadScheduleReviewRecent() { return []; },
   async whoAmI() { return "local"; },

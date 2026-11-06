@@ -1048,6 +1048,9 @@ export default function App() {
     ...(isAdmin ? [
       { key: "vendors", label: "Vendors", icon: Truck },
       { key: "reports", label: "Reports", icon: TrendingUp },
+      // The query tool over every payment and cost; the named reports above are
+      // what ownership reads, this is what the office digs with.
+      { key: "ledger", label: "Ledger", icon: List },
       // The badge is the whole point of the nav entry: nobody opens a queue
       // page speculatively, so the count has to come to them.
       { key: "schedule", label: "Schedule review", icon: CalendarCheck, badge: reviewRows.length },
@@ -1153,7 +1156,8 @@ export default function App() {
             {safeView === "jobs" && <JobsView ctx={ctx} />}
             {safeView === "calendar" && <CalendarView ctx={ctx} />}
             {safeView === "vendors" && isAdmin && <VendorsView ctx={ctx} />}
-            {safeView === "reports" && isAdmin && <ReportsView ctx={ctx} />}
+            {safeView === "reports" && isAdmin && <ReportsView />}
+            {safeView === "ledger" && isAdmin && <LedgerView ctx={ctx} />}
             {safeView === "schedule" && isAdmin && <ScheduleReviewView ctx={ctx} />}
             {safeView === "access" && isSuperAdmin && <AccessView ctx={ctx} />}
           </main>
@@ -2581,101 +2585,337 @@ async function exportXlsx(rows, filename, summary) {
   downloadBlob(new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), filename);
 }
 
-function ReportsView({ ctx }) {
-  const { jobs, vendors } = ctx;
+/* =========================================================================
+   REPORTS — named reports for ownership
+   =========================================================================
+   Each named report answers one question the same way every time. The query
+   tool (TransactionReport) lives on the Ledger page instead. Every figure is
+   computed in the database by an admin-only function, so the definitions sit
+   in one place (see the comment on each function) and the browser never sees
+   the underlying money tables in bulk. */
 
-  const activeJobs = jobs.filter((j) => j.stage !== "closed");
-  const totalContractValue = activeJobs.reduce((s, j) => s + Number(j.contractAmount || 0), 0);
-  const totalAR = jobs.reduce((s, j) => s + Math.max(0, clientBalance(j)), 0);
-  const totalAP = jobs.reduce((s, j) => s + vendorPending(j), 0);
-  const totalMargin = jobs.reduce((s, j) => s + jobMargin(j), 0);
+const NAMED_REPORTS = [
+  { key: "scorecard", label: "Monthly scorecard", blurb: "Booked, collected, completed and gross profit, month by month." },
+];
 
-  const contractByTrade = tradeKeysFor(jobs).map((k) => ({
-    label: TRADES[k] ? TRADES[k].label : k,
-    value: jobs.filter((j) => j.trade === k).reduce((s, j) => s + Number(j.contractAmount || 0), 0),
-    color: TRADES[k] ? TRADES[k].color : "#8A8478",
-  })).filter((d) => d.value > 0);
-
-  const jobsByStage = STAGES.map((s) => ({ label: s.label, value: jobs.filter((j) => j.stage === s.key).length, color: "#3F8EA6" }));
-
-  const marginByTrade = tradeKeysFor(jobs).map((k) => {
-    const tradeJobs = jobs.filter((j) => j.trade === k);
-    if (!tradeJobs.length) return null;
-    const rev = tradeJobs.reduce((s, j) => s + Number(j.contractAmount || 0), 0);
-    const marg = tradeJobs.reduce((s, j) => s + jobMargin(j), 0);
-    return {
-      label: TRADES[k] ? TRADES[k].label : k,
-      value: rev ? Math.round((marg / rev) * 100) : 0,
-      color: TRADES[k] ? TRADES[k].color : "#8A8478",
-    };
-  }).filter(Boolean);
-
-  const arAging = jobs.filter((j) => clientBalance(j) > 0)
-    .map((j) => ({ j, balance: clientBalance(j), days: daysBetween(j.startDate, new Date()) }))
-    .sort((a, b) => b.balance - a.balance);
-
-  const apAging = [];
-  jobs.forEach((j) => (j.vendorPayments || []).filter((p) => p.status === "pending").forEach((p) => apAging.push({ job: j, payment: p })));
-  apAging.sort((a, b) => new Date(a.payment.date) - new Date(b.payment.date));
-
+function ReportsView() {
+  const [active, setActive] = useState(NAMED_REPORTS[0].key);
+  const report = NAMED_REPORTS.find((r) => r.key === active) || NAMED_REPORTS[0];
   return (
     <div className="td-view">
-      <TransactionReport jobs={jobs} />
+      <div className="td-rpt-tabs" role="tablist">
+        {NAMED_REPORTS.map((r) => (
+          <button key={r.key} role="tab" aria-selected={r.key === active}
+            className={cls("td-rpt-tab", r.key === active && "td-rpt-tab-on")} onClick={() => setActive(r.key)}>
+            {r.label}
+          </button>
+        ))}
+      </div>
+      {report.key === "scorecard" && <ScorecardReport />}
+    </div>
+  );
+}
 
-      <div className="td-stat-row">
-        <TicketStat label="Active contract value" value={money(totalContractValue)} icon={DollarSign} accent="#B8860B" />
-        <TicketStat label="Client balance outstanding" value={money(totalAR)} icon={Wallet} accent="#C1440E" />
-        <TicketStat label="Vendor balance outstanding" value={money(totalAP)} icon={HandCoins} accent="#B23A2E" />
-        <TicketStat label="Total margin across jobs" value={money(totalMargin)} icon={Percent} accent="#3F7D58" />
+function LedgerView({ ctx }) {
+  return (
+    <div className="td-view">
+      <TransactionReport jobs={ctx.jobs} />
+    </div>
+  );
+}
+
+const SC_PERIODS = [
+  { key: "last12", label: "Last 12 months" },
+  { key: "ytd", label: "This year" },
+  { key: "last_year", label: "Last year" },
+  { key: "custom", label: "Custom" },
+];
+
+const monthInput = (d) => d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0");
+
+function scorecardRange(period, customFrom, customTo) {
+  const now = new Date();
+  const y = now.getFullYear();
+  if (period === "ytd") return { from: y + "-01-01", to: isoDay(now) };
+  if (period === "last_year") return { from: (y - 1) + "-01-01", to: (y - 1) + "-12-31" };
+  if (period === "custom") {
+    const [ty, tm] = (customTo || monthInput(now)).split("-").map(Number);
+    const last = new Date(ty, tm, 0); // day 0 of next month = last day of this one
+    return { from: (customFrom || monthInput(now)) + "-01", to: isoDay(last > now ? now : last) };
+  }
+  const start = new Date(y, now.getMonth() - 11, 1);
+  return { from: isoDay(start), to: isoDay(now) };
+}
+
+const scMonthLabel = (m) => new Date(m + "T00:00:00").toLocaleString("en-US", { month: "short", year: "numeric" });
+
+// One definition per column, shared by the table and both exports so the
+// spreadsheet always says what the screen says.
+const SC_COLUMNS = [
+  { key: "booked", header: "Booked (signed)", money: true },
+  { key: "booked_jobs", header: "Jobs signed" },
+  { key: "collected", header: "Collected (cash)", money: true },
+  { key: "completed", header: "Completed", money: true },
+  { key: "completed_jobs", header: "Jobs completed" },
+  { key: "finalized_revenue", header: "Finalized revenue", money: true },
+  { key: "gp_finalized", header: "GP finalized", money: true },
+  { key: "gp_provisional", header: "GP provisional", money: true },
+  { key: "provisional_jobs", header: "Provisional jobs" },
+  { key: "gp_total", header: "GP total", money: true },
+];
+
+function scTotals(months) {
+  const t = {};
+  SC_COLUMNS.forEach((c) => { t[c.key] = months.reduce((s, m) => s + Number(m[c.key] || 0), 0); });
+  const rev = months.reduce((s, m) => s + Number(m.finalized_revenue || 0) + Number(m.provisional_revenue || 0), 0);
+  t.gp_pct = rev > 0 ? t.gp_total / rev : null;
+  return t;
+}
+
+function scCoverageLines(c) {
+  if (!c) return [];
+  const since = c.stage_log_since ? fmtDate(c.stage_log_since) : "today (no stage moves logged yet)";
+  return [
+    ["Booked", c.jobs_with_signed_date + " of " + c.jobs_live + " live jobs have a contract signed date. Jobs without one are not in any month."],
+    ["Completed", "Stage history started " + since + ". " + c.complete_with_completion_date + " of " + c.complete_stage_jobs +
+      " completed/closed jobs have a completion date; earlier ones cannot be dated and are left out."],
+    ["GP finalized", c.finalized_jobs + " job" + (c.finalized_jobs === 1 ? "" : "s") + " finalized. Each finalization counts in the month it was made, so past months do not move."],
+    ["GP provisional", "Live margin on completed jobs not yet finalized: " + c.provisional_by_completion + " dated by completion, " +
+      c.provisional_by_signed + " by signed date. " + c.provisional_undated + " more (" + money(c.provisional_undated_revenue) +
+      " revenue) have no date and are not shown."],
+    ["Left out of GP", c.complete_no_costs + " completed jobs (" + money(c.complete_no_costs_revenue) +
+      " revenue) have no vendor costs recorded, so their margin would read as 100%."],
+  ];
+}
+
+async function exportScorecard(data, kind) {
+  const months = data.months || [];
+  const t = scTotals(months);
+  const header = ["Month", ...SC_COLUMNS.map((c) => c.header), "GP %"];
+  const body = months.map((m) => [scMonthLabel(m.m), ...SC_COLUMNS.map((c) => Number(m[c.key] || 0)),
+    m.gp_pct === null || m.gp_pct === undefined ? "" : Number(m.gp_pct)]);
+  const total = ["TOTAL", ...SC_COLUMNS.map((c) => t[c.key]), t.gp_pct === null ? "" : t.gp_pct];
+  const notes = scCoverageLines(data.coverage);
+  const base = "scorecard_" + data.from + "_to_" + data.to;
+
+  if (kind === "csv") {
+    const cell = (v) => {
+      let s = v === null || v === undefined ? "" : String(v);
+      if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+      return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    };
+    const lines = [header, ...body, total, [], ["Coverage"], ...notes].map((r) => r.map(cell).join(","));
+    downloadBlob(new Blob(["﻿" + lines.join("\r\n")], { type: "text/csv;charset=utf-8;" }), base + ".csv");
+    return;
+  }
+
+  const XLSX = await import("xlsx");
+  const aoa = [header, ...body, total];
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  for (let r = 1; r < aoa.length; r++) {
+    SC_COLUMNS.forEach((c, i) => {
+      const ref = XLSX.utils.encode_cell({ r, c: i + 1 });
+      if (c.money && ws[ref]) ws[ref].z = '"$"#,##0';
+    });
+    const pref = XLSX.utils.encode_cell({ r, c: SC_COLUMNS.length + 1 });
+    if (ws[pref] && typeof ws[pref].v === "number") ws[pref].z = "0.0%";
+  }
+  ws["!cols"] = [{ wch: 11 }, ...SC_COLUMNS.map(() => ({ wch: 15 })), { wch: 8 }];
+  ws["!freeze"] = { xSplit: 1, ySplit: 1 };
+  const cws = XLSX.utils.aoa_to_sheet([["Line", "Coverage"], ...notes, [],
+    ["Generated", new Date(data.generated_at).toLocaleString("en-US")], ["Period", data.from + " to " + data.to]]);
+  cws["!cols"] = [{ wch: 16 }, { wch: 110 }];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Scorecard");
+  XLSX.utils.book_append_sheet(wb, cws, "Coverage");
+  const out = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+  downloadBlob(new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), base + ".xlsx");
+}
+
+function ScorecardReport() {
+  const [period, setPeriod] = useState("last12");
+  const now = new Date();
+  const [customFrom, setCustomFrom] = useState(monthInput(new Date(now.getFullYear(), now.getMonth() - 11, 1)));
+  const [customTo, setCustomTo] = useState(monthInput(now));
+  const [data, setData] = useState(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState("");
+  const range = scorecardRange(period, customFrom, customTo);
+
+  useEffect(() => {
+    let live = true;
+    setLoading(true); setError("");
+    repo.reportMonthlyScorecard(range.from, range.to)
+      .then((d) => { if (live) setData(d); })
+      .catch((e) => { if (live) { setData(null); setError(e.message || String(e)); } })
+      .finally(() => { if (live) setLoading(false); });
+    return () => { live = false; };
+  }, [range.from, range.to]);
+
+  const months = (data && data.months) || [];
+  const t = scTotals(months);
+  const doExport = async (kind) => {
+    setBusy(kind);
+    try { await exportScorecard(data, kind); } catch (e) { setError("Export failed: " + (e.message || e)); }
+    finally { setBusy(""); }
+  };
+
+  return (
+    <div className="td-sc">
+      <div className="td-panel td-report">
+        <div className="td-panel-head">
+          <span><TrendingUp size={14} style={{ verticalAlign: -2, marginRight: 6 }} />Monthly scorecard</span>
+          <div className="td-report-actions">
+            <button className="td-btn" disabled={!months.length || !!busy} onClick={() => doExport("csv")}>
+              <Download size={13} /> {busy === "csv" ? "Exporting…" : "CSV"}
+            </button>
+            <button className="td-btn" disabled={!months.length || !!busy} onClick={() => doExport("xlsx")}>
+              <FileSpreadsheet size={13} /> {busy === "xlsx" ? "Building…" : "Excel"}
+            </button>
+          </div>
+        </div>
+        <div className="td-report-controls">
+          <label className="td-deal-field">
+            <span className="td-field-label">Period</span>
+            <select className="td-select" value={period} onChange={(e) => setPeriod(e.target.value)}>
+              {SC_PERIODS.map((p) => <option key={p.key} value={p.key}>{p.label}</option>)}
+            </select>
+          </label>
+          {period === "custom" && (
+            <>
+              <label className="td-deal-field">
+                <span className="td-field-label">From month</span>
+                <input className="td-input" type="month" value={customFrom} onChange={(e) => setCustomFrom(e.target.value)} />
+              </label>
+              <label className="td-deal-field">
+                <span className="td-field-label">To month</span>
+                <input className="td-input" type="month" value={customTo} onChange={(e) => setCustomTo(e.target.value)} />
+              </label>
+            </>
+          )}
+          <span className="td-report-range">{fmtDate(range.from + "T00:00:00")} – {fmtDate(range.to + "T00:00:00")}</span>
+        </div>
+
+        {error && <div className="td-sync-banner"><AlertTriangle size={15} /><span>{error}</span></div>}
+        {loading && !data && <div className="td-sc-loading">Loading…</div>}
+
+        {data && (
+          <>
+            <div className="td-stat-row">
+              <TicketStat label="Booked (contracts signed)" value={money(t.booked)} icon={ClipboardList} accent="#B8860B"
+                footnote={t.booked_jobs + " jobs"} />
+              <TicketStat label="Collected (cash in)" value={money(t.collected)} icon={Wallet} accent="#3F8EA6" />
+              <TicketStat label="Completed" value={money(t.completed)} icon={Check} accent="#6B5B95"
+                footnote={t.completed_jobs + " jobs"} />
+              <TicketStat label="Gross profit" value={money(t.gp_total)} icon={Percent} accent="#3F7D58"
+                footnote={(t.gp_pct === null ? "—" : pct(t.gp_pct)) + " · " + money(t.gp_provisional) + " provisional"} />
+            </div>
+
+            <div className="td-sc-chart">
+              <TrendChart months={months} series={[
+                { key: "booked", label: "Booked", color: "#B8860B" },
+                { key: "collected", label: "Collected", color: "#3F8EA6" },
+                { key: "gp_total", label: "Gross profit", color: "#3F7D58" },
+              ]} />
+            </div>
+
+            <div className="td-table-wrap">
+              <table className="td-table td-sc-table">
+                <thead>
+                  <tr>
+                    <th>Month</th><th className="td-num">Booked</th><th className="td-num">Collected</th>
+                    <th className="td-num">Completed</th><th className="td-num">GP finalized</th>
+                    <th className="td-num">GP provisional</th><th className="td-num">GP total</th><th className="td-num">GP %</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {months.map((m) => (
+                    <tr key={m.m}>
+                      <td>{scMonthLabel(m.m)}</td>
+                      <td className="td-num">{money(m.booked)}<span className="td-sc-sub">{m.booked_jobs || ""}</span></td>
+                      <td className="td-num">{money(m.collected)}</td>
+                      <td className="td-num">{money(m.completed)}<span className="td-sc-sub">{m.completed_jobs || ""}</span></td>
+                      <td className="td-num">{money(m.gp_finalized)}</td>
+                      <td className="td-num td-sc-prov" title={m.provisional_by_signed ? m.provisional_by_signed + " dated by signed date" : ""}>
+                        {money(m.gp_provisional)}<span className="td-sc-sub">{m.provisional_jobs || ""}</span></td>
+                      <td className="td-num"><strong>{money(m.gp_total)}</strong></td>
+                      <td className="td-num">{m.gp_pct === null || m.gp_pct === undefined ? "—" : pct(m.gp_pct)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr>
+                    <td><strong>Total</strong></td>
+                    <td className="td-num">{money(t.booked)}<span className="td-sc-sub" /></td><td className="td-num">{money(t.collected)}</td>
+                    <td className="td-num">{money(t.completed)}<span className="td-sc-sub" /></td><td className="td-num">{money(t.gp_finalized)}</td>
+                    <td className="td-num">{money(t.gp_provisional)}<span className="td-sc-sub" /></td><td className="td-num"><strong>{money(t.gp_total)}</strong></td>
+                    <td className="td-num">{t.gp_pct === null ? "—" : pct(t.gp_pct)}</td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+            <p className="td-sc-key">Small numbers are job counts. Provisional GP is live margin on completed jobs not yet finalized and will move as vendor bills land.</p>
+          </>
+        )}
       </div>
 
-      <div className="td-dash-grid">
-        <div className="td-panel">
-          <div className="td-panel-head"><span>Contract value by trade</span></div>
-          {contractByTrade.length === 0 ? <EmptyState icon={DollarSign} title="No jobs yet" /> : <BarChart data={contractByTrade} formatValue={money} />}
+      {data && data.coverage && (
+        <div className="td-panel td-sc-coverage">
+          <div className="td-panel-head"><span><AlertTriangle size={14} style={{ verticalAlign: -2, marginRight: 6 }} />How complete these numbers are</span></div>
+          <dl>
+            {scCoverageLines(data.coverage).map(([k, v]) => (<React.Fragment key={k}><dt>{k}</dt><dd>{v}</dd></React.Fragment>))}
+          </dl>
         </div>
-        <div className="td-panel">
-          <div className="td-panel-head"><span>Jobs by stage</span></div>
-          <BarChart data={jobsByStage} formatValue={(v) => v} />
-        </div>
-        <div className="td-panel">
-          <div className="td-panel-head"><span>Margin % by trade</span></div>
-          {marginByTrade.length === 0 ? <EmptyState icon={Percent} title="No jobs yet" /> : <BarChart data={marginByTrade} formatValue={(v) => v + "%"} />}
-        </div>
-        <div className="td-panel">
-          <div className="td-panel-head"><span>Vendor directory size</span></div>
-          <DonutChart data={[{ label: "Vendors", value: vendors.length, color: "#3F8EA6" }]} />
-        </div>
+      )}
+    </div>
+  );
+}
 
-        <div className="td-panel" style={{ gridColumn: "1 / -1" }}>
-          <div className="td-panel-head"><span>Client balances outstanding (AR)</span></div>
-          {arAging.length === 0 ? <EmptyState icon={Wallet} title="Nothing outstanding" sub="Every client is paid up." /> : (
-            <div className="td-source-list">
-              {arAging.map(({ j, balance, days }) => (
-                <div key={j.id} className="td-source-row">
-                  <span className="td-source-label">{j.customerName} · {jobNo(j.number)}</span>
-                  <span className="td-source-count">{days}d since start</span>
-                  <span className="td-source-won td-text-red">{money(balance)}</span>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
+const shortMoney = (v) => {
+  const a = Math.abs(v), s = v < 0 ? "-$" : "$";
+  if (a >= 1e6) return s + (a / 1e6).toFixed(a >= 1e7 ? 0 : 1) + "M";
+  if (a >= 1e3) return s + Math.round(a / 1e3) + "k";
+  return s + Math.round(a);
+};
 
-        <div className="td-panel" style={{ gridColumn: "1 / -1" }}>
-          <div className="td-panel-head"><span>Vendor balances owed (AP)</span></div>
-          {apAging.length === 0 ? <EmptyState icon={HandCoins} title="Nothing owed" sub="Every vendor is paid up." /> : (
-            <div className="td-source-list">
-              {apAging.map(({ job, payment }) => (
-                <div key={payment.id} className="td-source-row">
-                  <span className="td-source-label">{payment.vendorName} · {jobNo(job.number)}</span>
-                  <span className="td-source-count">{payment.category}</span>
-                  <span className="td-source-won td-text-red">{money(payment.amount)}</span>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
+function TrendChart({ months, series }) {
+  if (!months.length) return null;
+  const W = 760, H = 230, P = { l: 52, r: 14, t: 12, b: 26 };
+  const vals = series.flatMap((s) => months.map((m) => Number(m[s.key]) || 0));
+  const max = Math.max(1, ...vals), min = Math.min(0, ...vals);
+  const iw = W - P.l - P.r, ih = H - P.t - P.b;
+  const x = (i) => P.l + (months.length === 1 ? iw / 2 : (i * iw) / (months.length - 1));
+  const y = (v) => P.t + ih * (1 - (v - min) / (max - min));
+  const ticks = [0, 1, 2, 3, 4].map((i) => min + ((max - min) * i) / 4);
+  return (
+    <div>
+      <svg viewBox={`0 0 ${W} ${H}`} className="td-sc-svg" role="img" aria-label="Monthly trend">
+        {ticks.map((v, i) => (
+          <g key={i}>
+            <line x1={P.l} x2={W - P.r} y1={y(v)} y2={y(v)} stroke="#EBE6DC" />
+            <text x={P.l - 6} y={y(v) + 4} textAnchor="end" className="td-sc-axis">{shortMoney(v)}</text>
+          </g>
+        ))}
+        {months.map((m, i) => (
+          <text key={m.m} x={x(i)} y={H - 6} textAnchor="middle" className="td-sc-axis">
+            {new Date(m.m + "T00:00:00").toLocaleString("en-US", { month: "short" })}
+          </text>
+        ))}
+        {series.map((s) => (
+          <g key={s.key}>
+            <polyline fill="none" stroke={s.color} strokeWidth="2.2" strokeLinejoin="round"
+              points={months.map((m, i) => x(i) + "," + y(Number(m[s.key]) || 0)).join(" ")} />
+            {months.map((m, i) => (
+              <circle key={m.m} cx={x(i)} cy={y(Number(m[s.key]) || 0)} r="3.2" fill={s.color}>
+                <title>{s.label} · {scMonthLabel(m.m)}: {money(m[s.key])}</title>
+              </circle>
+            ))}
+          </g>
+        ))}
+      </svg>
+      <div className="td-sc-legend">
+        {series.map((s) => <span key={s.key}><i style={{ background: s.color }} />{s.label}</span>)}
       </div>
     </div>
   );
@@ -4134,6 +4374,32 @@ function GlobalStyle() {
         padding: 8px 10px; border-radius: 7px; background: #F3E7C9; color: #8A6A0B;
         font-size: 12.5px; font-weight: 600; }
       .td-age-gap svg { flex: none; }
+
+      /* ---------- Reports: named reports (monthly scorecard) ---------- */
+      .td-rpt-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+      .td-rpt-tab { border: 1px solid var(--td-border); background: var(--td-card); border-radius: 999px;
+        padding: 6px 14px; font-size: 13px; font-weight: 600; cursor: pointer; color: inherit; }
+      .td-rpt-tab-on { background: #2B2A27; border-color: #2B2A27; color: #fff; }
+      .td-sc .td-stat-row { margin-bottom: 14px; }
+      .td-sc .td-report-controls { grid-template-columns: repeat(auto-fit, minmax(165px, 220px)); }
+      .td-sc-chart { margin: 4px 0 14px; }
+      .td-sc-svg { width: 100%; height: auto; display: block; }
+      .td-sc-axis { font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; fill: #8A8478; }
+      .td-sc-legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: var(--td-muted); margin-top: 4px; }
+      .td-sc-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+      .td-sc-table td, .td-sc-table th { white-space: nowrap; }
+      .td-sc-sub { display: inline-block; min-width: 18px; margin-left: 6px; font-size: 10.5px; color: #8A8478; }
+      .td-sc-prov { color: #8A5A12; }
+      .td-sc-key { font-size: 12px; color: var(--td-muted); margin: 10px 0 0; }
+      .td-sc-loading { padding: 24px 0; color: var(--td-muted); font-size: 13px; }
+      .td-sc-coverage dl { display: grid; grid-template-columns: max-content 1fr; gap: 8px 16px; margin: 0; font-size: 13px; }
+      .td-sc-coverage dt { font-weight: 650; }
+      .td-sc-coverage dd { margin: 0; color: #4A463F; }
+      .td-sc .td-sc-coverage { margin-top: 12px; }
+      @media (max-width: 640px) {
+        .td-sc-coverage dl { grid-template-columns: 1fr; gap: 2px; }
+        .td-sc-coverage dd { margin-bottom: 8px; }
+      }
 
       /* ---------- Reports: the transaction report builder ---------- */
       .td-report { margin-bottom: 16px; }
