@@ -2684,6 +2684,10 @@ function scTotals(months) {
   SC_COLUMNS.forEach((c) => { t[c.key] = months.reduce((s, m) => s + Number(m[c.key] || 0), 0); });
   const rev = months.reduce((s, m) => s + Number(m.finalized_revenue || 0) + Number(m.provisional_revenue || 0), 0);
   t.gp_pct = rev > 0 ? t.gp_total / rev : null;
+  // What the GP figure actually covers: only jobs with vendor costs entered.
+  t.gp_revenue = rev;
+  t.gp_jobs = months.reduce((s, m) => s + Number(m.provisional_jobs || 0) + Number(m.finalized_jobs || 0), 0);
+  t.completed_jobs_n = months.reduce((s, m) => s + Number(m.completed_jobs || 0), 0);
   return t;
 }
 
@@ -2819,12 +2823,14 @@ function ScorecardReport() {
           <>
             <div className="td-stat-row">
               <TicketStat label="Booked (contracts signed)" value={money(t.booked)} icon={ClipboardList} accent="#B8860B"
-                footnote={t.booked_jobs + " jobs"} />
+                footnote={t.booked_jobs + " jobs" + (data.coverage ? " · only " + data.coverage.jobs_with_signed_date + " of " +
+                  data.coverage.jobs_live + " live jobs have a signed date" : "")} />
               <TicketStat label="Collected (cash in)" value={money(t.collected)} icon={Wallet} accent="#3F8EA6" />
               <TicketStat label="Completed" value={money(t.completed)} icon={Check} accent="#6B5B95"
                 footnote={t.completed_jobs + " jobs"} />
-              <TicketStat label="Gross profit" value={money(t.gp_total)} icon={Percent} accent="#3F7D58"
-                footnote={(t.gp_pct === null ? "—" : pct(t.gp_pct)) + " · " + money(t.gp_provisional) + " provisional"} />
+              <TicketStat label="Gross profit — costed jobs only" value={money(t.gp_total)} icon={Percent} accent="#3F7D58"
+                footnote={(t.gp_pct === null ? "—" : pct(t.gp_pct)) + " on " + money(t.gp_revenue) + " revenue · " +
+                  t.gp_jobs + " of " + t.completed_jobs_n + " completed jobs have vendor costs"} />
             </div>
 
             <div className="td-sc-chart">
