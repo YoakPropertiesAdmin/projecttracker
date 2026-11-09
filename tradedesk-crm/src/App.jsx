@@ -4801,6 +4801,8 @@ function GlobalStyle() {
       .td-table tbody tr:last-child td { border-bottom: none; }
       .td-cell-name { font-weight: 600; }
       .td-cell-sub { color: var(--td-muted); font-size: 12px; display: flex; align-items: center; gap: 3px; }
+      /* On a <td>, flex would break it out of the table layout and misalign the row divider. */
+      td.td-cell-sub { display: table-cell; }
       .td-mono { font-family: 'IBM Plex Mono', monospace; font-size: 12px; }
 
       .td-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 50px 20px; color: var(--td-muted); text-align: center; background: var(--td-card); border: 1px dashed var(--td-border); border-radius: var(--td-radius); }
