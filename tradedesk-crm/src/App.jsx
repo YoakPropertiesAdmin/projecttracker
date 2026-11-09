@@ -1495,7 +1495,12 @@ function JobTicket({ job, ctx, dragging, onDragStart, onDragEnd }) {
         </div>
       )}
       <div className="td-ticket-foot">
-        <span className="td-ticket-value">{money(job.contractAmount)}</span>
+        <span className="td-ticket-value">{money(job.contractAmount)}
+          {job.groupId && (() => {
+            const n = ctx.jobs.filter((j) => j.groupId === job.groupId).length;
+            return n > 1 ? <span className="td-linked-badge" title={"Linked to " + (n - 1) + " other job" + (n > 2 ? "s" : "") + " in this project"}><Link2 size={10} /> {n}</span> : null;
+          })()}
+        </span>
         <span className="td-ticket-date">{fmtDateShort(job.targetDate)}</span>
       </div>
       {(paid || bal > 0 || owed > 0 || job.isRepair || deadStatus(job) || isOverdue) && (
@@ -1565,6 +1570,79 @@ function JobFormModal({ onClose, onSave }) {
 /* =========================================================================
    JOB DETAIL (stage, client payments, vendor payments, profitability)
    ========================================================================= */
+
+/* =========================================================================
+   LINKED JOBS — one customer project, several jobs
+   =========================================================================
+   A second phase, an add-on or a re-sell after a cancellation is its own job
+   (own contract, payments, stage) but belongs with the first. The database
+   groups jobs that share a GHL project # automatically (jobs_auto_group), so
+   a new opportunity on an existing project arrives as a linked job instead of
+   overwriting or being rejected; the office can also link any two by hand. */
+function LinkedJobs({ ctx, job }) {
+  const [target, setTarget] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const siblings = job.groupId ? ctx.jobs.filter((j) => j.groupId === job.groupId) : [job];
+  const others = siblings.filter((j) => j.id !== job.id).sort((a, b) => a.number - b.number);
+  if (!others.length && !ctx.isAdmin) return null;
+
+  const live = siblings.filter((j) => !["lost", "abandoned"].includes(j.ghlStatus));
+  const total = live.reduce((s, j) => s + Number(j.contractAmount || 0), 0);
+  const received = live.reduce((s, j) => s + clientReceived(j), 0);
+
+  const run = async (fn) => {
+    setBusy(true); setErr("");
+    try { await fn(); await ctx.reload(); setTarget(""); }
+    catch (e) { setErr(e.message || String(e)); }
+    finally { setBusy(false); }
+  };
+  const link = () => {
+    const n = Number(String(target).replace(/\D/g, ""));
+    const other = ctx.jobs.find((j) => Number(j.number) === n);
+    if (!other) { setErr("No job " + jobNo(n || target)); return; }
+    if (other.id === job.id) { setErr("That is this job"); return; }
+    run(() => repo.linkJobs(job.id, other.id));
+  };
+
+  return (
+    <div className="td-linked">
+      <div className="td-linked-head">
+        <span><Link2 size={13} style={{ verticalAlign: -2, marginRight: 6 }} />
+          {others.length ? "Linked jobs — " + siblings.length + " in this project" : "Linked jobs"}</span>
+        {others.length > 0 && ctx.isAdmin && (
+          <span className="td-linked-total">{money(total)} contract · {money(received)} received · {money(total - received)} balance</span>
+        )}
+      </div>
+      {others.length > 0 && (
+        <ul className="td-linked-list">
+          {others.map((j) => (
+            <li key={j.id}>
+              <button className="td-link-btn" onClick={() => ctx.setSelectedJobId(j.id)}>{jobNo(j.number)}</button>
+              <span>{TRADES[j.trade] ? TRADES[j.trade].label : j.trade}</span>
+              <span className="td-cell-sub">{j.contractSignedDate ? fmtDate(j.contractSignedDate + "T00:00:00") : "—"}</span>
+              <span>{(STAGES.find((s) => s.key === j.stage) || {}).label || j.stage}</span>
+              {["lost", "abandoned"].includes(j.ghlStatus) && <span className="td-linked-lost">{j.ghlStatus}</span>}
+              {ctx.isAdmin && <span className="td-num">{money(j.contractAmount)}</span>}
+              {ctx.isAdmin && (
+                <button className="td-iconbtn" title="Unlink this job from the project" disabled={busy}
+                  onClick={() => run(() => repo.unlinkJob(j.id))}><X size={12} /></button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {ctx.isAdmin && (
+        <div className="td-linked-add">
+          <input className="td-input" placeholder="Job # to link, e.g. 1447" value={target}
+            onChange={(e) => setTarget(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") link(); }} />
+          <button className="td-btn" disabled={busy || !target.trim()} onClick={link}><Link2 size={13} /> Link</button>
+        </div>
+      )}
+      {err && <div className="td-linked-err">{err}</div>}
+    </div>
+  );
+}
 
 function JobDetailModal({ ctx, job, onClose }) {
   const { updateJob, deleteJob, addClientPayment, deleteClientPayment, addVendorPayment, updateVendorPayment, deleteVendorPayment, vendorNames } = ctx;
@@ -1776,6 +1854,8 @@ function JobDetailModal({ ctx, job, onClose }) {
         )}
 
         <JobAssignments ctx={ctx} job={job} />
+
+        <LinkedJobs ctx={ctx} job={job} />
 
         {canManage && (<>
         <div className="td-payment-summary">
@@ -5048,6 +5128,17 @@ function GlobalStyle() {
 
       /* ---------- Job detail ---------- */
       .td-job-detail { display: flex; flex-direction: column; gap: 4px; }
+      .td-linked-badge { display: inline-flex; align-items: center; gap: 2px; margin-left: 6px; font-size: 10.5px; font-weight: 700; color: #5B5BA0; background: #ECEBF7; border-radius: 3px; padding: 0 5px; vertical-align: 2px; }
+      .td-linked { border: 1px solid var(--td-border); border-radius: var(--td-radius); padding: 10px 12px; margin: 12px 0 4px; background: var(--td-card); }
+      .td-linked-head { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; font-size: 13px; font-weight: 600; }
+      .td-linked-total { font-weight: 500; color: var(--td-muted); font-size: 12px; }
+      .td-linked-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+      .td-linked-list li { display: grid; grid-template-columns: 78px 1fr 90px 1fr auto auto auto; gap: 8px; align-items: center; font-size: 12.5px; }
+      .td-linked-lost { font-size: 10.5px; text-transform: uppercase; font-weight: 700; color: #9A2E1C; background: #F8E1DC; border-radius: 3px; padding: 0 5px; }
+      .td-linked-add { display: flex; gap: 6px; margin-top: 8px; }
+      .td-linked-add .td-input { max-width: 200px; }
+      .td-linked-err { color: #9A2E1C; font-size: 12px; margin-top: 6px; }
+      @media (max-width: 640px) { .td-linked-list li { grid-template-columns: 70px 1fr auto auto; } }
       .td-payment-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; background: var(--td-card); border: 1px solid var(--td-border); border-radius: var(--td-radius); padding: 12px 14px; margin: 12px 0 4px; }
       .td-payment-summary-item { display: flex; flex-direction: column; gap: 4px; }
       .td-payment-summary-value { font-family: 'Oswald', sans-serif; font-size: 17px; font-weight: 600; }

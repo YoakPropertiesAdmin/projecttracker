@@ -51,6 +51,11 @@ const jobFromRow = (r) => ({
   // 'open' jobs are managed by the sync; the rest are kept as history.
   ghlStatus: r.ghl_status || "open",
   ghlProjectDisplayId: r.ghl_project_display_id || null,
+  // Jobs that belong to one customer project (phases, add-ons, a re-sell after
+  // a cancellation) share a group. Set automatically when two jobs carry the
+  // same GHL project #, or by hand with linkJobs(). Each job keeps its own
+  // contract, payments and stage.
+  groupId: r.group_id || null,
   contractAmount: Number(r.contract_amount || 0),
   startDate: toIso(r.start_date),
   targetDate: toIso(r.target_date),
@@ -580,6 +585,15 @@ const supabaseRepo = {
     return await supabase.rpc("report_balances_owed").then(unwrap);
   },
 
+  // Admin-only in the database. Links two jobs into one project group (merging
+  // groups if both already have one); unlinkJob takes one job back out.
+  async linkJobs(jobId, otherJobId) {
+    return await supabase.rpc("link_jobs", { p_job: jobId, p_other: otherJobId }).then(unwrap);
+  },
+  async unlinkJob(jobId) {
+    return await supabase.rpc("unlink_job", { p_job: jobId }).then(unwrap);
+  },
+
   async listUsers() {
     return await supabase.rpc("admin_list_users").then(unwrap);
   },
@@ -715,6 +729,8 @@ const localRepo = {
   async finalizeGp() { throw new Error("finalizing gross profit needs Supabase"); },
   async reportMonthlyScorecard() { throw new Error("reports need Supabase"); },
   async reportBalancesOwed() { throw new Error("reports need Supabase"); },
+  async linkJobs() { throw new Error("linking jobs needs Supabase"); },
+  async unlinkJob() { throw new Error("linking jobs needs Supabase"); },
   async loadScheduleReview() { return []; },
   async loadScheduleReviewRecent() { return []; },
   async whoAmI() { return "local"; },
