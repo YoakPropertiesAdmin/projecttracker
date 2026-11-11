@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { ClipboardList, LogIn, AlertTriangle, RefreshCw, WifiOff } from "lucide-react";
 import { supabase, isSupabaseConfigured } from "../data/supabaseClient.js";
+import { isEmbedded, ghlSignIn } from "./ghlSso.js";
 
 /**
  * Sign-in gate.
@@ -33,7 +34,19 @@ import { supabase, isSupabaseConfigured } from "../data/supabaseClient.js";
  *                                place for no reason.
  *
  * Conflating those is what made a brief restart look like a broken app.
+ *
+ * ---------------------------------------------------------------------------
+ * Inside GoHighLevel
+ *
+ * Opened from the Renew sidebar, TradeDesk runs in GHL's iframe. With no
+ * session there, the gate asks GHL who is looking (auth/ghlSso.js) and the
+ * td-sso function returns a session for the matching TradeDesk login, so
+ * nobody types a password inside GHL. If that fails — no matching login, GHL
+ * did not answer — the normal sign-in form is shown with the reason. A session
+ * that dies while embedded is re-issued the same way instead of signing out.
  */
+
+const EMBEDDED = typeof window !== "undefined" && isEmbedded();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -73,6 +86,30 @@ export default function AuthGate({ children }) {
   const [degraded, setDegraded] = useState(false);
   const lastCheck = useRef(0);
   const inFlight = useRef(false);
+  const ssoInFlight = useRef(false);
+  const [ssoWorking, setSsoWorking] = useState(false);
+
+  /** Sign in through GoHighLevel. Returns true on success. */
+  const ssoSignIn = useCallback(async () => {
+    if (!EMBEDDED || ssoInFlight.current) return false;
+    ssoInFlight.current = true;
+    setSsoWorking(true);
+    try {
+      const tokens = await ghlSignIn();
+      const { data, error } = await supabase.auth.setSession(tokens);
+      if (error || !data?.session) throw error || new Error("Could not start your session.");
+      setSession(data.session);
+      setNotice("");
+      lastCheck.current = Date.now();
+      return true;
+    } catch (e) {
+      setNotice(e?.message || "Sign-in through GoHighLevel failed.");
+      return false;
+    } finally {
+      ssoInFlight.current = false;
+      setSsoWorking(false);
+    }
+  }, []);
 
   /**
    * Confirm with the server that the session is still real. Returns true if
@@ -103,6 +140,7 @@ export default function AuthGate({ children }) {
           setSession(null);
           setDegraded(false);
           setNotice("Your session expired. Please sign in again.");
+          if (EMBEDDED) ssoSignIn();
           return false;
         }
 
@@ -115,24 +153,28 @@ export default function AuthGate({ children }) {
     } finally {
       inFlight.current = false;
     }
-  }, []);
+  }, [ssoSignIn]);
 
   useEffect(() => {
     if (!isSupabaseConfigured) { setChecking(false); return; }
     let alive = true;
 
-    supabase.auth.getSession().then(({ data, error }) => {
+    supabase.auth.getSession().then(async ({ data, error }) => {
       if (!alive) return;
-      if (error && isDeadSession(error)) {
-        setSession(null);
-        setNotice("Your session expired. Please sign in again.");
-      } else {
-        setSession(data?.session ?? null);
+      const restored = error && isDeadSession(error) ? null : data?.session ?? null;
+      if (restored) {
+        setSession(restored);
         // A restored session proves only that a token is in storage, not that
         // it is still honoured. Check before trusting it.
-        if (data?.session) revalidate({ force: true });
+        revalidate({ force: true });
+      } else if (EMBEDDED) {
+        // Inside GoHighLevel: sign in as the GHL user instead of asking.
+        await ssoSignIn();
+      } else {
+        setSession(null);
+        if (error) setNotice("Your session expired. Please sign in again.");
       }
-      setChecking(false);
+      if (alive) setChecking(false);
     });
 
     const { data: sub } = supabase.auth.onAuthStateChange((event, next) => {
@@ -167,24 +209,27 @@ export default function AuthGate({ children }) {
       window.removeEventListener("focus", onWake);
       window.removeEventListener("online", onOnline);
     };
-  }, [revalidate]);
+  }, [revalidate, ssoSignIn]);
 
   if (!isSupabaseConfigured) return children;
 
-  if (checking) {
+  if (checking || ssoWorking) {
     return (
       <div className="td-root td-loading-screen">
         <RefreshCw size={22} className="td-spin" />
-        <div>Checking your session…</div>
+        <div>{EMBEDDED ? "Signing you in through GoHighLevel…" : "Checking your session…"}</div>
       </div>
     );
   }
 
-  if (!session) return <SignIn notice={notice} />;
+  if (!session) return <SignIn notice={notice} onRetrySso={EMBEDDED ? ssoSignIn : null} />;
 
   return (
     <>
       {degraded && <ConnectionBanner onRetry={() => revalidate({ force: true })} />}
+      {/* Inside GHL the session belongs to the GHL login, so signing out here
+          would only be undone on the next load. */}
+      {EMBEDDED && <style>{`.td-signout{display:none !important;}`}</style>}
       {children}
     </>
   );
@@ -213,7 +258,7 @@ function ConnectionBanner({ onRetry }) {
   );
 }
 
-function SignIn({ notice }) {
+function SignIn({ notice, onRetrySso }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -272,6 +317,13 @@ function SignIn({ notice }) {
           <span>{busy ? "Signing in…" : "Sign in"}</span>
         </button>
 
+        {onRetrySso && (
+          <button className="td-auth-btn td-auth-btn-alt" type="button" onClick={onRetrySso}>
+            <RefreshCw size={15} />
+            <span>Try GoHighLevel sign-in again</span>
+          </button>
+        )}
+
         <p className="td-auth-foot">
           Accounts are issued by the office. If you need access, ask IT to invite your work email.
         </p>
@@ -299,6 +351,7 @@ function SignIn({ notice }) {
           padding:10px 14px;border:none;border-radius:8px;background:#2B2721;color:#F5F2EC;
           font-size:14px;font-weight:600;font-family:inherit;cursor:pointer;}
         .td-auth-btn:disabled{opacity:.55;cursor:not-allowed;}
+        .td-auth-btn-alt{margin-top:8px;background:transparent;color:#2B2721;border:1px solid #DCD5C9;}
         .td-auth-foot{margin:16px 0 0;font-size:11.5px;line-height:1.5;color:#8A8478;text-align:center;}
         .td-spin{animation:td-spin 1s linear infinite;}
         @keyframes td-spin{to{transform:rotate(360deg);}}

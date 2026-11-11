@@ -5,3 +5,19 @@
 
 [build.environment]
   NODE_VERSION = "20"
+
+# Single-page app: every path (including /embed, the GoHighLevel Custom Page)
+# serves the app shell. Real files (assets, icons, sw.js) are still served as
+# themselves because Netlify only applies this rule when no file matches.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# Who may show TradeDesk inside a frame: itself and GoHighLevel only (the Renew
+# sidebar Custom Page). Everyone else is refused, which also blocks clickjacking.
+# No white-label domain is in use; add it here if one is ever set up.
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Content-Security-Policy = "frame-ancestors 'self' https://app.gohighlevel.com https://*.gohighlevel.com https://app.leadconnectorhq.com https://*.leadconnectorhq.com"
