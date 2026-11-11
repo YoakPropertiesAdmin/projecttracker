@@ -4468,14 +4468,21 @@ function AccessView({ ctx }) {
   const { assignees, reload } = ctx;
   const [users, setUsers] = useState(null);
   const [roles, setRoles] = useState([]);
+  const [ghlUsers, setGhlUsers] = useState([]);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState("");
 
   const load = React.useCallback(async () => {
     try {
-      const [u, r] = await Promise.all([repo.listUsers(), repo.listAppRoles()]);
+      const [u, r, g] = await Promise.all([
+        repo.listUsers(), repo.listAppRoles(),
+        // The GHL directory is optional: if it cannot be read the rest of the
+        // screen still works, it just has no GoHighLevel names to offer.
+        repo.listGhlUsers().catch(() => []),
+      ]);
       setUsers(u);
       setRoles(r);
+      setGhlUsers(g || []);
       setErr("");
     } catch (e) {
       setUsers([]);
@@ -4504,6 +4511,16 @@ function AccessView({ ctx }) {
   };
 
   const unlinked = assignees.filter((a) => !a.userId && a.active !== false);
+  // GoHighLevel side: which GHL person opens TradeDesk from the sidebar as
+  // which login. 'linked' was set here or by a past sign-in; 'email' is the
+  // automatic match td-sso will make on first visit. A login holds one GHL user.
+  const ghlOf = (userId) => ghlUsers.filter((g) => g.user_id === userId);
+  const ghlPickable = ghlUsers.filter((g) => !g.deleted && g.link_kind !== "linked");
+  const emailOf = (userId) => ((users || []).find((x) => x.user_id === userId) || {}).email || "";
+  const refreshGhl = () => run("ghl-refresh", async () => {
+    await repo.refreshGhlUsers();
+    await new Promise((r) => setTimeout(r, 4000));
+  });
   const linkedTo = (userId) => assignees.filter((a) => a.userId === userId);
   const roleLabel = (key) => (roles.find((r) => r.key === key) || {}).label || key;
 
@@ -4525,6 +4542,7 @@ function AccessView({ ctx }) {
         .td-access-chip button{border:none;background:transparent;color:inherit;cursor:pointer;
           padding:0;display:inline-flex;opacity:.75;}
         .td-access-chip button:hover{opacity:1;}
+        .td-access-ghl{background:#2F5D8A;color:#fff;}
         .td-access-warn{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;
           color:#9B3A20;background:#FBEDE9;border-radius:6px;padding:3px 8px;}
         .td-access-err{display:flex;align-items:center;gap:8px;margin-bottom:12px;padding:9px 12px;
@@ -4570,6 +4588,21 @@ function AccessView({ ctx }) {
               </select>
 
               <div className="td-access-people">
+                {ghlOf(u.user_id).map((g) => (
+                  <span key={"ghl-" + g.ghl_user_id} className="td-access-chip td-access-ghl"
+                    title={g.link_kind === "linked"
+                      ? "GoHighLevel user " + (g.email || "") + " signs in as this login"
+                      : "Matched by email — signs in as this login on first visit from GoHighLevel"}>
+                    <Link2 size={11} /> {g.name || g.email}{g.link_kind === "email" ? " (email)" : ""}
+                    {g.link_kind === "linked" && (
+                      <button type="button" title="Unlink GoHighLevel user"
+                        onClick={() => run("ghl-" + g.ghl_user_id, () => repo.linkGhlUser(g.ghl_user_id, null))}>
+                        <X size={11} />
+                      </button>
+                    )}
+                  </span>
+                ))}
+
                 {mine.map((a) => (
                   <span key={a.id} className="td-access-chip"
                     style={{ background: a.color, color: textOn(a.color) }}
@@ -4584,8 +4617,25 @@ function AccessView({ ctx }) {
 
                 <select className="td-select" style={{ minWidth: 170 }} value=""
                   disabled={busy !== ""}
-                  onChange={(e) => { const id = e.target.value; if (id) run("link-" + id, () => repo.linkAssignee(id, u.user_id)); }}>
+                  onChange={(e) => {
+                    const id = e.target.value;
+                    if (!id) return;
+                    if (id.startsWith("ghl:")) {
+                      const gid = id.slice(4);
+                      run("ghl-" + gid, () => repo.linkGhlUser(gid, u.user_id));
+                    } else run("link-" + id, () => repo.linkAssignee(id, u.user_id));
+                  }}>
                   <option value="">Link a name…</option>
+                  {!ghlOf(u.user_id).some((g) => g.link_kind === "linked") && ghlPickable.length > 0 && (
+                    <optgroup label="GoHighLevel user">
+                      {ghlPickable.map((g) => (
+                        <option key={g.ghl_user_id} value={"ghl:" + g.ghl_user_id}>
+                          {g.name || g.email}{g.email ? " — " + g.email : ""}
+                          {g.user_id && g.user_id !== u.user_id ? " (now: " + emailOf(g.user_id) + ")" : ""}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
                   {assigneeRoleKeys().map((rk) => {
                     const opts = unlinked.filter((a) => a.role === rk);
                     if (!opts.length) return null;
@@ -4606,6 +4656,53 @@ function AccessView({ ctx }) {
             </div>
           );
         })}
+      </div>
+
+      <div className="td-access-head" style={{ marginTop: 22, display: "flex", alignItems: "flex-end", gap: 12, flexWrap: "wrap" }}>
+        <div style={{ flex: 1, minWidth: 260 }}>
+          <h2>GoHighLevel users</h2>
+          <p>
+            Everyone in the Renew sub-account, refreshed nightly. Opening TradeDesk from the GoHighLevel
+            sidebar signs a person in as the login shown here — matched by email unless linked above with
+            “Link a name…”. Anyone without a login is refused.
+          </p>
+        </div>
+        <button className="td-btn td-btn-sm" onClick={refreshGhl} disabled={busy !== ""}>
+          <RefreshCw size={13} className={busy === "ghl-refresh" ? "td-spin" : ""} /> Refresh from GoHighLevel
+        </button>
+      </div>
+
+      <div className="td-panel">
+        {ghlUsers.length === 0 ? (
+          <div className="td-muted-line" style={{ padding: 16 }}>
+            No GoHighLevel users loaded yet. Use “Refresh from GoHighLevel”.
+          </div>
+        ) : (
+          <div className="td-table-wrap">
+            <table className="td-table">
+              <thead>
+                <tr><th>Name</th><th>GoHighLevel email</th><th>GHL role</th><th>Signs in as</th></tr>
+              </thead>
+              <tbody>
+                {ghlUsers.map((g) => (
+                  <tr key={g.ghl_user_id} style={g.deleted ? { opacity: 0.5 } : undefined}>
+                    <td>{g.name || "—"}{g.deleted ? " (removed)" : ""}</td>
+                    <td style={{ wordBreak: "break-all" }}>{g.email || "—"}</td>
+                    <td>{[g.ghl_type, g.ghl_role].filter(Boolean).join(" · ") || "—"}</td>
+                    <td>
+                      {g.user_id ? (
+                        <>{emailOf(g.user_id)} <span className="td-access-seen" style={{ display: "inline" }}>
+                          {g.link_kind === "linked" ? "· linked" : "· by email"}</span></>
+                      ) : (
+                        <span className="td-access-warn"><AlertTriangle size={11} /> no TradeDesk login — refused</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       <div className="td-access-foot">

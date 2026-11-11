@@ -610,6 +610,22 @@ const supabaseRepo = {
   async linkAssignee(assigneeId, userId) {
     await supabase.rpc("admin_link_assignee", { p_assignee: assigneeId, p_user: userId || null }).then(unwrap);
   },
+
+  // GoHighLevel users of the Renew sub-account (mirrored nightly into
+  // ghl_users) and which login each one signs in as from the GHL sidebar.
+  async listGhlUsers() {
+    return await supabase.rpc("admin_list_ghl_users").then(unwrap);
+  },
+
+  // p_user null unlinks.
+  async linkGhlUser(ghlUserId, userId) {
+    await supabase.rpc("admin_link_ghl_user", { p_ghl_user: ghlUserId, p_user: userId || null }).then(unwrap);
+  },
+
+  // Asks the server to re-read the list from GoHighLevel; it lands a few seconds later.
+  async refreshGhlUsers() {
+    await supabase.rpc("admin_refresh_ghl_users").then(unwrap);
+  },
 };
 
 /* ---------------------------------------------------------------------------
@@ -740,6 +756,9 @@ const localRepo = {
   async listAppRoles() { return []; },
   async setUserRole() { throw new Error("user accounts only exist against Supabase"); },
   async linkAssignee() { throw new Error("user accounts only exist against Supabase"); },
+  async listGhlUsers() { return []; },
+  async linkGhlUser() { throw new Error("user accounts only exist against Supabase"); },
+  async refreshGhlUsers() {},
 
   async createVendor(vendor) { cache.vendors = [vendor, ...cache.vendors]; return persistLocal(); },
   async updateVendor(id, patch) {
