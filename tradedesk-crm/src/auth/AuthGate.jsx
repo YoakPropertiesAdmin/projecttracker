@@ -159,7 +159,22 @@ export default function AuthGate({ children }) {
     if (!isSupabaseConfigured) { setChecking(false); return; }
     let alive = true;
 
-    supabase.auth.getSession().then(async ({ data, error }) => {
+    // Inside GoHighLevel the person is whoever GHL says is logged in — never
+    // whatever session the frame happens to have kept. A stored session can
+    // belong to someone else: switch GHL users in the same browser and the
+    // frame's storage still holds the previous person's TradeDesk login, which
+    // handed a project manager a super admin's screens (2026-11-12). So every
+    // embedded load drops any stored session and asks GHL afresh.
+    if (EMBEDDED) {
+      (async () => {
+        try { await supabase.auth.signOut({ scope: "local" }); } catch { /* nothing stored */ }
+        if (!alive) return;
+        await ssoSignIn();
+        if (alive) setChecking(false);
+      })();
+    }
+
+    if (!EMBEDDED) supabase.auth.getSession().then(async ({ data, error }) => {
       if (!alive) return;
       const restored = error && isDeadSession(error) ? null : data?.session ?? null;
       if (restored) {
@@ -230,7 +245,9 @@ export default function AuthGate({ children }) {
       {/* Inside GHL the session belongs to the GHL login, so signing out here
           would only be undone on the next load. */}
       {EMBEDDED && <style>{`.td-signout{display:none !important;}`}</style>}
-      {children}
+      {/* Keyed by login: if the signed-in person changes, the whole app is
+          rebuilt so no screen or role from the previous person survives. */}
+      <React.Fragment key={session.user?.id || "anon"}>{children}</React.Fragment>
     </>
   );
 }
