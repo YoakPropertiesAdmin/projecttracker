@@ -42,6 +42,8 @@ const jobFromRow = (r) => ({
   // has to special-case combo.
   trades: Array.isArray(r.trades) && r.trades.length ? r.trades : (r.trade ? [r.trade] : []),
   isRepair: Boolean(r.is_repair),
+  // Chosen by hand once the job is paid in full: "in_progress" | "completed" | "".
+  paidStatus: r.paid_status || "",
   stage: r.stage,
   // Stage is the board column; substage and flag are facts about the job that
   // the column cannot express. See map_ghl_inbound in the database.
@@ -93,6 +95,7 @@ const jobToRow = (j) => {
   }
   if (j.trades !== undefined) row.trades = j.trades;
   if (j.isRepair !== undefined) row.is_repair = Boolean(j.isRepair);
+  if (j.paidStatus !== undefined) row.paid_status = j.paidStatus || null;
   if (j.stage !== undefined) row.stage = j.stage;
   if (j.substage !== undefined) row.substage = j.substage || null;
   if (j.flag !== undefined) row.flag = j.flag || null;

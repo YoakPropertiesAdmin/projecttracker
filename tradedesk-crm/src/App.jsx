@@ -327,13 +327,13 @@ const textOn = (hex) => {
  *   0  live work
  *   1  held (flagged demote in the registry)
  *   2  lost or abandoned in the CRM
- *   3  collected in full — nothing left to chase, so it goes last
+ *   3  marked Paid in Full / Completed — nothing left to chase, so it goes last
  *
  * The practical effect in Project Complete: jobs still owing money stay at the
  * top where the office is looking, and paid-in-full drops to the bottom.
  */
 const settledRank = (job) => {
-  if (isPaidInFull(job)) return 3;
+  if (isPaidCompleted(job)) return 3;
   if (deadStatus(job)) return 2;
   const f = jobFlag(job);
   if (f && f.demote) return 1;
@@ -449,6 +449,17 @@ const paidPct = (job) => (job.contractAmount ? Math.min(1, clientReceived(job) /
 // Collected in full. Guarded on a non-zero contract so a $0 placeholder job
 // doesn't read as paid the moment it is created.
 const isPaidInFull = (job) => Number(job.contractAmount || 0) > 0 && clientBalance(job) <= 0;
+// Being paid in full no longer finishes a job by itself (2026-11-12): someone
+// says which it is. "Paid in Full / Completed" is the old behaviour — green
+// card, sinks to the bottom. "Paid in Full / In Progress" is a tag only, the
+// card stays where the work is. Either choice only counts while the balance
+// is still covered; if it reopens, the card shows the balance due again.
+const PAID_STATUSES = {
+  in_progress: { label: "Paid in Full / In Progress", short: "Paid in full \u00b7 In progress" },
+  completed: { label: "Paid in Full / Completed", short: "Paid in full" },
+};
+const paidStatusOf = (job) => (isPaidInFull(job) ? (job.paidStatus || "unset") : null);
+const isPaidCompleted = (job) => paidStatusOf(job) === "completed";
 
 /* =========================================================================
    SEED DATA
@@ -1420,7 +1431,9 @@ function JobsView({ ctx }) {
                       </td>
                       <td>{money(j.contractAmount)}</td>
                       <td className={bal > 0 ? "td-text-red" : "td-text-green"}>
-                        {isPaidInFull(j) ? "Paid in full" : money(bal)}
+                        {isPaidInFull(j)
+                          ? (PAID_STATUSES[j.paidStatus] ? PAID_STATUSES[j.paidStatus].short : "Paid in full")
+                          : money(bal)}
                       </td>
                       <td className={owed > 0 ? "td-text-red" : "td-cell-sub"}>{owed > 0 ? money(owed) : "—"}</td>
                       <td className="td-mono">{fmtDateShort(j.targetDate)}</td>
@@ -1443,7 +1456,10 @@ function JobTicket({ job, ctx, dragging, onDragStart, onDragEnd }) {
   // job's worth, which they are meant to see.
   const bal = ctx.isAdmin ? clientBalance(job) : 0;
   const owed = ctx.isAdmin ? vendorPending(job) : 0;
-  const paid = ctx.isAdmin ? isPaidInFull(job) : false;
+  // null (not paid in full), "unset", "in_progress" or "completed". Only
+  // "completed" turns the card green.
+  const paidState = ctx.isAdmin ? paidStatusOf(job) : null;
+  const paid = paidState === "completed";
   // Stalled past a threshold and still short of Scheduled. Overrides the hold
   // tint below: a held job that has also gone quiet for ten weeks is the more
   // urgent fact, and two pale washes fighting each other says neither.
@@ -1503,7 +1519,7 @@ function JobTicket({ job, ctx, dragging, onDragStart, onDragEnd }) {
         </span>
         <span className="td-ticket-date">{fmtDateShort(job.targetDate)}</span>
       </div>
-      {(paid || bal > 0 || owed > 0 || job.isRepair || deadStatus(job) || isOverdue) && (
+      {(paidState || bal > 0 || owed > 0 || job.isRepair || deadStatus(job) || isOverdue) && (
         <div className="td-ticket-flags">
           {/* The counter, not just the flag: "14w since signed" tells you how
               bad it is, where a red card only tells you that it is bad. */}
@@ -1514,8 +1530,11 @@ function JobTicket({ job, ctx, dragging, onDragStart, onDragEnd }) {
           ))}
           {deadStatus(job) && <span className="td-ticket-flag td-ticket-flag-red"><X size={10} /> {deadStatus(job)}</span>}
           {job.isRepair && <span className="td-ticket-flag td-ticket-flag-repair"><Wrench size={10} /> Repair</span>}
-          {paid
-            ? <span className="td-ticket-flag td-ticket-flag-green"><Check size={10} /> Paid in full</span>
+          {paidState
+            ? <span className={cls("td-ticket-flag", paidState === "unset" ? "td-ticket-flag-neutral" : "td-ticket-flag-green")}
+                title={paidState === "unset" ? "Paid in full — open the job to mark it In Progress or Completed" : undefined}>
+                <Check size={10} /> {PAID_STATUSES[paidState] ? PAID_STATUSES[paidState].short : "Paid in full"}
+              </span>
             : bal > 0 && <span className="td-ticket-flag td-ticket-flag-red"><Wallet size={10} /> {money(bal)} due</span>}
           {owed > 0 && <span className="td-ticket-flag td-ticket-flag-amber"><HandCoins size={10} /> {money(owed)} owed</span>}
         </div>
@@ -1884,6 +1903,22 @@ function JobDetailModal({ ctx, job, onClose }) {
           </div>
         </div>
         <ProgressBar value={paidPct(job)} tone={balance <= 0 ? "green" : undefined} />
+
+        {isPaidInFull(job) && (
+          <div className="td-paidstatus">
+            <span className="td-field-label">Paid in full — this job is</span>
+            <div className="td-paidstatus-opts" role="radiogroup" aria-label="Paid in full status">
+              {Object.entries(PAID_STATUSES).map(([key, s]) => (
+                <button key={key} type="button" role="radio" aria-checked={job.paidStatus === key}
+                  className={cls("td-hold-toggle", job.paidStatus === key && "td-paidstatus-on")}
+                  onClick={() => updateJob(job.id, { paidStatus: job.paidStatus === key ? "" : key })}>
+                  <Check size={13} /> {s.label}
+                </button>
+              ))}
+            </div>
+            {!job.paidStatus && <span className="td-cell-sub">Not chosen yet — the card shows a plain "Paid in full" tag until you pick one.</span>}
+          </div>
+        )}
 
         <JobGpFinalize ctx={ctx} job={job} liveMargin={margin} drifted={gpDrift} />
 
@@ -4953,6 +4988,10 @@ function GlobalStyle() {
       .td-ticket-flag-red { background: #F4DBD6; color: var(--td-red); }
       .td-ticket-flag-amber { background: #F3E7C9; color: #8A6A0B; }
       .td-ticket-flag-green { background: #DCE9DA; color: #3E6B3A; }
+      .td-ticket-flag-neutral { background: #EFEBE3; color: #6B6459; }
+      .td-paidstatus { display: flex; flex-direction: column; gap: 6px; margin: 10px 0 4px; }
+      .td-paidstatus-opts { display: flex; flex-wrap: wrap; gap: 8px; }
+      .td-hold-toggle.td-paidstatus-on { background: #DCE9DA; border-color: #A9C9A4; color: #3E6B3A; }
       .td-ticket-flag-repair { background: #E2E4EE; color: #4A5480; }
       /* Lost or abandoned: still readable, visibly not live. */
       .td-ticket-dead { opacity: .62; }
