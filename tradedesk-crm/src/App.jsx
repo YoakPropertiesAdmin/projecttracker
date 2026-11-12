@@ -4,7 +4,7 @@ import { supabase, isSupabaseConfigured } from "./data/supabaseClient.js";
 import {
   LayoutDashboard, LayoutGrid, List, Truck, TrendingUp,
   Home, Layers, AppWindow, DoorOpen,
-  Plus, X, Search, Phone, Mail, MapPin, DollarSign, Check,
+  Plus, Minus, X, Search, Phone, Mail, MapPin, DollarSign, Check,
   ChevronDown, ChevronRight, ChevronLeft, Trash2, Pencil, Users, UserPlus,
   AlertTriangle, Tag, Building2, Menu, ClipboardList, RefreshCw,
   Wallet, HandCoins, Percent, Calendar as CalendarIcon, LogOut,
@@ -439,13 +439,26 @@ const jobRef = (job) => projectRef(job) || jobNo(job.number);
 /* ---------------- job financial derivations ---------------- */
 
 const clientReceived = (job) => (job.clientPayments || []).reduce((s, p) => s + Number(p.amount || 0), 0);
-const clientBalance = (job) => Number(job.contractAmount || 0) - clientReceived(job);
+// Client credits (2026-11-12): money taken off what the client owes after
+// signing. Never part of Received, never a refund. The contract amount stays
+// the signed figure; the credit lowers the balance due, and margin is figured
+// on net revenue (contract - credits), the same as job_financials and the
+// reports in the database.
+const clientCredited = (job) => (job.clientCredits || []).reduce((s, c) => s + Number(c.amount || 0), 0);
+const netContract = (job) => Number(job.contractAmount || 0) - clientCredited(job);
+const clientBalance = (job) => Number(job.contractAmount || 0) - clientReceived(job) - clientCredited(job);
 const vendorPaid = (job) => (job.vendorPayments || []).filter((p) => p.status === "paid").reduce((s, p) => s + Number(p.amount || 0), 0);
 const vendorPending = (job) => (job.vendorPayments || []).filter((p) => p.status === "pending").reduce((s, p) => s + Number(p.amount || 0), 0);
 const vendorTotal = (job) => vendorPaid(job) + vendorPending(job);
-const jobMargin = (job) => Number(job.contractAmount || 0) - vendorTotal(job);
-const jobMarginPct = (job) => (job.contractAmount ? jobMargin(job) / job.contractAmount : 0);
-const paidPct = (job) => (job.contractAmount ? Math.min(1, clientReceived(job) / job.contractAmount) : 0);
+const jobMargin = (job) => netContract(job) - vendorTotal(job);
+const jobMarginPct = (job) => (netContract(job) ? jobMargin(job) / netContract(job) : 0);
+// Credits count toward "covered" here, so a job settled by payment + credit
+// fills the bar the same as one paid in cash.
+const paidPct = (job) => (job.contractAmount ? Math.min(1, (clientReceived(job) + clientCredited(job)) / job.contractAmount) : 0);
+// A credit amount, always shown with a true minus sign: "−$1,700.00".
+const creditMoney = (n) => "\u2212" + moneyDec(Math.abs(Number(n) || 0));
+// A balance that may go below zero, signed the same way: "−$15.00".
+const signedMoneyDec = (n) => (Number(n) < 0 ? creditMoney(n) : moneyDec(n));
 // Collected in full. Guarded on a non-zero contract so a $0 placeholder job
 // doesn't read as paid the moment it is created.
 const isPaidInFull = (job) => Number(job.contractAmount || 0) > 0 && clientBalance(job) <= 0;
@@ -869,7 +882,7 @@ export default function App() {
   const addJob = (job) => {
     const j = {
       id: newId(), number: nextJobNo(), stage: "signed", notes: "", createdAt: new Date().toISOString(),
-      clientPayments: [], vendorPayments: [], ...job,
+      clientPayments: [], clientCredits: [], vendorPayments: [], ...job,
     };
     setData((prev) => ({ ...prev, jobs: [j, ...prev.jobs] }));
     persist(async () => {
@@ -901,6 +914,16 @@ export default function App() {
   const deleteClientPayment = (jobId, paymentId) => {
     setData((prev) => ({ ...prev, jobs: prev.jobs.map((j) => (j.id === jobId ? { ...j, clientPayments: (j.clientPayments || []).filter((p) => p.id !== paymentId) } : j)) }));
     persist(() => repo.deleteClientPayment(jobId, paymentId), "Deleting the client payment");
+  };
+
+  const addClientCredit = (jobId, credit) => {
+    const c = { id: newId(), date: new Date().toISOString(), reason: "", ...credit };
+    setData((prev) => ({ ...prev, jobs: prev.jobs.map((j) => (j.id === jobId ? { ...j, clientCredits: [c, ...(j.clientCredits || [])] } : j)) }));
+    persist(() => repo.createClientCredit(jobId, c), "The client credit");
+  };
+  const deleteClientCredit = (jobId, creditId) => {
+    setData((prev) => ({ ...prev, jobs: prev.jobs.map((j) => (j.id === jobId ? { ...j, clientCredits: (j.clientCredits || []).filter((c) => c.id !== creditId) } : j)) }));
+    persist(() => repo.deleteClientCredit(jobId, creditId), "Deleting the client credit");
   };
 
   const addVendorPayment = (jobId, payment) => {
@@ -1041,7 +1064,7 @@ export default function App() {
     role, isAdmin, isSuperAdmin, reload,
     reviewRows, reviewRecent, reviewLoading, reviewError, loadReview,
     addJob, updateJob, deleteJob,
-    addClientPayment, deleteClientPayment,
+    addClientPayment, deleteClientPayment, addClientCredit, deleteClientCredit,
     addVendorPayment, updateVendorPayment, deleteVendorPayment,
     addVendor, updateVendor, deleteVendor,
     addAssignment, updateAssignment, removeAssignment,
@@ -1609,6 +1632,7 @@ function LinkedJobs({ ctx, job }) {
   const live = siblings.filter((j) => !["lost", "abandoned"].includes(j.ghlStatus));
   const total = live.reduce((s, j) => s + Number(j.contractAmount || 0), 0);
   const received = live.reduce((s, j) => s + clientReceived(j), 0);
+  const credited = live.reduce((s, j) => s + clientCredited(j), 0);
 
   const run = async (fn) => {
     setBusy(true); setErr("");
@@ -1630,7 +1654,7 @@ function LinkedJobs({ ctx, job }) {
         <span><Link2 size={13} style={{ verticalAlign: -2, marginRight: 6 }} />
           {others.length ? "Linked jobs — " + siblings.length + " in this project" : "Linked jobs"}</span>
         {others.length > 0 && ctx.isAdmin && (
-          <span className="td-linked-total">{money(total)} contract · {money(received)} received · {money(total - received)} balance</span>
+          <span className="td-linked-total">{money(total)} contract · {money(received)} received{credited > 0 ? " \u00b7 \u2212" + money(credited) + " credited" : ""} · {money(total - received - credited)} balance</span>
         )}
       </div>
       {others.length > 0 && (
@@ -1664,12 +1688,16 @@ function LinkedJobs({ ctx, job }) {
 }
 
 function JobDetailModal({ ctx, job, onClose }) {
-  const { updateJob, deleteJob, addClientPayment, deleteClientPayment, addVendorPayment, updateVendorPayment, deleteVendorPayment, vendorNames } = ctx;
+  const { updateJob, deleteJob, addClientPayment, deleteClientPayment, addClientCredit, deleteClientCredit, addVendorPayment, updateVendorPayment, deleteVendorPayment, vendorNames } = ctx;
   const [notes, setNotes] = useState(job?.notes || "");
   const [name, setName] = useState(job?.customerName || "");
   const [phone, setPhone] = useState(job?.customerPhone || "");
   const [email, setEmail] = useState(job?.customerEmail || "");
   const [cpForm, setCpForm] = useState({ amount: "", date: new Date().toISOString().slice(0, 10), method: PAYMENT_METHODS[0], note: "", paymentType: "" });
+  // The Apply credit form. Closed by default so the payment form stays the
+  // obvious thing to use; credits are the exception.
+  const [ccOpen, setCcOpen] = useState(false);
+  const [ccForm, setCcForm] = useState({ amount: "", date: new Date().toISOString().slice(0, 10), reason: "" });
   const [vpForm, setVpForm] = useState({ vendorName: "", category: VENDOR_CATEGORIES[0], amount: "", date: new Date().toISOString().slice(0, 10), status: "pending", note: "" });
 
   if (!job) return null;
@@ -1700,6 +1728,7 @@ function JobDetailModal({ ctx, job, onClose }) {
   };
 
   const received = clientReceived(job);
+  const credited = clientCredited(job);
   const balance = clientBalance(job);
   const vPaid = vendorPaid(job);
   const vPending = vendorPending(job);
@@ -1714,6 +1743,25 @@ function JobDetailModal({ ctx, job, onClose }) {
   // and lets you through rather than refusing the entry.
   const cpAmount = Number(cpForm.amount) || 0;
   const cpOverage = cpAmount - clientBalance(job);
+
+  // Over-crediting warns but does not block (Joshua, 2026-11-12): there can be
+  // a real reason to post the credit before a payment is corrected.
+  const ccAmount = Number(ccForm.amount) || 0;
+  const ccBalanceAfter = balance - ccAmount;
+  const ccValid = ccAmount > 0 && ccForm.reason.trim() !== "" && Boolean(ccForm.date);
+
+  const submitClientCredit = () => {
+    if (!ccValid) return;
+    addClientCredit(job.id, {
+      amount: ccAmount,
+      // Noon local time so the stored instant lands on the chosen day in any
+      // US timezone, rather than midnight UTC sliding back to the day before.
+      date: new Date(ccForm.date + "T12:00:00").toISOString(),
+      reason: ccForm.reason.trim(),
+    });
+    setCcForm({ amount: "", date: new Date().toISOString().slice(0, 10), reason: "" });
+    setCcOpen(false);
+  };
 
   const submitClientPayment = () => {
     if (!cpForm.amount || cpAmount <= 0) return;
@@ -1739,7 +1787,7 @@ function JobDetailModal({ ctx, job, onClose }) {
   // and pending together, so this is what the job would actually earn once
   // this cost is booked — pending or not.
   const vpAmount = Number(vpForm.amount) || 0;
-  const vpMarginAfter = Number(job.contractAmount || 0) - (vendorTotal(job) + vpAmount);
+  const vpMarginAfter = netContract(job) - (vendorTotal(job) + vpAmount);
 
   const submitVendorPayment = () => {
     if (!vpForm.vendorName.trim() || !vpForm.amount || vpAmount <= 0) return;
@@ -1879,12 +1927,21 @@ function JobDetailModal({ ctx, job, onClose }) {
         {canManage && (<>
         <div className="td-payment-summary">
           <div className="td-payment-summary-item">
+            <span className="td-field-label">Contract</span>
+            <span className="td-payment-summary-value">{moneyDec(job.contractAmount)}</span>
+          </div>
+          <div className="td-payment-summary-item">
             <span className="td-field-label">Received</span>
-            <span className="td-payment-summary-value td-text-green">{money(received)}</span>
+            <span className="td-payment-summary-value td-text-green">{moneyDec(received)}</span>
+          </div>
+          <div className="td-payment-summary-item">
+            <span className="td-field-label">Client credits</span>
+            <span className={cls("td-payment-summary-value", credited > 0 ? "td-credit-text" : "td-cell-sub")}>{credited > 0 ? creditMoney(credited) : "$0.00"}</span>
           </div>
           <div className="td-payment-summary-item">
             <span className="td-field-label">Balance due</span>
-            <span className={cls("td-payment-summary-value", balance > 0 && "td-text-red")}>{money(balance)}</span>
+            <span className={cls("td-payment-summary-value", balance > 0 && "td-text-red")}>{signedMoneyDec(balance)}</span>
+            {isPaidInFull(job) && balance > -0.005 && <span className="td-cell-sub td-text-green"><Check size={11} style={{ verticalAlign: -1 }} /> Paid in full</span>}
           </div>
           <div className="td-payment-summary-item">
             <span className="td-field-label">Vendor costs owed</span>
@@ -1925,9 +1982,24 @@ function JobDetailModal({ ctx, job, onClose }) {
         <div className="td-job-detail-cols">
           <div className="td-job-detail-col">
             <div className="td-drawer-section-title" style={{ borderTop: "none", paddingTop: 0 }}>Client payments</div>
-            {(job.clientPayments || []).length === 0 ? <div className="td-muted-line">No payments logged yet.</div> : (
+            {(job.clientPayments || []).length === 0 && (job.clientCredits || []).length === 0 ? <div className="td-muted-line">No payments logged yet.</div> : (
               <div className="td-payment-list">
-                {[...job.clientPayments].sort((a, b) => new Date(b.date) - new Date(a.date)).map((p) => (
+                {[...(job.clientPayments || []).map((p) => ({ ...p, _kind: "payment" })),
+                  ...(job.clientCredits || []).map((c) => ({ ...c, _kind: "credit" }))]
+                  .sort((a, b) => new Date(b.date) - new Date(a.date)).map((p) => p._kind === "credit" ? (
+                  <div key={"cc-" + p.id} className="td-payment-row td-credit-row">
+                    <div className="td-payment-row-main">
+                      <div className="td-payment-row-top">
+                        <span className="td-payment-amount td-credit-text">{creditMoney(p.amount)}</span>
+                        <span className="td-paytype-chip td-credit-chip">Client credit</span>
+                      </div>
+                      <div className="td-cell-sub">{fmtDate(p.date)}{p.reason ? " \u00b7 \u201c" + p.reason + "\u201d" : ""}</div>
+                    </div>
+                    <button className="td-iconbtn td-iconbtn-danger" onClick={() => {
+                      if (confirm("Delete this " + creditMoney(p.amount) + " client credit" + (p.reason ? " (\u201c" + p.reason + "\u201d)" : "") + "? The balance due will go back up by " + moneyDec(p.amount) + ".")) deleteClientCredit(job.id, p.id);
+                    }} aria-label="Delete client credit"><Trash2 size={12} /></button>
+                  </div>
+                ) : (
                   <div key={p.id} className="td-payment-row">
                     <div className="td-payment-row-main">
                       <div className="td-payment-row-top">
@@ -1976,11 +2048,48 @@ function JobDetailModal({ ctx, job, onClose }) {
               {cpOverage > 0 && (
                 <div className="td-overage-hint">
                   <AlertTriangle size={13} />
-                  <span>{money(cpOverage)} over the {money(job.contractAmount)} contract — the job would show a {money(cpOverage)} credit.</span>
+                  <span>{money(cpOverage)} more than the balance due — the job would show a {money(cpOverage)} overpayment.</span>
                 </div>
               )}
-              <button className="td-btn td-btn-primary td-btn-sm" onClick={submitClientPayment}><Plus size={13} /> Log client payment</button>
+              <div className="td-payment-btns">
+                <button className="td-btn td-btn-primary td-btn-sm" onClick={submitClientPayment}><Plus size={13} /> Log client payment</button>
+                {!ccOpen && (
+                  <button className="td-btn td-btn-sm td-credit-btn" onClick={() => setCcOpen(true)}
+                    title="Take money off what the client owes. The contract amount stays as signed.">
+                    <Minus size={13} /> Apply credit
+                  </button>
+                )}
+              </div>
             </div>
+            {ccOpen && (
+              <div className="td-payment-form td-credit-form">
+                <div className="td-credit-form-title">Apply client credit</div>
+                <div className="td-payment-form-row">
+                  <input className="td-input td-input-num" type="number" min="0" step="0.01" placeholder="Credit amount" autoFocus
+                    value={ccForm.amount} onChange={(e) => setCcForm((f) => ({ ...f, amount: e.target.value }))} />
+                  <input className="td-input" type="date" value={ccForm.date} onChange={(e) => setCcForm((f) => ({ ...f, date: e.target.value }))} />
+                </div>
+                <input className="td-input" placeholder="Reason (required) — e.g. Gutter color change" value={ccForm.reason}
+                  onChange={(e) => setCcForm((f) => ({ ...f, reason: e.target.value }))}
+                  onKeyDown={(e) => { if (e.key === "Enter") submitClientCredit(); }} />
+                {ccAmount > 0 && (
+                  <div className="td-cell-sub">Balance will go from <strong>{signedMoneyDec(balance)}</strong> to <strong>{signedMoneyDec(ccBalanceAfter)}</strong>.</div>
+                )}
+                {ccAmount > 0 && ccBalanceAfter <= -0.005 && (
+                  <div className="td-overage-hint">
+                    <AlertTriangle size={13} />
+                    <span>This leaves a {signedMoneyDec(ccBalanceAfter)} balance. Credits aren't refunds — check the amount.</span>
+                  </div>
+                )}
+                <div className="td-payment-btns">
+                  <button className="td-btn td-btn-sm td-credit-btn td-credit-btn-solid" disabled={!ccValid} onClick={submitClientCredit}
+                    title={ccValid ? "" : "Enter an amount above $0 and a reason"}>
+                    <Check size={13} /> Apply credit
+                  </button>
+                  <button className="td-btn td-btn-sm" onClick={() => { setCcOpen(false); setCcForm({ amount: "", date: new Date().toISOString().slice(0, 10), reason: "" }); }}>Cancel</button>
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="td-job-detail-col">
@@ -2566,8 +2675,11 @@ function groupLabel(groupBy, key) {
 }
 
 /**
- * Flatten both ledgers into one list of comparable rows. Direction is what
- * keeps them straight: client payments are money in, vendor costs money out.
+ * Flatten the ledgers into one list of comparable rows. Direction is what
+ * keeps them straight: client payments are money in, vendor costs money out,
+ * and client credits are "credit" — money taken off what a client owes. A
+ * credit is not cash, so it never feeds Money in, Money out or Net; it is
+ * totalled on its own as Credits applied.
  *
  * The date is parsed ONCE here, into `when`. A payment whose date will not
  * parse is counted and left out rather than carried forward — a date-less row
@@ -2605,6 +2717,16 @@ function buildLedgerRows(jobs) {
       customer: j.customerName, address: j.customerAddress || "",
       tradeKey: j.trade, tradeLabel, stageKey: j.stage, stageLabel,
       fromCrm: false, note: p.note || "",
+    }));
+    (j.clientCredits || []).forEach((c) => push({
+      id: c.id, direction: "credit", ledger: "Client credit",
+      date: c.date, amount: Number(c.amount || 0),
+      typeKey: null, typeLabel: "Client credit",
+      method: "", vendor: "", category: "", status: "applied",
+      jobNumber: j.number, projectRef: j.ghlProjectDisplayId || "",
+      customer: j.customerName, address: j.customerAddress || "",
+      tradeKey: j.trade, tradeLabel, stageKey: j.stage, stageLabel,
+      fromCrm: false, note: c.reason || "",
     }));
   });
   return { rows, undated };
@@ -2665,10 +2787,13 @@ async function exportXlsx(rows, filename, summary) {
     const v = exportValue(r, c);
     return c.money ? Number(v || 0) : v;
   })));
-  // Totals row, so the figure in the sheet matches the figure on screen.
-  const total = rows.reduce((s, r) => s + Number(r.amount || 0), 0);
+  // Totals per ledger, so each figure in the sheet matches one on screen.
+  // Adding payments, costs and credits into a single sum would mean nothing.
+  const sumOf = (dir) => rows.filter((r) => r.direction === dir).reduce((s, r) => s + Number(r.amount || 0), 0);
   aoa.push([]);
-  aoa.push(["TOTAL", "", "", total]);
+  if (rows.some((r) => r.direction === "in")) aoa.push(["TOTAL MONEY IN", "", "", sumOf("in")]);
+  if (rows.some((r) => r.direction === "out")) aoa.push(["TOTAL MONEY OUT", "", "", sumOf("out")]);
+  if (rows.some((r) => r.direction === "credit")) aoa.push(["TOTAL CREDITS APPLIED", "", "", sumOf("credit")]);
 
   const ws = XLSX.utils.aoa_to_sheet(aoa);
   const amountCol = EXPORT_COLUMNS.findIndex((c) => c.money);
@@ -2683,16 +2808,16 @@ async function exportXlsx(rows, filename, summary) {
   XLSX.utils.book_append_sheet(wb, ws, "Transactions");
 
   if (summary && summary.length) {
-    const sAoa = [["Group", "Count", "Money in", "Money out", "Net"]];
-    summary.forEach((g) => sAoa.push([g.label, g.count, g.moneyIn, g.moneyOut, g.net]));
+    const sAoa = [["Group", "Count", "Money in", "Money out", "Net (cash)", "Credits applied"]];
+    summary.forEach((g) => sAoa.push([g.label, g.count, g.moneyIn, g.moneyOut, g.net, g.credits]));
     const sws = XLSX.utils.aoa_to_sheet(sAoa);
     for (let i = 1; i < sAoa.length; i++) {
-      [2, 3, 4].forEach((c) => {
+      [2, 3, 4, 5].forEach((c) => {
         const ref = XLSX.utils.encode_cell({ r: i, c });
         if (sws[ref] && typeof sws[ref].v === "number") sws[ref].z = '"$"#,##0.00';
       });
     }
-    sws["!cols"] = [{ wch: 26 }, { wch: 8 }, { wch: 14 }, { wch: 14 }, { wch: 14 }];
+    sws["!cols"] = [{ wch: 26 }, { wch: 8 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 15 }];
     XLSX.utils.book_append_sheet(wb, sws, "Summary");
   }
 
@@ -3061,7 +3186,9 @@ function TrendChart({ months, series }) {
    BALANCES OWED — what is still owed on each job
    =========================================================================
    Computed in the database by report_balances_owed() (admin only). Per job:
-     balance   = contract - collected
+     balance   = contract - collected - client_credited
+     (contract stays the signed amount; client credits come from their own
+     table and are never counted as collected)
      collected = the larger of the TradeDesk client payments and the amount the
                  Completion Log sheet says was collected. Older jobs often have
                  no payments entered in TradeDesk, and the sheet is the office's
@@ -3077,7 +3204,7 @@ const BAL_SCOPES = [
 ];
 const BAL_SHOW = [
   { key: "owing", label: "Still owing" },
-  { key: "credit", label: "Overpaid / credits" },
+  { key: "credit", label: "Overpaid (negative balance)" },
   { key: "all", label: "Everything" },
 ];
 const BAL_GROUPS = [
@@ -3131,6 +3258,7 @@ const BAL_EXPORT = [
   { key: "paid_td", header: "Paid (TradeDesk)", money: true, get: (r) => Number(r.paid_tradedesk || 0) },
   { key: "paid_sheet", header: "Collected (sheet)", money: true, get: (r) => (r.paid_sheet === null || r.paid_sheet === undefined ? "" : Number(r.paid_sheet)) },
   { key: "collected", header: "Collected (used)", money: true, get: (r) => Number(r.collected || 0) },
+  { key: "credited", header: "Client credited", money: true, get: (r) => Number(r.client_credited || 0) },
   { key: "source", header: "Collected from", get: (r) => BAL_SOURCE_LABEL[r.collected_source] || r.collected_source },
   { key: "balance", header: "Balance owed", money: true, get: (r) => Number(r.balance || 0) },
   { key: "completed", header: "Completed", get: (r) => (r.completed_at ? isoDay(r.completed_at) : "") },
@@ -3162,6 +3290,7 @@ async function exportBalancesXlsx(rows, groups, filename) {
   tot[0] = "TOTAL";
   tot[BAL_EXPORT.findIndex((c) => c.key === "contract")] = sum("contract");
   tot[BAL_EXPORT.findIndex((c) => c.key === "collected")] = sum("collected");
+  tot[BAL_EXPORT.findIndex((c) => c.key === "credited")] = sum("client_credited");
   tot[BAL_EXPORT.findIndex((c) => c.key === "balance")] = sum("balance");
   aoa.push(tot);
   const ws = XLSX.utils.aoa_to_sheet(aoa);
@@ -3216,6 +3345,7 @@ function BalancesOwedReport({ onOpenJob }) {
   const all = useMemo(() => ((data && data.rows) || []).map((r) => ({
     ...r,
     contract: Number(r.contract || 0), collected: Number(r.collected || 0), balance: Number(r.balance || 0),
+    client_credited: Number(r.client_credited || 0), client_credits_count: Number(r.client_credits_count || 0),
     paid_tradedesk: Number(r.paid_tradedesk || 0),
     paid_sheet: r.paid_sheet === null || r.paid_sheet === undefined ? null : Number(r.paid_sheet),
   })), [data]);
@@ -3235,8 +3365,11 @@ function BalancesOwedReport({ onOpenJob }) {
       open: s(open), openJobs: open.length,
       sheetOnlyJobs: sheetOnly.length, sheetOnlyGap: sheetOnly.reduce((t, r) => t + (r.paid_sheet - r.paid_tradedesk), 0),
       credits: -s(credits), creditJobs: credits.length,
+      // Straight from the server, across every job, like the other headlines.
+      clientCredited: Number((data && data.client_credited_total) || 0),
+      clientCreditedJobs: all.filter((r) => r.client_credited > 0).length,
     };
-  }, [all]);
+  }, [all, data]);
 
   const rows = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -3333,8 +3466,10 @@ function BalancesOwedReport({ onOpenJob }) {
                 footnote={head.openJobs + " jobs not finished yet"} />
               <TicketStat label="Paid per sheet, not in TradeDesk" value={String(head.sheetOnlyJobs)} icon={AlertTriangle} accent="#8A5A12"
                 footnote={money(head.sheetOnlyGap) + " of payments to enter"} />
-              <TicketStat label="Overpaid / credits" value={money(head.credits)} icon={HandCoins} accent="#3F7D58"
-                footnote={head.creditJobs + " jobs collected more than contract"} />
+              <TicketStat label="Overpaid" value={money(head.credits)} icon={HandCoins} accent="#3F7D58"
+                footnote={head.creditJobs + " jobs with a negative balance"} />
+              <TicketStat label="Client Credited Total" value={money(head.clientCredited)} icon={Minus} accent="#6A4C93"
+                footnote={head.clientCreditedJobs + " job" + (head.clientCreditedJobs === 1 ? "" : "s") + " · taken off balances, not refunds"} />
             </div>
 
             <div className="td-report-controls">
@@ -3430,7 +3565,8 @@ function BalancesOwedReport({ onOpenJob }) {
                     <thead>
                       <tr>
                         <th>Job</th><th>Customer</th><th>Stage</th>
-                        <th className="td-num">Contract</th><th className="td-num">Collected</th><th className="td-num">Balance</th>
+                        <th className="td-num">Contract</th><th className="td-num">Collected</th>
+                        <th className="td-num">Credited</th><th className="td-num">Balance</th>
                         <th>Completed</th><th>Last payment</th><th>Check</th>
                       </tr>
                     </thead>
@@ -3452,6 +3588,11 @@ function BalancesOwedReport({ onOpenJob }) {
                             <td className="td-num">
                               {money(r.collected)}
                               {r.collected_source === "sheet" && <span className="td-bal-src" title={"TradeDesk has " + money(r.paid_tradedesk) + "; the Completion Log says " + money(r.paid_sheet)}>sheet</span>}
+                            </td>
+                            <td className="td-num">
+                              {r.client_credited > 0
+                                ? <span className="td-credit-text" title={r.client_credits_count + " client credit" + (r.client_credits_count === 1 ? "" : "s")}>{"\u2212" + money(r.client_credited)}</span>
+                                : <span className="td-bal-sub">—</span>}
                             </td>
                             <td className={"td-num " + (r.balance < 0 ? "td-text-green" : r.balance >= 1 ? "td-text-red" : "")}><strong>{money(r.balance)}</strong></td>
                             <td>
@@ -3520,12 +3661,21 @@ function TransactionReport({ jobs }) {
 
   const { rows: allRows, undated } = useMemo(() => buildLedgerRows(jobs), [jobs]);
 
+  // Which ledgers the "Show" choice includes. "both" stays payments + costs
+  // (cash only); "all" adds client credits on top.
+  const showIn = ["in", "both", "all"].includes(direction);
+  const showOut = ["out", "both", "all"].includes(direction);
+  const showCredit = ["credit", "all"].includes(direction);
+  const showNet = showIn && showOut;
+
   const rows = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!from || !to) return [];
     return allRows.filter((r) => {
       if (!(r.when >= from && r.when <= to)) return false;
-      if (direction !== "both" && r.direction !== direction) return false;
+      if (r.direction === "in" && !showIn) return false;
+      if (r.direction === "out" && !showOut) return false;
+      if (r.direction === "credit" && !showCredit) return false;
       if (fType && r.typeKey !== fType) return false;
       if (fMethod && r.method !== fMethod) return false;
       if (fTrade && r.tradeKey !== fTrade) return false;
@@ -3541,33 +3691,37 @@ function TransactionReport({ jobs }) {
                  String(r.projectRef).toLowerCase().includes(q))) return false;
       return true;
     }).sort((a, b) => b.when - a.when);
-  }, [allRows, from, to, direction, fType, fMethod, fTrade, fStage, fVendor, fCategory, fStatus, search]);
+  }, [allRows, from, to, showIn, showOut, showCredit, fType, fMethod, fTrade, fStage, fVendor, fCategory, fStatus, search]);
 
   const groups = useMemo(() => {
     const g = GROUPINGS[groupBy] || GROUPINGS.none;
     const map = new Map();
     rows.forEach((r) => {
       const key = g.key(r.when, r);
-      const e = map.get(key) || { key, count: 0, moneyIn: 0, moneyOut: 0 };
+      const e = map.get(key) || { key, count: 0, moneyIn: 0, moneyOut: 0, credits: 0 };
       e.count += 1;
-      if (r.direction === "in") e.moneyIn += r.amount; else e.moneyOut += r.amount;
+      if (r.direction === "in") e.moneyIn += r.amount;
+      else if (r.direction === "out") e.moneyOut += r.amount;
+      else if (r.direction === "credit") e.credits += r.amount;
       map.set(key, e);
     });
     const dateGrouped = ["day", "week", "month", "quarter", "year"].includes(groupBy);
     return [...map.values()]
       .map((e) => ({ ...e, net: e.moneyIn - e.moneyOut, label: groupLabel(groupBy, e.key) }))
-      .sort((a, b) => dateGrouped ? (a.key < b.key ? 1 : -1) : (b.moneyIn + b.moneyOut) - (a.moneyIn + a.moneyOut));
+      .sort((a, b) => dateGrouped ? (a.key < b.key ? 1 : -1) : (b.moneyIn + b.moneyOut + b.credits) - (a.moneyIn + a.moneyOut + a.credits));
   }, [rows, groupBy]);
 
   const totalIn = rows.filter((r) => r.direction === "in").reduce((s, r) => s + r.amount, 0);
   const totalOut = rows.filter((r) => r.direction === "out").reduce((s, r) => s + r.amount, 0);
+  const totalCredit = rows.filter((r) => r.direction === "credit").reduce((s, r) => s + r.amount, 0);
+  const creditJobs = new Set(rows.filter((r) => r.direction === "credit").map((r) => r.jobNumber)).size;
 
   const vendorNames = useMemo(
     () => [...new Set(allRows.filter((r) => r.vendor).map((r) => r.vendor))].sort(), [allRows]);
 
   const rangeLabel = isoDay(from) + "_to_" + isoDay(to);
   const filenameBase = "tradedesk_" +
-    (direction === "in" ? "client-payments" : direction === "out" ? "vendor-costs" : "all-transactions") +
+    ({ in: "client-payments", out: "vendor-costs", credit: "client-credits", both: "payments-and-costs", all: "all-transactions" }[direction] || "transactions") +
     "_" + rangeLabel;
 
   const doExport = async (kind) => {
@@ -3627,7 +3781,9 @@ function TransactionReport({ jobs }) {
           <select className="td-select" value={direction} onChange={(e) => setDirection(e.target.value)}>
             <option value="in">Client payments (money in)</option>
             <option value="out">Vendor costs (money out)</option>
-            <option value="both">Both</option>
+            <option value="credit">Client credits</option>
+            <option value="both">Payments + costs</option>
+            <option value="all">Everything (incl. credits)</option>
           </select>
         </label>
         <label className="td-deal-field">
@@ -3637,7 +3793,7 @@ function TransactionReport({ jobs }) {
           </select>
         </label>
 
-        {direction !== "out" && (
+        {showIn && (
           <>
             <label className="td-deal-field">
               <span className="td-field-label">Payment type</span>
@@ -3656,7 +3812,7 @@ function TransactionReport({ jobs }) {
           </>
         )}
 
-        {direction !== "in" && (
+        {showOut && (
           <>
             <label className="td-deal-field">
               <span className="td-field-label">Cost category</span>
@@ -3699,7 +3855,7 @@ function TransactionReport({ jobs }) {
         </label>
         <label className="td-deal-field td-report-search">
           <span className="td-field-label">Search</span>
-          <input className="td-input" placeholder="Customer, vendor, address, job #" value={search}
+          <input className="td-input" placeholder={showCredit ? "Customer, vendor, address, job #, credit reason" : "Customer, vendor, address, job #"} value={search}
             onChange={(e) => setSearch(e.target.value)} />
         </label>
         {activeFilters > 0 && (
@@ -3711,9 +3867,11 @@ function TransactionReport({ jobs }) {
 
       <div className="td-report-totals">
         <div><span className="td-field-label">Transactions</span><strong>{rows.length}</strong></div>
-        {direction !== "out" && <div><span className="td-field-label">Money in</span><strong className="td-text-green">{money(totalIn)}</strong></div>}
-        {direction !== "in" && <div><span className="td-field-label">Money out</span><strong className="td-text-red">{money(totalOut)}</strong></div>}
-        {direction === "both" && <div><span className="td-field-label">Net</span><strong className={totalIn - totalOut < 0 ? "td-text-red" : "td-text-green"}>{money(totalIn - totalOut)}</strong></div>}
+        {showIn && <div><span className="td-field-label">Money in</span><strong className="td-text-green">{money(totalIn)}</strong></div>}
+        {showOut && <div><span className="td-field-label">Money out</span><strong className="td-text-red">{money(totalOut)}</strong></div>}
+        {showNet && <div title="Cash only — client credits are not money in or out"><span className="td-field-label">Net</span><strong className={totalIn - totalOut < 0 ? "td-text-red" : "td-text-green"}>{money(totalIn - totalOut)}</strong></div>}
+        {showCredit && <div title="Taken off what clients owe. Not cash, not refunds."><span className="td-field-label">Credits applied</span><strong className="td-credit-text">{totalCredit ? "\u2212" + money(totalCredit) : money(0)}</strong></div>}
+        {showCredit && <div><span className="td-field-label">Jobs credited</span><strong>{creditJobs}</strong></div>}
         {undated > 0 && (
           <div title="These have no usable payment date, so they cannot belong to any period.">
             <span className="td-field-label">Undated</span>
@@ -3736,9 +3894,10 @@ function TransactionReport({ jobs }) {
                 <tr>
                   <th>{GROUPINGS[groupBy].label.replace(/^By /, "").replace(/^No grouping$/, "Total")}</th>
                   <th className="td-num">Count</th>
-                  {direction !== "out" && <th className="td-num">Money in</th>}
-                  {direction !== "in" && <th className="td-num">Money out</th>}
-                  {direction === "both" && <th className="td-num">Net</th>}
+                  {showIn && <th className="td-num">Money in</th>}
+                  {showOut && <th className="td-num">Money out</th>}
+                  {showNet && <th className="td-num">Net</th>}
+                  {showCredit && <th className="td-num">Credits applied</th>}
                 </tr>
               </thead>
               <tbody>
@@ -3746,9 +3905,10 @@ function TransactionReport({ jobs }) {
                   <tr key={g.key}>
                     <td>{g.label}</td>
                     <td className="td-num">{g.count}</td>
-                    {direction !== "out" && <td className="td-num td-text-green">{money(g.moneyIn)}</td>}
-                    {direction !== "in" && <td className="td-num td-text-red">{money(g.moneyOut)}</td>}
-                    {direction === "both" && <td className={"td-num " + (g.net < 0 ? "td-text-red" : "td-text-green")}>{money(g.net)}</td>}
+                    {showIn && <td className="td-num td-text-green">{money(g.moneyIn)}</td>}
+                    {showOut && <td className="td-num td-text-red">{money(g.moneyOut)}</td>}
+                    {showNet && <td className={"td-num " + (g.net < 0 ? "td-text-red" : "td-text-green")}>{money(g.net)}</td>}
+                    {showCredit && <td className="td-num td-credit-text">{g.credits ? "\u2212" + money(g.credits) : money(0)}</td>}
                   </tr>
                 ))}
               </tbody>
@@ -3756,9 +3916,10 @@ function TransactionReport({ jobs }) {
                 <tr>
                   <td><strong>Total</strong></td>
                   <td className="td-num"><strong>{rows.length}</strong></td>
-                  {direction !== "out" && <td className="td-num"><strong>{money(totalIn)}</strong></td>}
-                  {direction !== "in" && <td className="td-num"><strong>{money(totalOut)}</strong></td>}
-                  {direction === "both" && <td className="td-num"><strong>{money(totalIn - totalOut)}</strong></td>}
+                  {showIn && <td className="td-num"><strong>{money(totalIn)}</strong></td>}
+                  {showOut && <td className="td-num"><strong>{money(totalOut)}</strong></td>}
+                  {showNet && <td className="td-num"><strong>{money(totalIn - totalOut)}</strong></td>}
+                  {showCredit && <td className="td-num"><strong>{totalCredit ? "\u2212" + money(totalCredit) : money(0)}</strong></td>}
                 </tr>
               </tfoot>
             </table>
@@ -3782,13 +3943,13 @@ function TransactionReport({ jobs }) {
                     <tr key={r.direction + r.id}>
                       <td>{fmtDate(r.date)}</td>
                       <td>{r.typeLabel}{r.fromCrm && <span className="td-ghl-badge" style={{ marginLeft: 6 }}>GHL</span>}</td>
-                      <td className={"td-num " + (r.direction === "in" ? "td-text-green" : "td-text-red")}>
-                        {r.direction === "in" ? "" : "−"}{moneyDec(r.amount)}
+                      <td className={"td-num " + (r.direction === "in" ? "td-text-green" : r.direction === "credit" ? "td-credit-text" : "td-text-red")}>
+                        {r.direction === "in" ? "" : "\u2212"}{moneyDec(r.amount)}
                       </td>
                       <td>{r.customer}</td>
                       <td>{jobNo(r.jobNumber)}</td>
                       <td className="td-cell-sub">
-                        {[r.method, r.vendor, r.direction === "out" ? r.status : null, r.note]
+                        {[r.method, r.vendor, r.direction === "out" ? r.status : null, r.direction === "credit" && r.note ? "\u201c" + r.note + "\u201d" : r.note]
                           .filter(Boolean).join(" · ")}
                       </td>
                     </tr>
@@ -5053,6 +5214,9 @@ function GlobalStyle() {
         padding: 6px 14px; font-size: 13px; font-weight: 600; cursor: pointer; color: inherit; }
       .td-rpt-tab-on { background: #2B2A27; border-color: #2B2A27; color: #fff; }
       .td-sc .td-stat-row { margin-bottom: 14px; }
+      .td-bal .td-stat-row { grid-template-columns: repeat(5, 1fr); }
+      @media (max-width: 1100px) { .td-bal .td-stat-row { grid-template-columns: repeat(3, 1fr); } }
+      @media (max-width: 900px) { .td-bal .td-stat-row { grid-template-columns: 1fr 1fr; } }
       .td-sc .td-report-controls { grid-template-columns: repeat(auto-fit, minmax(165px, 220px)); }
       .td-sc-chart { margin: 4px 0 14px; }
       .td-sc-svg { width: 100%; height: auto; display: block; }
@@ -5277,7 +5441,7 @@ function GlobalStyle() {
       .td-linked-add .td-input { max-width: 200px; }
       .td-linked-err { color: #9A2E1C; font-size: 12px; margin-top: 6px; }
       @media (max-width: 640px) { .td-linked-list li { grid-template-columns: 70px 1fr auto auto; } }
-      .td-payment-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; background: var(--td-card); border: 1px solid var(--td-border); border-radius: var(--td-radius); padding: 12px 14px; margin: 12px 0 4px; }
+      .td-payment-summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; background: var(--td-card); border: 1px solid var(--td-border); border-radius: var(--td-radius); padding: 12px 14px; margin: 12px 0 4px; }
       .td-payment-summary-item { display: flex; flex-direction: column; gap: 4px; }
       .td-payment-summary-value { font-family: 'Oswald', sans-serif; font-size: 17px; font-weight: 600; }
       .td-job-detail-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 10px; }
@@ -5289,6 +5453,16 @@ function GlobalStyle() {
       .td-payment-amount { font-family: 'IBM Plex Mono', monospace; font-weight: 700; font-size: 13px; }
       .td-payment-form { display: flex; flex-direction: column; gap: 6px; border-top: 1px dashed var(--td-border); padding-top: 10px; }
       .td-payment-form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+      .td-payment-btns { display: flex; flex-wrap: wrap; gap: 6px; }
+      /* Client credits: plum, deliberately not red — a credit is not an error. */
+      .td-credit-text { color: #6A4C93; font-weight: 600; }
+      .td-credit-row { background: #F6F2FA; border-color: #DCD1EA; }
+      .td-credit-chip { color: #6A4C93; background: #E9E1F3; }
+      .td-btn.td-credit-btn { color: #6A4C93; border-color: #CDBFE0; }
+      .td-btn.td-credit-btn-solid { background: #6A4C93; color: #fff; border-color: #6A4C93; }
+      .td-btn.td-credit-btn-solid:disabled { opacity: .5; cursor: not-allowed; }
+      .td-credit-form { margin-top: 10px; border-top-color: #CDBFE0; }
+      .td-credit-form-title { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; font-weight: 700; color: #6A4C93; }
 
       /* ---------- Responsive ---------- */
       @media (max-width: 900px) {

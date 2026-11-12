@@ -71,6 +71,10 @@ const jobFromRow = (r) => ({
   notes: r.notes || "",
   createdAt: toIso(r.created_at),
   clientPayments: [],
+  // Client credits: money taken off what the client owes after signing (its own
+  // table, never mixed into clientPayments). Stored positive, shown negative.
+  // Admin-only by RLS, so always empty for a project manager.
+  clientCredits: [],
   vendorPayments: [],
   // Project manager / installers / services working this job. Filled by
   // loadAll from job_assignments; the calendar reads the same rows.
@@ -143,6 +147,14 @@ const clientPaymentFromRow = (r) => ({
   // Initial deposit / second deposit / final payment. What the reports group
   // by, so it is stored rather than re-inferred from order on every read.
   paymentType: r.payment_type || null,
+});
+
+const clientCreditFromRow = (r) => ({
+  id: r.id,
+  amount: Number(r.amount || 0),
+  date: toIso(r.credit_date),
+  reason: r.reason || "",
+  createdAt: toIso(r.created_at),
 });
 
 const vendorPaymentFromRow = (r) => ({
@@ -269,7 +281,7 @@ const supabaseRepo = {
 
   async loadAll() {
     const [jobRows, vendorRows, cpRows, vpRows, tradeRows, flagRows, payTypeRows, ageRuleRows,
-           roleRows, assigneeRows, assignmentRows, finalRows, appRole] = await Promise.all([
+           roleRows, assigneeRows, assignmentRows, finalRows, appRole, creditRows] = await Promise.all([
       supabase.from("jobs").select("*").order("number", { ascending: false }).then(unwrap),
       supabase.from("vendors").select("*").order("name", { ascending: true }).then(unwrap),
       supabase.from("client_payments").select("*").order("payment_date", { ascending: false }).then(unwrap),
@@ -295,11 +307,14 @@ const supabaseRepo = {
       // drawing panels that RLS has already emptied. Fails closed: a role that
       // cannot be read is the most restricted one, never the least.
       supabase.rpc("current_app_role").then(({ data, error }) => (error ? "project_manager" : (data || "project_manager"))),
+      // Admin-only by RLS: a project manager simply gets no rows back.
+      supabase.from("client_credits").select("*").order("credit_date", { ascending: false }).then(unwrap),
     ]);
 
     const jobs = jobRows.map(jobFromRow);
     const byId = new Map(jobs.map((j) => [j.id, j]));
     cpRows.forEach((r) => byId.get(r.job_id)?.clientPayments.push(clientPaymentFromRow(r)));
+    creditRows.forEach((r) => byId.get(r.job_id)?.clientCredits.push(clientCreditFromRow(r)));
     vpRows.forEach((r) => byId.get(r.job_id)?.vendorPayments.push(vendorPaymentFromRow(r)));
     assignmentRows.forEach((r) => byId.get(r.job_id)?.assignments.push(assignmentFromRow(r)));
     finalRows.forEach((r) => { const j = byId.get(r.job_id); if (j) j.finalization = finalizationFromRow(r); });
@@ -352,6 +367,24 @@ const supabaseRepo = {
 
   async deleteClientPayment(_jobId, paymentId) {
     await supabase.from("client_payments").delete().eq("id", paymentId).then(unwrap);
+  },
+
+  // created_by is left out on purpose: the column defaults to auth.uid().
+  async createClientCredit(jobId, c) {
+    await supabase
+      .from("client_credits")
+      .insert({
+        id: c.id,
+        job_id: jobId,
+        amount: Number(c.amount) || 0,
+        credit_date: toIso(c.date),
+        reason: (c.reason || "").trim(),
+      })
+      .then(unwrap);
+  },
+
+  async deleteClientCredit(_jobId, creditId) {
+    await supabase.from("client_credits").delete().eq("id", creditId).then(unwrap);
   },
 
   async createVendorPayment(jobId, p) {
@@ -663,7 +696,8 @@ const localRepo = {
       cache.role = cache.role || "admin";
       cache.assignees = cache.assignees || [];
       cache.jobs = (cache.jobs || []).map((j) => ({
-        ...j, assignments: j.assignments || [], finalization: j.finalization || null }));
+        ...j, assignments: j.assignments || [], clientCredits: j.clientCredits || [],
+        finalization: j.finalization || null }));
     }
     return cache;
   },
@@ -688,6 +722,12 @@ const localRepo = {
   },
   async deleteClientPayment(jobId, paymentId) {
     return mapJob(jobId, (j) => ({ ...j, clientPayments: (j.clientPayments || []).filter((p) => p.id !== paymentId) }));
+  },
+  async createClientCredit(jobId, c) {
+    return mapJob(jobId, (j) => ({ ...j, clientCredits: [c, ...(j.clientCredits || [])] }));
+  },
+  async deleteClientCredit(jobId, creditId) {
+    return mapJob(jobId, (j) => ({ ...j, clientCredits: (j.clientCredits || []).filter((c) => c.id !== creditId) }));
   },
   async createVendorPayment(jobId, p) {
     return mapJob(jobId, (j) => ({ ...j, vendorPayments: [p, ...(j.vendorPayments || [])] }));
