@@ -446,7 +446,11 @@ const clientReceived = (job) => (job.clientPayments || []).reduce((s, p) => s + 
 // reports in the database.
 const clientCredited = (job) => (job.clientCredits || []).reduce((s, c) => s + Number(c.amount || 0), 0);
 const netContract = (job) => Number(job.contractAmount || 0) - clientCredited(job);
-const clientBalance = (job) => Number(job.contractAmount || 0) - clientReceived(job) - clientCredited(job);
+// Rounded to the cent. Float subtraction leaves crumbs — 13867.92 - 13215.75
+// - 652.17 is 1.1e-13, not 0 — and a crumb above zero kept job #1101 from
+// reading as paid in full, hiding the In Progress / Completed choice.
+const toCents = (n) => Math.round((Number(n) || 0) * 100) / 100;
+const clientBalance = (job) => toCents(Number(job.contractAmount || 0) - clientReceived(job) - clientCredited(job));
 const vendorPaid = (job) => (job.vendorPayments || []).filter((p) => p.status === "paid").reduce((s, p) => s + Number(p.amount || 0), 0);
 const vendorPending = (job) => (job.vendorPayments || []).filter((p) => p.status === "pending").reduce((s, p) => s + Number(p.amount || 0), 0);
 const vendorTotal = (job) => vendorPaid(job) + vendorPending(job);
