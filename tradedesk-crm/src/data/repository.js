@@ -42,6 +42,13 @@ const jobFromRow = (r) => ({
   // has to special-case combo.
   trades: Array.isArray(r.trades) && r.trades.length ? r.trades : (r.trade ? [r.trade] : []),
   isRepair: Boolean(r.is_repair),
+  // Renew / Rehab / Yoak PM, from the job_types registry. The database fills it
+  // when an insert leaves it blank (from the name), and a name containing
+  // "Yoak PM" always means yoak_pm. Only admins can change it (guard trigger).
+  jobType: r.job_type || "renew",
+  // How the job came in: "manual" (entered here), "webhook" (a GHL contract),
+  // "system", or null for jobs created before 2026-11-18. Set by the database.
+  createdVia: r.created_via || null,
   // Chosen by hand once the job is paid in full: "in_progress" | "completed" | "".
   paidStatus: r.paid_status || "",
   stage: r.stage,
@@ -99,6 +106,13 @@ const jobToRow = (j) => {
   }
   if (j.trades !== undefined) row.trades = j.trades;
   if (j.isRepair !== undefined) row.is_repair = Boolean(j.isRepair);
+  if (j.jobType !== undefined) row.job_type = j.jobType || null;
+  // The GHL project # is the key that lets an incoming GHL contract attach to
+  // this job instead of creating a second one. Digits only; blank clears it.
+  if (j.ghlProjectDisplayId !== undefined) {
+    const digits = String(j.ghlProjectDisplayId || "").replace(/\D/g, "");
+    row.ghl_project_display_id = digits || null;
+  }
   if (j.paidStatus !== undefined) row.paid_status = j.paidStatus || null;
   if (j.stage !== undefined) row.stage = j.stage;
   if (j.substage !== undefined) row.substage = j.substage || null;
@@ -281,7 +295,7 @@ const supabaseRepo = {
 
   async loadAll() {
     const [jobRows, vendorRows, cpRows, vpRows, tradeRows, flagRows, payTypeRows, ageRuleRows,
-           roleRows, assigneeRows, assignmentRows, finalRows, appRole, creditRows] = await Promise.all([
+           roleRows, assigneeRows, assignmentRows, finalRows, appRole, creditRows, jobTypeRows] = await Promise.all([
       supabase.from("jobs").select("*").order("number", { ascending: false }).then(unwrap),
       supabase.from("vendors").select("*").order("name", { ascending: true }).then(unwrap),
       supabase.from("client_payments").select("*").order("payment_date", { ascending: false }).then(unwrap),
@@ -309,6 +323,8 @@ const supabaseRepo = {
       supabase.rpc("current_app_role").then(({ data, error }) => (error ? "project_manager" : (data || "project_manager"))),
       // Admin-only by RLS: a project manager simply gets no rows back.
       supabase.from("client_credits").select("*").order("credit_date", { ascending: false }).then(unwrap),
+      // Renew / Rehab / Yoak PM. Configuration like trades: one row per type.
+      supabase.from("job_types").select("*").eq("active", true).order("sort").then(unwrap),
     ]);
 
     const jobs = jobRows.map(jobFromRow);
@@ -322,7 +338,7 @@ const supabaseRepo = {
     return { jobs, vendors: vendorRows.map(vendorFromRow), trades: tradeRows, jobFlags: flagRows,
              paymentTypes: payTypeRows, ageRules: ageRuleRows,
              assigneeRoles: roleRows, assignees: assigneeRows.map(assigneeFromRow),
-             role: appRole };
+             jobTypes: jobTypeRows, role: appRole };
   },
 
   // Seeding is a database concern in Supabase mode, not something the browser
@@ -614,6 +630,12 @@ const supabaseRepo = {
     return await supabase.rpc("report_monthly_scorecard", { p_from: from, p_to: to }).then(unwrap);
   },
 
+  // Booked split by job type, admin-only like the scorecard. Same jobs and the
+  // same whole-month rule, so the types always add up to the scorecard's Booked.
+  async reportBookedByType(from, to) {
+    return await supabase.rpc("report_booked_by_type", { p_from: from, p_to: to }).then(unwrap);
+  },
+
   // Admin-only (report_balances_owed raises 42501 for anyone else). One row per
   // live job: contract, collected (larger of TradeDesk payments and the
   // Completion Log sheet), balance, and which source the collected figure used.
@@ -787,6 +809,7 @@ const localRepo = {
 
   async finalizeGp() { throw new Error("finalizing gross profit needs Supabase"); },
   async reportMonthlyScorecard() { throw new Error("reports need Supabase"); },
+  async reportBookedByType() { throw new Error("reports need Supabase"); },
   async reportBalancesOwed() { throw new Error("reports need Supabase"); },
   async linkJobs() { throw new Error("linking jobs needs Supabase"); },
   async unlinkJob() { throw new Error("linking jobs needs Supabase"); },

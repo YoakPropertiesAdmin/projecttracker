@@ -6,16 +6,19 @@ import { crm, db, DEFAULT_LOCATION, exchangeLocationToken, logSync } from "../_s
  * Signed marketplace-app webhooks (named without "ghl": portal URL rule).
  *
  *  1. Verify X-GHL-Signature (Ed25519, base64) against GHL's public key.
- *     Unsigned or tampered -> 401. No RSA fallback (X-WH-Signature retired
- *     2026-09-01).
- *  2. Dedupe on webhookId (PK of ghl_webhook_events). A retry -> 200, no work.
- *  3. Respond 200 at once; the work runs in EdgeRuntime.waitUntil.
+ *     Unsigned or tampered -> 401.
+ *  2. Events TradeDesk does not act on (tags, tasks, notes, records, other
+ *     pipelines, other locations) -> 200 at once, no database work.
+ *  3. Everything else -> 200 at once. Storing (dedupe on webhookId, the PK of
+ *     ghl_webhook_events) and processing run in EdgeRuntime.waitUntil, with the
+ *     store retried, so a slow or briefly failing database never makes GHL wait
+ *     or count a failure. (v5, 2026-11-16: GHL paused delivery at 53% success
+ *     because answers took ~4.7 s during bursts and cold boots hit
+ *     PGRST303 "JWT issued at future".)
  *
  * Opportunity events do NOT trust the payload: the opportunity is re-read from
  * the API and applied with the nightly sweep's own rules
- * (ghl_apply_opportunity_event -> ghl_sync_opportunities). So contract_amount
- * is seeded only when a job is created, trade/status locks hold, and stage only
- * moves where ghl_stage_map says it may — exactly as today.
+ * (ghl_apply_opportunity_event -> ghl_sync_opportunities).
  */
 
 const PIPELINE = Deno.env.get("GHL_PRODUCTION_PIPELINE_ID") || "ynllopdoIURk6CKPtjNg";
@@ -39,8 +42,6 @@ function verify(body: string, sigB64: string): boolean {
   if (sig.length !== 64) return false;
   const enc = new TextEncoder();
   try { if (ed25519.verify(sig, enc.encode(body), PUBKEY)) return true; } catch { /* fall through */ }
-  // GHL's own sample verifies JSON.stringify(req.body); accept that form of the
-  // same body too, in case their serialisation differs from the raw bytes.
   try {
     const re = JSON.stringify(JSON.parse(body));
     if (re !== body) return ed25519.verify(sig, enc.encode(re), PUBKEY);
@@ -50,13 +51,14 @@ function verify(body: string, sigB64: string): boolean {
 
 const json = (s: number, b: unknown) =>
   new Response(JSON.stringify(b), { status: s, headers: { "content-type": "application/json" } });
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // ---------- opportunity normalisation: identical field map to ghl-sync ----------
 const F = {
   display: "0PyQD5I2itCf0nOdpHSF", street: "1HUElXdGFLyqwVFViCYd", address: "1LjzVxPu7WzexHsSi8bf",
   city: "WPsoqqsi5vlPALc01YDc", state: "zL8uHsMCVCp5j0riG2Qb", zip: "Q0FLnbxGalma3kngxfhV",
-  type: "S8XE5l2bsQHtrIk17aEp", signed: "tWVSxfJFeGsiORG7YKvI", notes: "oynp2kmyX4EVBCeU39Ob",
-  // Milestone dates (confirmed by Joshua on job #1459, 2026-11-10)
+  type: "ahJkRoMCrPBqkmwmKsIO", typeOld: "S8XE5l2bsQHtrIk17aEp",
+  signed: "tWVSxfJFeGsiORG7YKvI", notes: "oynp2kmyX4EVBCeU39Ob",
   signedDate: "IIJDGI3z2bESbPQfNuDe", materialsDate: "7U5wuHNq6LjUMuseVipP",
 };
 
@@ -78,7 +80,7 @@ export function parseGhlDate(raw: unknown): string | null {
   if (/^\d{12,13}$/.test(s)) return new Date(Number(s)).toISOString().slice(0, 10);
   m = s.match(/^([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2}),?\s+(\d{4})$/);
   if (m && MONTHS[m[1].toLowerCase()]) return ymd(+m[3], MONTHS[m[1].toLowerCase()], +m[2]);
-  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  m = s.match(/^(\d{1,2})[\/.](\d{1,2})[\/.](\d{4})$/);
   if (m) return ymd(+m[3], +m[1], +m[2]);
   return null;
 }
@@ -100,7 +102,7 @@ function normalise(o: any, stageName: Map<string, string>) {
     name: o.name || o.contact?.name || null, status: o.status || "open",
     stage_name: stageName.get(o.pipelineStageId) || null,
     monetary_value: o.monetaryValue ?? null, signed_value: amt(cf, F.signed),
-    project_type: txt(cf, F.type),
+    project_type: txt(cf, F.type) || txt(cf, F.typeOld),
     address: [street, [city, st].filter(Boolean).join(", "), zip].filter(Boolean).join(" ").trim(),
     phone: o.contact?.phone || null, email: o.contact?.email || null,
     notes: txt(cf, F.notes), created_at: o.createdAt || null, updated_at: o.updatedAt || null,
@@ -123,6 +125,19 @@ async function stageNames(loc: string) {
   return map;
 }
 
+/** Events TradeDesk acts on. Anything else is answered 200 and dropped. */
+function ignoreReason(ev: any): string | null {
+  const type: string = ev.type || "";
+  if (type === "INSTALL" || type === "UNINSTALL") return null;
+  if (ev.locationId && DEFAULT_LOCATION && ev.locationId !== DEFAULT_LOCATION) return "other location";
+  if (type === "ContactUpdate" || type === "ContactDelete" || type === "OpportunityDelete") return null;
+  if (type.startsWith("Opportunity")) {
+    if (ev.pipelineId && ev.pipelineId !== PIPELINE) return "not the Production pipeline";
+    return null;
+  }
+  return "unhandled type " + type;
+}
+
 // ---------- event handlers ----------
 async function handle(ev: any): Promise<{ result: unknown; error?: string }> {
   const type: string = ev.type || "";
@@ -135,8 +150,6 @@ async function handle(ev: any): Promise<{ result: unknown; error?: string }> {
     await logSync({ direction: "in", entity: "install", action: type.toLowerCase() + "_webhook", ok: true,
                     ghl_id: ev.locationId || ev.companyId || null, source: "marketplace_webhook",
                     detail: { installType: ev.installType ?? null, appId: ev.appId ?? null } });
-    // A reinstall that arrives without an OAuth redirect: mint the location
-    // token from the stored agency token (the flow GHL documents for this).
     if (type === "INSTALL" && ev.locationId === DEFAULT_LOCATION && ev.companyId) {
       try { await exchangeLocationToken(ev.companyId, ev.locationId); }
       catch (e) { return { result: { noted: type }, error: "reconnect failed: " + String(e) }; }
@@ -159,7 +172,6 @@ async function handle(ev: any): Promise<{ result: unknown; error?: string }> {
   }
 
   if (type === "ContactDelete") {
-    // Never deletes or blanks a job; recorded for review only.
     await logSync({ direction: "in", entity: "contact", action: "contact_deleted_in_crm", ok: true,
                     ghl_id: ev.id, source: "marketplace_webhook" });
     return { result: { noted: "ContactDelete" } };
@@ -194,6 +206,27 @@ async function handle(ev: any): Promise<{ result: unknown; error?: string }> {
   return { result: { ignored: "unhandled type " + type } };
 }
 
+/** Store the delivery, retrying transient errors. Returns false for a duplicate or a store that never succeeded. */
+async function store(webhookId: string, ev: any): Promise<boolean> {
+  const waits = [0, 400, 1200, 3000, 6000];
+  let last: unknown = null;
+  for (const w of waits) {
+    if (w) await sleep(w);
+    const ins = await db().from("ghl_webhook_events").insert({
+      webhook_id: webhookId, type: ev.type || "unknown", location_id: ev.locationId || null,
+      payload: ev, signature_ok: true,
+    });
+    if (!ins.error) return true;
+    if (ins.error.code === "23505") return false; // retry of a delivery we already have
+    last = ins.error;
+  }
+  console.error("ghl_webhook_events insert failed after retries", webhookId, ev.type, last);
+  await logSync({ direction: "in", entity: ev.type?.startsWith?.("Contact") ? "contact" : "opportunity",
+                  action: "webhook_store_failed", ok: false, ghl_id: ev.id ?? null,
+                  source: "marketplace_webhook", detail: { webhookId, type: ev.type, error: last } });
+  return false;
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method !== "POST") return json(405, { error: "POST only" });
 
@@ -206,22 +239,20 @@ Deno.serve(async (req: Request) => {
   const webhookId: string = ev.webhookId || ev.webhook_id || "";
   if (!webhookId) return json(400, { error: "no webhookId" });
 
-  const ins = await db().from("ghl_webhook_events").insert({
-    webhook_id: webhookId, type: ev.type || "unknown", location_id: ev.locationId || null,
-    payload: ev, signature_ok: true,
-  });
-  if (ins.error) {
-    if (ins.error.code === "23505") return json(200, { ok: true, duplicate: true });
-    console.error("ghl_webhook_events insert failed", ins.error);
-    return json(500, { error: "could not store delivery" }); // GHL retries; nothing was processed
-  }
+  const skip = ignoreReason(ev);
+  if (skip) return json(200, { ok: true, ignored: skip });
 
   const work = (async () => {
-    let out: { result: unknown; error?: string };
-    try { out = await handle(ev); } catch (e) { out = { result: null, error: String(e) }; }
-    await db().from("ghl_webhook_events")
-      .update({ processed_at: new Date().toISOString(), error: out.error ?? null })
-      .eq("webhook_id", webhookId);
+    try {
+      if (!(await store(webhookId, ev))) return;
+      let out: { result: unknown; error?: string };
+      try { out = await handle(ev); } catch (e) { out = { result: null, error: String(e) }; }
+      await db().from("ghl_webhook_events")
+        .update({ processed_at: new Date().toISOString(), error: out.error ?? null })
+        .eq("webhook_id", webhookId);
+    } catch (e) {
+      console.error("webhook background work failed", webhookId, e);
+    }
   })();
   // deno-lint-ignore no-explicit-any
   const rt = (globalThis as any).EdgeRuntime;

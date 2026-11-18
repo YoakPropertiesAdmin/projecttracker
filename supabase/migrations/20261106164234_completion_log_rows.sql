@@ -1,0 +1,8 @@
+create table public.completion_log_rows (id uuid primary key default gen_random_uuid(), source text not null, sheet_row int, section text not null check (section in ('completed','awaiting_payment','installing')), customer text, address text, projects text, contract_amount numeric, amount_collected numeric, date_started date, date_completed date, date_collected date, raw_dates jsonb, project_manager text, installer text, permit_no text, notes text, ghl_project_id text, job_id uuid references public.jobs(id) on delete set null, match_method text, match_status text not null default 'unmatched' check (match_status in ('matched','ambiguous','unmatched','manual','ignored')), match_note text, received_at timestamptz not null default now(), updated_at timestamptz not null default now());
+comment on table public.completion_log_rows is 'Rows from the 2026-Sales-Log-Live "Completion Log" tab. source=backfill_2026-11-06 for the one-time load; the live sheet sync writes here too. job_id is set by matching (GHL project id when the row has one, else address) or by hand (match_status=manual).';
+create index completion_log_rows_job_idx on public.completion_log_rows (job_id);
+create index completion_log_rows_ghl_idx on public.completion_log_rows (ghl_project_id);
+alter table public.completion_log_rows enable row level security;
+create policy completion_log_rows_admin on public.completion_log_rows for all to authenticated using (public.is_admin()) with check (public.is_admin());
+revoke all on public.completion_log_rows from anon;
+create trigger trg_completion_log_rows_updated_at before update on public.completion_log_rows for each row execute function public.touch_updated_at();;

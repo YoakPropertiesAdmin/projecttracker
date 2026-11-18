@@ -110,6 +110,56 @@ const flagKeys = () => Object.keys(JOB_FLAGS);
 const jobFlag = (job) => (job && job.flag ? JOB_FLAGS[job.flag] : null);
 
 /**
+ * Job types — Renew, Rehab, Yoak PM — from the `job_types` registry. Same
+ * mutable-module pattern as trades and markers.
+ *
+ *   expectsProjectId  a live job of this type with no GHL project # is flagged
+ *                     "Needs Project ID" here and on the 6:30 AM email. The
+ *                     project # is what lets an incoming GHL contract attach
+ *                     to the job instead of creating a second one.
+ *   namePattern       a name matching it always means that type ("Yoak PM").
+ *                     The database enforces the same rule on every save.
+ *
+ * Every type counts in Booked; the scorecard only splits Booked by type.
+ */
+const JOB_TYPES = {
+  renew:   { label: "Renew",   expectsProjectId: false, namePattern: null },
+  rehab:   { label: "Rehab",   expectsProjectId: true,  namePattern: null },
+  yoak_pm: { label: "Yoak PM", expectsProjectId: false, namePattern: /yoak\s*pm/i },
+};
+
+function applyJobTypes(rows) {
+  if (!rows || !rows.length) return;
+  Object.keys(JOB_TYPES).forEach((k) => delete JOB_TYPES[k]);
+  rows.forEach((r) => {
+    let re = null;
+    try { re = r.name_pattern ? new RegExp(r.name_pattern, "i") : null; } catch { re = null; }
+    JOB_TYPES[r.key] = { label: r.label, expectsProjectId: Boolean(r.expects_project_id), namePattern: re };
+  });
+}
+
+const jobTypeKeys = () => Object.keys(JOB_TYPES);
+const jobTypeLabel = (key) => (JOB_TYPES[key] ? JOB_TYPES[key].label : key || "Renew");
+
+// The type a name forces, if any: "Yoak PM – 313 5th NW" is always Yoak PM.
+const typeForcedByName = (name) =>
+  jobTypeKeys().find((k) => JOB_TYPES[k].namePattern && JOB_TYPES[k].namePattern.test(name || "")) || null;
+
+// Choosing a name-pattern type puts the type's label in front of the name, so
+// the name and the type can't disagree ("1240 Oxford NW" → "Yoak PM – 1240 Oxford NW").
+const nameForType = (type, name) => {
+  const t = JOB_TYPES[type];
+  const n = (name || "").trim();
+  if (!t || !t.namePattern || t.namePattern.test(n)) return n;
+  return t.label + " – " + n;
+};
+
+// A live job whose type expects a GHL project #, without one.
+const needsProjectId = (job) =>
+  Boolean(job && JOB_TYPES[job.jobType] && JOB_TYPES[job.jobType].expectsProjectId)
+  && !job.ghlProjectDisplayId && !deadStatus(job);
+
+/**
  * Client payment classifications, from the `payment_types` registry. Same
  * mutable-module pattern as the trade and flag registries: rewritten from the
  * database immediately before the state update that renders it.
@@ -637,6 +687,7 @@ function useJobTrackerData() {
         applyPaymentTypes(loaded.paymentTypes);
         applyAgeRules(loaded.ageRules);
         applyAssigneeRoles(loaded.assigneeRoles);
+        applyJobTypes(loaded.jobTypes);
         setDataState(loaded);
       } else {
         // Nothing stored at all. Only reachable in the localStorage dev
@@ -895,7 +946,8 @@ export default function App() {
       const saved = await repo.createJob(j);
       setData((prev) => ({
         ...prev,
-        jobs: prev.jobs.map((x) => (x.id === j.id ? { ...x, number: saved.number } : x)),
+        // The database may also settle the type (a "Yoak PM" name forces it).
+        jobs: prev.jobs.map((x) => (x.id === j.id ? { ...x, number: saved.number, jobType: saved.jobType } : x)),
       }));
     }, "The new job");
     return j;
@@ -1206,7 +1258,7 @@ export default function App() {
         <JobDetailModal ctx={ctx} job={jobs.find((j) => j.id === selectedJobId)} onClose={() => setSelectedJobId(null)} />
       )}
       {showAddJob && (
-        <JobFormModal onClose={() => setShowAddJob(false)}
+        <JobFormModal jobs={jobs} onClose={() => setShowAddJob(false)}
           onSave={(j) => { const created = addJob(j); setShowAddJob(false); setSelectedJobId(created.id); }} />
       )}
       {showVendorForm && (
@@ -1330,6 +1382,8 @@ function JobsView({ ctx }) {
   const [mode, setMode] = useState("board");
   const [tradeFilter, setTradeFilter] = useState("all");
   const [repairsOnly, setRepairsOnly] = useState(false);
+  // "all", a job_types key, or "needs_id" (live jobs still missing a GHL project #).
+  const [typeFilter, setTypeFilter] = useState("all");
   const [flagFilter, setFlagFilter] = useState("all");
   const [dragOverStage, setDragOverStage] = useState(null);
   const [draggingId, setDraggingId] = useState(null);
@@ -1340,6 +1394,8 @@ function JobsView({ ctx }) {
     if (tradeFilter !== "all" && j.trade !== tradeFilter &&
         !(j.trades || []).includes(tradeFilter)) return false;
     if (repairsOnly && !j.isRepair) return false;
+    if (typeFilter === "needs_id" && !needsProjectId(j)) return false;
+    if (typeFilter !== "all" && typeFilter !== "needs_id" && j.jobType !== typeFilter) return false;
     // "none" is a real answer here — showing only the jobs carrying no marker
     // is how you see what is actually moving.
     if (flagFilter === "none" && j.flag) return false;
@@ -1392,6 +1448,12 @@ function JobsView({ ctx }) {
             title="Show only repair work">
             <Wrench size={13} /> Repairs
           </button>
+          <select value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}
+            className={cls("td-select", typeFilter !== "all" && "td-select-on")} aria-label="Job type">
+            <option value="all">All job types</option>
+            {jobTypeKeys().map((k) => <option key={k} value={k}>{JOB_TYPES[k].label}</option>)}
+            <option value="needs_id">Needs Project ID ({jobs.filter(needsProjectId).length})</option>
+          </select>
         </div>
       </div>
 
@@ -1448,6 +1510,12 @@ function JobsView({ ctx }) {
                           {j.customerName}
                         </div>
                         <div className="td-cell-sub"><MapPin size={11} /> {j.customerAddress}</div>
+                        {(j.jobType !== "renew" || needsProjectId(j)) && (
+                          <div className="td-cell-sub">
+                            {j.jobType !== "renew" && jobTypeLabel(j.jobType)}
+                            {needsProjectId(j) && <span className="td-needs-id td-needs-id-inline"><AlertTriangle size={10} /> Needs Project ID</span>}
+                          </div>
+                        )}
                       </td>
                       <td><TradeBadge trade={j.trade} size="sm" /></td>
                       <td>
@@ -1546,7 +1614,8 @@ function JobTicket({ job, ctx, dragging, onDragStart, onDragEnd }) {
         </span>
         <span className="td-ticket-date">{fmtDateShort(job.targetDate)}</span>
       </div>
-      {(paidState || bal > 0 || owed > 0 || job.isRepair || deadStatus(job) || isOverdue) && (
+      {(paidState || bal > 0 || owed > 0 || job.isRepair || deadStatus(job) || isOverdue
+        || job.jobType !== "renew" || needsProjectId(job)) && (
         <div className="td-ticket-flags">
           {/* The counter, not just the flag: "14w since signed" tells you how
               bad it is, where a red card only tells you that it is bad. */}
@@ -1557,6 +1626,13 @@ function JobTicket({ job, ctx, dragging, onDragStart, onDragEnd }) {
           ))}
           {deadStatus(job) && <span className="td-ticket-flag td-ticket-flag-red"><X size={10} /> {deadStatus(job)}</span>}
           {job.isRepair && <span className="td-ticket-flag td-ticket-flag-repair"><Wrench size={10} /> Repair</span>}
+          {/* Renew is most of the board, so only the other types get a chip. */}
+          {job.jobType !== "renew" && <span className="td-ticket-flag td-ticket-flag-neutral">{jobTypeLabel(job.jobType)}</span>}
+          {needsProjectId(job) && (
+            <span className="td-ticket-flag td-ticket-flag-amber" title="Add the GHL project # in the job so a GHL contract can be matched to it">
+              <AlertTriangle size={10} /> Needs Project ID
+            </span>
+          )}
           {paidState
             ? <span className={cls("td-ticket-flag", paidState === "unset" ? "td-ticket-flag-neutral" : "td-ticket-flag-green")}
                 title={paidState === "unset" ? "Paid in full — open the job to mark it In Progress or Completed" : undefined}>
@@ -1570,37 +1646,90 @@ function JobTicket({ job, ctx, dragging, onDragStart, onDragEnd }) {
   );
 }
 
-function JobFormModal({ onClose, onSave }) {
+function JobFormModal({ jobs, onClose, onSave }) {
+  const today = new Date().toISOString().slice(0, 10);
   const [form, setForm] = useState({
-    customerName: "", customerPhone: "", customerEmail: "", customerAddress: "",
-    trade: "roofing", contractAmount: "", startDate: new Date().toISOString().slice(0, 10),
-    targetDate: addDays(null, 21).slice(0, 10), stage: "signed", notes: "",
+    jobType: "", customerName: "", customerPhone: "", customerEmail: "", customerAddress: "",
+    trade: "roofing", contractAmount: "", contractSignedDate: today, projectNo: "",
+    startDate: today, targetDate: addDays(null, 21).slice(0, 10), stage: "signed", notes: "",
   });
   const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }));
-  const valid = form.customerName.trim() && form.customerAddress.trim() && form.contractAmount;
+
+  // A "Yoak PM" name decides the type on its own (the database enforces it),
+  // so the dropdown follows the name rather than letting the two disagree.
+  const forced = typeForcedByName(form.customerName);
+  const jobType = forced || form.jobType;
+  const type = JOB_TYPES[jobType];
+  const projectNo = form.projectNo.replace(/\D/g, "");
+  // Sharing a project # is how phases and add-ons are linked, so it's allowed;
+  // the form just says which job it will be linked to.
+  const sameProject = projectNo ? (jobs || []).filter((j) => String(j.ghlProjectDisplayId || "") === projectNo) : [];
+  const finalName = nameForType(jobType, form.customerName);
+
+  // Contract signed is required because Booked counts jobs by that date: a job
+  // without one never reaches the scorecard.
+  const valid = jobType && form.customerName.trim() && form.customerAddress.trim()
+    && form.contractAmount !== "" && form.contractSignedDate;
 
   return (
     <Modal title="New job" onClose={onClose}
       footer={<>
         <button className="td-btn" onClick={onClose}>Cancel</button>
         <button className="td-btn td-btn-primary" disabled={!valid} onClick={() => valid && onSave({
-          ...form, contractAmount: Number(form.contractAmount),
+          jobType,
+          customerName: finalName,
+          customerPhone: form.customerPhone, customerEmail: form.customerEmail,
+          customerAddress: form.customerAddress, trade: form.trade, stage: form.stage, notes: form.notes,
+          contractAmount: Number(form.contractAmount),
+          contractSignedDate: form.contractSignedDate,
+          ghlProjectDisplayId: projectNo || null,
           startDate: new Date(form.startDate).toISOString(), targetDate: new Date(form.targetDate).toISOString(),
         })}>Create job</button>
       </>}>
       <div className="td-form-grid">
-        <Field label="Customer name"><input className="td-input" value={form.customerName} onChange={set("customerName")} placeholder="Jane Homeowner" /></Field>
+        <Field label="Job type">
+          <select className="td-select td-select-full" value={jobType} onChange={set("jobType")} disabled={Boolean(forced)}>
+            {!jobType && <option value="">Choose a type</option>}
+            {jobTypeKeys().map((k) => <option key={k} value={k}>{JOB_TYPES[k].label}</option>)}
+          </select>
+        </Field>
+        <Field label={jobType === "renew" ? "Customer name" : "Customer or property"}>
+          <input className="td-input" value={form.customerName} onChange={set("customerName")}
+            placeholder={jobType === "renew" ? "Jane Homeowner" : "1240 Oxford NW"} />
+        </Field>
+        {(forced || (type && type.namePattern)) && finalName && (
+          <p className="td-form-note" style={{ gridColumn: "1 / -1" }}>
+            {forced ? "The name includes “" + type.label + "”, so this is a " + type.label + " job. " : ""}
+            Saved as “{finalName}”.
+          </p>
+        )}
         <Field label="Phone"><input className="td-input" value={form.customerPhone} onChange={set("customerPhone")} placeholder="412-555-0100" /></Field>
         <Field label="Email"><input className="td-input" value={form.customerEmail} onChange={set("customerEmail")} placeholder="jane@example.com" /></Field>
+        <div style={{ gridColumn: "1 / -1" }}>
+          <Field label="Job address"><input className="td-input" value={form.customerAddress} onChange={set("customerAddress")} placeholder="123 Main St, Sharonville" /></Field>
+        </div>
         <Field label="Trade">
           <select className="td-select td-select-full" value={form.trade} onChange={set("trade")}>
             {tradeKeys().map((k) => <option key={k} value={k}>{TRADES[k].label}</option>)}
           </select>
         </Field>
-        <div style={{ gridColumn: "1 / -1" }}>
-          <Field label="Job address"><input className="td-input" value={form.customerAddress} onChange={set("customerAddress")} placeholder="123 Main St, Sharonville" /></Field>
-        </div>
         <Field label="Contract amount ($)"><input className="td-input td-input-num" type="number" value={form.contractAmount} onChange={set("contractAmount")} placeholder="14200" /></Field>
+        <Field label="Contract signed"><input className="td-input" type="date" value={form.contractSignedDate} onChange={set("contractSignedDate")} /></Field>
+        <Field label={type && type.expectsProjectId ? "GHL project #" : "GHL project # (if it has one)"}>
+          <input className="td-input td-input-num" inputMode="numeric" value={form.projectNo} onChange={set("projectNo")} placeholder="223398" />
+        </Field>
+        {(type && type.expectsProjectId && !projectNo) && (
+          <p className="td-form-note td-form-note-warn" style={{ gridColumn: "1 / -1" }}>
+            {type.label} jobs need their GHL project # so a contract arriving from GHL attaches to this job instead of creating a second one.
+            You can save without it; the job is flagged until it's added.
+          </p>
+        )}
+        {sameProject.length > 0 && (
+          <p className="td-form-note" style={{ gridColumn: "1 / -1" }}>
+            {jobNo(sameProject[0].number)} {sameProject[0].customerName}{sameProject.length > 1 ? " and " + (sameProject.length - 1) + " more" : ""} already
+            {sameProject.length > 1 ? " use" : " uses"} project #{projectNo}. This job will be linked to {sameProject.length > 1 ? "them" : "it"} as part of the same project.
+          </p>
+        )}
         <Field label="Starting stage">
           <select className="td-select td-select-full" value={form.stage} onChange={set("stage")}>
             {STAGES.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
@@ -1697,6 +1826,7 @@ function JobDetailModal({ ctx, job, onClose }) {
   const [name, setName] = useState(job?.customerName || "");
   const [phone, setPhone] = useState(job?.customerPhone || "");
   const [email, setEmail] = useState(job?.customerEmail || "");
+  const [projNo, setProjNo] = useState(job?.ghlProjectDisplayId || "");
   const [cpForm, setCpForm] = useState({ amount: "", date: new Date().toISOString().slice(0, 10), method: PAYMENT_METHODS[0], note: "", paymentType: "" });
   // The Apply credit form. Closed by default so the payment form stays the
   // obvious thing to use; credits are the exception.
@@ -1729,6 +1859,46 @@ function JobDetailModal({ ctx, job, onClose }) {
   const commitContact = (key, value, current) => {
     const next = value.trim();
     if (next !== (current || "")) updateJob(job.id, { [key]: next });
+  };
+
+  // The GHL project # is what lets a contract arriving from GHL attach to this
+  // job rather than create a second one, and jobs sharing one are linked as a
+  // project (jobs_auto_group). Digits only; clearing it asks first because it
+  // unlinks the job from GHL matching.
+  const commitProjectNo = () => {
+    const next = projNo.replace(/\D/g, "");
+    const current = job.ghlProjectDisplayId || "";
+    if (next === current) { setProjNo(current); return; }
+    if (!next && !confirm("Remove project #" + current + " from " + jobNo(job.number) + "?\n\n" +
+        "Without it, a contract arriving from GHL can't be matched to this job.")) { setProjNo(current); return; }
+    const others = next ? ctx.jobs.filter((j) => j.id !== job.id && String(j.ghlProjectDisplayId || "") === next) : [];
+    if (others.length && !confirm("Project #" + next + " is already on " +
+        others.map((j) => jobNo(j.number) + " " + j.customerName).join(", ") + ".\n\n" +
+        "This job will be linked to " + (others.length > 1 ? "them" : "it") + " as part of the same project. Continue?")) {
+      setProjNo(current); return;
+    }
+    setProjNo(next);
+    updateJob(job.id, { ghlProjectDisplayId: next || null });
+    // The database links jobs that share a project # (jobs_auto_group); re-read
+    // shortly after so the Linked jobs panel shows the new grouping.
+    if (ctx.reload) setTimeout(() => ctx.reload(), 1500);
+  };
+
+  // A "Yoak PM" name always means a Yoak PM job (the database enforces it), so
+  // switching away asks for a rename first, and switching to it adds the label
+  // to the front of the name.
+  const changeType = (next) => {
+    if (next === job.jobType) return;
+    const forced = typeForcedByName(job.customerName);
+    if (forced && forced !== next) {
+      alert("\u201c" + job.customerName + "\u201d has \u201c" + jobTypeLabel(forced) + "\u201d in its name, which always makes it a " +
+        jobTypeLabel(forced) + " job.\n\nChange the customer name first.");
+      return;
+    }
+    const nextName = nameForType(next, job.customerName);
+    const patch = { jobType: next };
+    if (nextName !== job.customerName) { patch.customerName = nextName; setName(nextName); }
+    updateJob(job.id, patch);
   };
 
   const received = clientReceived(job);
@@ -1826,7 +1996,23 @@ function JobDetailModal({ ctx, job, onClose }) {
       <div className="td-job-detail">
 
         <div className="td-idline">
-          <span className="td-idline-item"><strong>Project #</strong> {job.ghlProjectDisplayId || "— not from GoHighLevel"}</span>
+          {canManage ? (
+            <label className="td-idline-item td-idline-edit">
+              <strong>Project #</strong>
+              <input className="td-input td-input-num td-projno-input" inputMode="numeric" value={projNo}
+                placeholder="none" aria-label="GHL project number"
+                onChange={(e) => setProjNo(e.target.value)}
+                onBlur={commitProjectNo}
+                onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }} />
+            </label>
+          ) : (
+            <span className="td-idline-item"><strong>Project #</strong> {job.ghlProjectDisplayId || "— not from GoHighLevel"}</span>
+          )}
+          {needsProjectId(job) && (
+            <span className="td-needs-id" title={jobTypeLabel(job.jobType) + " jobs need their GHL project # so a GHL contract can be matched to them"}>
+              <AlertTriangle size={11} /> Needs Project ID
+            </span>
+          )}
           <span className="td-idline-item"><strong>TradeDesk</strong> {jobNo(job.number)}</span>
         </div>
         {/* Two tiers rather than one row: what the job IS on top as chips, what
@@ -1837,6 +2023,16 @@ function JobDetailModal({ ctx, job, onClose }) {
           <div className="td-deal-meta">
             <TradeBadge trade={job.trade} />
             {job.substage && <span className="td-substage-chip" title="Stage name from GoHighLevel">{job.substage}</span>}
+            {canManage ? (
+              <select className="td-type-select" value={job.jobType}
+                onChange={(e) => changeType(e.target.value)}
+                aria-label="Job type" title="Job type: Renew, Rehab or Yoak PM">
+                {jobTypeKeys().map((k) => <option key={k} value={k}>{JOB_TYPES[k].label}</option>)}
+                {!JOB_TYPES[job.jobType] && <option value={job.jobType}>{job.jobType}</option>}
+              </select>
+            ) : (
+              <span className="td-substage-chip">{jobTypeLabel(job.jobType)}</span>
+            )}
             {canManage ? (
               <button type="button"
                 className={cls("td-hold-toggle", job.isRepair && "active")}
@@ -3004,6 +3200,9 @@ function ScorecardReport() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState("");
+  // Booked split by job type. Fetched on its own so a failure here hides the
+  // split and nothing else on the scorecard.
+  const [byType, setByType] = useState(null);
   const range = scorecardRange(period, customFrom, customTo);
 
   useEffect(() => {
@@ -3013,11 +3212,21 @@ function ScorecardReport() {
       .then((d) => { if (live) setData(d); })
       .catch((e) => { if (live) { setData(null); setError(e.message || String(e)); } })
       .finally(() => { if (live) setLoading(false); });
+    repo.reportBookedByType(range.from, range.to)
+      .then((d) => { if (live) setByType(d); })
+      .catch(() => { if (live) setByType(null); });
     return () => { live = false; };
   }, [range.from, range.to]);
 
   const months = (data && data.months) || [];
   const t = scTotals(months);
+  // Per-month split for the Booked cell's tooltip, keyed like the scorecard rows.
+  const typeMonth = new Map(((byType && byType.months) || []).map((m) => [String(m.month).slice(0, 10), m]));
+  const typeSplit = (m) => {
+    const row = typeMonth.get(String(m).slice(0, 10));
+    if (!row || !byType) return "";
+    return (byType.types || []).map((tp) => tp.label + " " + money((row.by_type[tp.key] || {}).booked || 0)).join("\n");
+  };
   const doExport = async (kind) => {
     setBusy(kind);
     try { await exportScorecard(data, kind); } catch (e) { setError("Export failed: " + (e.message || e)); }
@@ -3077,6 +3286,32 @@ function ScorecardReport() {
                   t.gp_jobs + " of " + t.completed_jobs_n + " completed jobs have vendor costs"} />
             </div>
 
+            {byType && byType.totals && (
+              <div className="td-sc-types">
+                <span className="td-sc-types-head">Booked by job type</span>
+                {(byType.types || []).map((tp) => {
+                  const v = byType.totals.by_type[tp.key] || { booked: 0, jobs: 0 };
+                  return (
+                    <span key={tp.key} className="td-sc-type">
+                      <span className="td-sc-type-label">{tp.label}</span>
+                      <strong className="td-num">{money(v.booked)}</strong>
+                      <span className="td-sc-type-sub">
+                        {v.jobs} {v.jobs === 1 ? "job" : "jobs"}
+                        {byType.totals.booked ? ", " + pct(v.booked / byType.totals.booked) : ""}
+                      </span>
+                    </span>
+                  );
+                })}
+                {/* Same jobs and months as Booked above, so this only shows if
+                    the two reports ever disagree. */}
+                {Math.abs(Number(byType.totals.booked) - Number(t.booked)) >= 0.01 && (
+                  <span className="td-sc-type-warn">
+                    <AlertTriangle size={12} /> The split totals {money(byType.totals.booked)}, not {money(t.booked)}. Reload to refresh.
+                  </span>
+                )}
+              </div>
+            )}
+
             <div className="td-sc-chart">
               <TrendChart months={months} series={[
                 { key: "booked", label: "Booked", color: "#B8860B" },
@@ -3098,7 +3333,7 @@ function ScorecardReport() {
                   {months.map((m) => (
                     <tr key={m.m}>
                       <td>{scMonthLabel(m.m)}</td>
-                      <td className="td-num">{money(m.booked)}<span className="td-sc-sub">{m.booked_jobs || ""}</span></td>
+                      <td className="td-num" title={typeSplit(m.m)}>{money(m.booked)}<span className="td-sc-sub">{m.booked_jobs || ""}</span></td>
                       <td className="td-num">{money(m.collected)}</td>
                       <td className="td-num">{money(m.completed)}<span className="td-sc-sub">{m.completed_jobs || ""}</span></td>
                       <td className="td-num">{money(m.gp_finalized)}</td>
@@ -5191,6 +5426,24 @@ function GlobalStyle() {
         font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; }
       .td-hold-toggle:hover { border-color: #C6BCA9; }
       .td-hold-toggle.active { background: #FDF3E3; border-color: #E6D3A6; color: #8A5A12; }
+      /* Job type: sits beside the repair toggle and reads as its sibling. */
+      .td-type-select { padding: 6px 10px; border: 1px solid #DCD5C9; background: #FDFCFA; color: #6B6459;
+        border-radius: 7px; font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; }
+      .td-type-select:hover { border-color: #C6BCA9; }
+      .td-idline-edit { display: inline-flex; align-items: center; }
+      .td-projno-input { width: 96px; padding: 3px 7px; font-family: 'IBM Plex Mono', monospace; font-size: 12px; }
+      .td-needs-id { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 600;
+        color: #8A6A0B; background: #F3E7C9; border-radius: 4px; padding: 2px 7px; align-self: center; }
+      .td-needs-id-inline { margin-left: 6px; padding: 1px 6px; font-size: 10.5px; }
+      .td-form-note { margin: -4px 0 0; font-size: 12px; line-height: 1.5; color: var(--td-muted); }
+      .td-form-note-warn { color: #8A6A0B; }
+      .td-sc-types { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 22px;
+        margin: 0 0 14px; padding: 10px 14px; border: 1px solid #EBE6DC; border-radius: 8px; font-size: 13px; }
+      .td-sc-types-head { font-weight: 600; color: var(--td-muted); }
+      .td-sc-type { display: inline-flex; align-items: baseline; gap: 6px; }
+      .td-sc-type-label { color: #6B6459; }
+      .td-sc-type-sub { font-size: 12px; color: var(--td-muted); }
+      .td-sc-type-warn { display: inline-flex; align-items: center; gap: 5px; color: #8A6A0B; font-size: 12px; }
 
       .td-deal-modal-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
 

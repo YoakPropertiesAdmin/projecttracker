@@ -1,0 +1,8 @@
+insert into public.trades(key,label,color,icon,sort_order,active) values ('gutters','Gutters','#2E7D6B','droplets',50,true),('soffit_fascia','Soffit / Fascia / Trim','#9A7B4F','hammer',60,true),('other','Other','#8A8478','wrench',80,true) on conflict (key) do update set label=excluded.label, active=true;
+update public.trade_keywords set trade_key='gutters' where keyword='gutter';
+insert into public.trade_keywords(keyword,trade_key,work_type) values ('soffit','soffit_fascia',null),('fascia','soffit_fascia',null),('capping','soffit_fascia',null),('trim','soffit_fascia',null),('shutter','siding',null),('shake','siding',null),('skylight','roofing',null),('flashing','roofing',null),('tarp','roofing',null),('chimney','other',null),('solar','other',null),('vent','other',null),('other','other',null),('downspout','gutters',null),('d. spout','gutters',null),('tarp','roofing',null) on conflict do nothing;
+alter table public.jobs add column if not exists trade_locked boolean not null default false, add column if not exists trade_source text;
+comment on column public.jobs.trade_locked is 'True once TradeDesk owns the project type: set when a trade is changed in the app or corrected from the Sales Log. A job with any client payment (first deposit) is also treated as owned. The GHL sweep/webhook never overwrite trade/trades/is_repair on an owned job.';
+alter table public.reconciliation_changes add column if not exists old_text text, add column if not exists new_text text;
+alter table public.reconciliation_changes drop constraint if exists reconciliation_changes_kind_check;
+alter table public.reconciliation_changes add constraint reconciliation_changes_kind_check check (kind in ('contract','payment','signed_date','trade','ghl_project_type'));;
