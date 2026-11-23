@@ -209,6 +209,7 @@ function suggestPaymentType(job, amount) {
 // stop competing for attention with work in progress.
 const DEAD_STATUSES = { lost: "Lost", abandoned: "Abandoned" };
 const deadStatus = (job) => (job && DEAD_STATUSES[job.ghlStatus]) || null;
+const LIVE_STATUSES = { open: "Open", won: "Won" };
 
 /**
  * Ageing rules, from the `job_age_rules` registry.
@@ -2041,6 +2042,7 @@ function JobDetailModal({ ctx, job, onClose }) {
                 <Wrench size={13} /> {job.isRepair ? "Repair" : "Mark as repair"}
               </button>
             ) : (job.isRepair && <span className="td-substage-chip"><Wrench size={12} /> Repair</span>)}
+            <JobLostControl ctx={ctx} job={job} />
           </div>
           {canManage ? (
           <div className="td-deal-fields">
@@ -2374,6 +2376,77 @@ function JobDetailModal({ ctx, job, onClose }) {
  * Office-only, like every other money control on this card. finalize_job_gp()
  * checks is_admin() in Postgres; this only decides what gets drawn.
  */
+/* ---- Mark lost / Reopen ---------------------------------------------------
+   Lost lives in ghl_status. Admins change it here through job_set_lost, which
+   locks the status (so the GHL sweep/webhook leave it alone), logs the change,
+   and queues the same status onto the GHL opportunity. Before asking, it pulls
+   what is at stake: money on the job, and whether the 2026 Sales Log agrees. */
+function JobLostControl({ ctx, job }) {
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
+  const dead = deadStatus(job);
+
+  if (!ctx.isAdmin) return dead ? <span className="td-linked-lost td-lost-chip">{dead}</span> : null;
+
+  const run = async (lost) => {
+    setBusy(true); setErr(""); setMsg("");
+    try {
+      const pv = await repo.jobStatusPreview(job.id);
+      const ref = jobRef(job) + " · " + job.customerName;
+      const lines = [];
+      if (lost) {
+        lines.push("Mark " + ref + " as LOST?");
+        lines.push("It drops out of Booked, the Monthly scorecard and Balances owed.");
+        const money_ = [];
+        if (Number(pv.collected)) money_.push("  • " + money(pv.collected) + " collected (" + pv.payment_count + " payment" + (pv.payment_count === 1 ? "" : "s") + ")");
+        if (Number(pv.vendor_total)) money_.push("  • " + money(pv.vendor_total) + " in vendor costs (" + pv.vendor_count + ")");
+        if (Number(pv.credit_total)) money_.push("  • " + money(pv.credit_total) + " in client credits (" + pv.credit_count + ")");
+        if (money_.length) {
+          lines.push("⚠ This job has money recorded:\n" + money_.join("\n") +
+            "\nThat money stays in Ledger › Payment reports (tagged Lost) but will not be in Balances owed. " +
+            "If a deposit was refunded or moved to another job, record that too.");
+        }
+        if (pv.sales_live) lines.push("The 2026 Sales Log still lists this sale as active. Mark it cancelled on the Sales tab so the two agree.");
+      } else {
+        const back = LIVE_STATUSES[pv.restore_status] || pv.restore_status;
+        lines.push("Reopen " + ref + "?");
+        lines.push("It goes back to " + back + " and counts again in Booked, the Monthly scorecard and Balances owed.");
+        if (pv.sales_cancelled) {
+          lines.push("⚠ The 2026 Sales Log marks this sale CANCELLED. The next sheet sync will mark the job lost again unless the Sales tab is changed first.");
+        }
+      }
+      lines.push(pv.has_opportunity
+        ? "GoHighLevel's opportunity will be set to " + (lost ? "Lost" : (LIVE_STATUSES[pv.restore_status] || pv.restore_status)) + " as well."
+        : "No GHL opportunity is linked, so nothing is sent to GoHighLevel.");
+      if (!confirm(lines.join("\n\n"))) return;
+
+      const res = await repo.setJobLost(job.id, lost);
+      await ctx.reload();
+      if (res && res.changed === false) setMsg("Already " + (DEAD_STATUSES[res.ghl_status] || LIVE_STATUSES[res.ghl_status] || res.ghl_status) + " — nothing changed.");
+      else if (res && res.ghl_queued && !res.ghl_kicked) setMsg("Saved. The GHL update is queued and will go out on the next send.");
+      else setMsg("");
+    } catch (e) {
+      setErr(e && e.message ? e.message : "That change was refused.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      {dead && <span className="td-linked-lost td-lost-chip">{dead}</span>}
+      <button type="button" className={cls("td-hold-toggle", dead ? "td-reopen-toggle" : "td-lost-toggle")}
+        disabled={busy} onClick={() => run(!dead)}
+        title={dead ? "Put this job back in play" : "The sale fell through: take it out of Booked, the Scorecard and Balances owed"}>
+        {dead ? <><RefreshCw size={13} /> {busy ? "Reopening…" : "Reopen"}</> : <><X size={13} /> {busy ? "Saving…" : "Mark lost"}</>}
+      </button>
+      {msg && <span className="td-cell-sub">{msg}</span>}
+      {err && <span className="td-text-red td-cell-sub">{err}</span>}
+    </>
+  );
+}
+
 function JobGpFinalize({ ctx, job, liveMargin, drifted }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
@@ -2895,6 +2968,10 @@ function buildLedgerRows(jobs) {
     rows.push({ ...row, when });
   };
   jobs.forEach((j) => {
+    // Read from the job as it is now, so a Reopen clears the tag by itself.
+    const dead = deadStatus(j);
+    const jobStatusKey = dead ? j.ghlStatus : "live";
+    const jobStatusLabel = dead || "Live";
     const tradeLabel = TRADES[j.trade] ? TRADES[j.trade].label : (j.trade || "—");
     const stageLabel = (STAGES.find((s) => s.key === j.stage) || {}).label || j.stage;
     (j.clientPayments || []).forEach((p) => push({
@@ -2904,7 +2981,7 @@ function buildLedgerRows(jobs) {
       method: p.method || "", vendor: "", category: "", status: "received",
       jobNumber: j.number, projectRef: j.ghlProjectDisplayId || "",
       customer: j.customerName, address: j.customerAddress || "",
-      tradeKey: j.trade, tradeLabel, stageKey: j.stage, stageLabel,
+      tradeKey: j.trade, tradeLabel, stageKey: j.stage, stageLabel, jobStatusKey, jobStatusLabel,
       fromCrm: Boolean(p.sourceRef), note: (p.note || "").replace(/^ADDED BY GHL — ?/, ""),
     }));
     (j.vendorPayments || []).forEach((p) => push({
@@ -2915,7 +2992,7 @@ function buildLedgerRows(jobs) {
       status: p.status || "pending",
       jobNumber: j.number, projectRef: j.ghlProjectDisplayId || "",
       customer: j.customerName, address: j.customerAddress || "",
-      tradeKey: j.trade, tradeLabel, stageKey: j.stage, stageLabel,
+      tradeKey: j.trade, tradeLabel, stageKey: j.stage, stageLabel, jobStatusKey, jobStatusLabel,
       fromCrm: false, note: p.note || "",
     }));
     (j.clientCredits || []).forEach((c) => push({
@@ -2925,7 +3002,7 @@ function buildLedgerRows(jobs) {
       method: "", vendor: "", category: "", status: "applied",
       jobNumber: j.number, projectRef: j.ghlProjectDisplayId || "",
       customer: j.customerName, address: j.customerAddress || "",
-      tradeKey: j.trade, tradeLabel, stageKey: j.stage, stageLabel,
+      tradeKey: j.trade, tradeLabel, stageKey: j.stage, stageLabel, jobStatusKey, jobStatusLabel,
       fromCrm: false, note: c.reason || "",
     }));
   });
@@ -2948,6 +3025,7 @@ const EXPORT_COLUMNS = [
   { key: "address",    header: "Address",       money: false },
   { key: "tradeLabel", header: "Trade",         money: false },
   { key: "stageLabel", header: "Stage",         money: false },
+  { key: "jobStatusLabel", header: "Job status", money: false },
   { key: "note",       header: "Note",          money: false },
 ];
 
@@ -3888,6 +3966,9 @@ function TransactionReport({ jobs }) {
   const [fVendor, setFVendor] = useState("");
   const [fCategory, setFCategory] = useState("");
   const [fStatus, setFStatus] = useState("");
+  // "" = every job (the default, so cash always reconciles); "live" hides
+  // lost/abandoned jobs; "dead" shows only them.
+  const [fJobStatus, setFJobStatus] = useState("");
   const [search, setSearch] = useState("");
   const [showRows, setShowRows] = useState(false);
   const [busy, setBusy] = useState("");
@@ -3922,6 +4003,8 @@ function TransactionReport({ jobs }) {
       if (fVendor && r.vendor !== fVendor) return false;
       if (fCategory && r.category !== fCategory) return false;
       if (fStatus && r.status !== fStatus) return false;
+      if (fJobStatus === "live" && r.jobStatusKey !== "live") return false;
+      if (fJobStatus === "dead" && r.jobStatusKey === "live") return false;
       if (q && !(String(r.customer).toLowerCase().includes(q) ||
                  String(r.vendor).toLowerCase().includes(q) ||
                  String(r.address).toLowerCase().includes(q) ||
@@ -3930,7 +4013,7 @@ function TransactionReport({ jobs }) {
                  String(r.projectRef).toLowerCase().includes(q))) return false;
       return true;
     }).sort((a, b) => b.when - a.when);
-  }, [allRows, from, to, showIn, showOut, showCredit, fType, fMethod, fTrade, fStage, fVendor, fCategory, fStatus, search]);
+  }, [allRows, from, to, showIn, showOut, showCredit, fType, fMethod, fTrade, fStage, fVendor, fCategory, fStatus, fJobStatus, search]);
 
   const groups = useMemo(() => {
     const g = GROUPINGS[groupBy] || GROUPINGS.none;
@@ -3954,6 +4037,10 @@ function TransactionReport({ jobs }) {
   const totalOut = rows.filter((r) => r.direction === "out").reduce((s, r) => s + r.amount, 0);
   const totalCredit = rows.filter((r) => r.direction === "credit").reduce((s, r) => s + r.amount, 0);
   const creditJobs = new Set(rows.filter((r) => r.direction === "credit").map((r) => r.jobNumber)).size;
+  // Rows on lost/abandoned jobs stay in every total above; this only says how
+  // many there are, because those jobs are missing from Balances owed.
+  const deadRows = rows.filter((r) => r.jobStatusKey !== "live");
+  const deadJobs = new Set(deadRows.map((r) => r.jobNumber)).size;
 
   const vendorNames = useMemo(
     () => [...new Set(allRows.filter((r) => r.vendor).map((r) => r.vendor))].sort(), [allRows]);
@@ -3978,9 +4065,9 @@ function TransactionReport({ jobs }) {
 
   const reset = () => {
     setFType(""); setFMethod(""); setFTrade(""); setFStage("");
-    setFVendor(""); setFCategory(""); setFStatus(""); setSearch("");
+    setFVendor(""); setFCategory(""); setFStatus(""); setFJobStatus(""); setSearch("");
   };
-  const activeFilters = [fType, fMethod, fTrade, fStage, fVendor, fCategory, fStatus, search].filter(Boolean).length;
+  const activeFilters = [fType, fMethod, fTrade, fStage, fVendor, fCategory, fStatus, fJobStatus, search].filter(Boolean).length;
 
   return (
     <div className="td-panel td-report">
@@ -4092,6 +4179,14 @@ function TransactionReport({ jobs }) {
             {STAGES.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
           </select>
         </label>
+        <label className="td-deal-field">
+          <span className="td-field-label">Job status</span>
+          <select className="td-select" value={fJobStatus} onChange={(e) => setFJobStatus(e.target.value)}>
+            <option value="">All jobs</option>
+            <option value="live">Hide lost jobs</option>
+            <option value="dead">Lost / abandoned only</option>
+          </select>
+        </label>
         <label className="td-deal-field td-report-search">
           <span className="td-field-label">Search</span>
           <input className="td-input" placeholder={showCredit ? "Customer, vendor, address, job #, credit reason" : "Customer, vendor, address, job #"} value={search}
@@ -4111,6 +4206,12 @@ function TransactionReport({ jobs }) {
         {showNet && <div title="Cash only — client credits are not money in or out"><span className="td-field-label">Net</span><strong className={totalIn - totalOut < 0 ? "td-text-red" : "td-text-green"}>{money(totalIn - totalOut)}</strong></div>}
         {showCredit && <div title="Taken off what clients owe. Not cash, not refunds."><span className="td-field-label">Credits applied</span><strong className="td-credit-text">{totalCredit ? "\u2212" + money(totalCredit) : money(0)}</strong></div>}
         {showCredit && <div><span className="td-field-label">Jobs credited</span><strong>{creditJobs}</strong></div>}
+        {deadRows.length > 0 && (
+          <div title="Included in the totals. These jobs are lost or abandoned, so they are not in Booked, the Scorecard or Balances owed.">
+            <span className="td-field-label">On lost jobs</span>
+            <strong className="td-text-red">{deadRows.length} row{deadRows.length === 1 ? "" : "s"} · {deadJobs} job{deadJobs === 1 ? "" : "s"}</strong>
+          </div>
+        )}
         {undated > 0 && (
           <div title="These have no usable payment date, so they cannot belong to any period.">
             <span className="td-field-label">Undated</span>
@@ -4186,7 +4287,7 @@ function TransactionReport({ jobs }) {
                         {r.direction === "in" ? "" : "\u2212"}{moneyDec(r.amount)}
                       </td>
                       <td>{r.customer}</td>
-                      <td>{jobNo(r.jobNumber)}</td>
+                      <td>{jobNo(r.jobNumber)}{r.jobStatusKey !== "live" && <span className="td-linked-lost" style={{ marginLeft: 6 }}>{r.jobStatusLabel}</span>}</td>
                       <td className="td-cell-sub">
                         {[r.method, r.vendor, r.direction === "out" ? r.status : null, r.direction === "credit" && r.note ? "\u201c" + r.note + "\u201d" : r.note]
                           .filter(Boolean).join(" · ")}
@@ -5426,6 +5527,9 @@ function GlobalStyle() {
         font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; }
       .td-hold-toggle:hover { border-color: #C6BCA9; }
       .td-hold-toggle.active { background: #FDF3E3; border-color: #E6D3A6; color: #8A5A12; }
+      .td-hold-toggle.td-lost-toggle:hover { border-color: #D9A497; color: #9A2E1C; }
+      .td-hold-toggle:disabled { opacity: .6; cursor: default; }
+      .td-lost-chip { font-size: 11.5px; padding: 3px 8px; align-self: center; }
       /* Job type: sits beside the repair toggle and reads as its sibling. */
       .td-type-select { padding: 6px 10px; border: 1px solid #DCD5C9; background: #FDFCFA; color: #6B6459;
         border-radius: 7px; font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; }

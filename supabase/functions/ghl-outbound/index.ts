@@ -16,6 +16,10 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
  * is not proof the change applied — without this check a write that is ignored,
  * or reverted moments later by a workflow, would be logged as success while
  * nothing moved.
+ *
+ * A row with no target_stage_name is a STATUS-ONLY write (TradeDesk marked the
+ * job lost, or reopened it). Same rules: read first and skip if GHL already has
+ * that status, write, then re-read and confirm the status stuck.
  */
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
@@ -62,6 +66,63 @@ const patchRow = (id: string, patch: Record<string, unknown>) =>
   fetch(SUPABASE_URL + "/rest/v1/ghl_outbound?id=eq." + id,
         { method: "PATCH", headers: svc, body: JSON.stringify(patch) });
 
+const STATUSES = ["open", "won", "lost", "abandoned"];
+
+/** Set only the opportunity's status. Read, skip-if-same, write, confirm. */
+async function writeStatus(row: any, dry: boolean) {
+  const want = String(row.set_status || "").toLowerCase();
+  if (!STATUSES.includes(want)) {
+    await patchRow(row.id, { status: "failed", attempts: row.attempts + 1,
+      last_error: "status-only row with no valid set_status (" + row.set_status + ")" });
+    return { id: row.id, outcome: "failed", reason: "bad status" };
+  }
+
+  const cur = await ghl("/opportunities/" + row.opportunity_id);
+  if (!cur.ok || !cur.body?.opportunity) {
+    const attempts = row.attempts + 1;
+    await patchRow(row.id, { status: attempts >= MAX_ATTEMPTS ? "failed" : "pending",
+      attempts, last_error: "read failed: HTTP " + cur.status });
+    return { id: row.id, outcome: "retry", status: cur.status };
+  }
+  const opp = cur.body.opportunity;
+  const had = String(opp.status || "").toLowerCase();
+
+  if (had === want) {
+    await patchRow(row.id, { status: "skipped", attempts: row.attempts + 1,
+      sent_at: new Date().toISOString(), last_error: null, note: "already " + want });
+    return { id: row.id, outcome: "already-there", name: opp.name, status: want };
+  }
+  if (dry) return { id: row.id, outcome: "would-set-status", name: opp.name, from: had, to: want };
+
+  const payload: Record<string, unknown> = { status: want };
+  // Sent back explicitly so a status change can never blank the card's owner.
+  if (opp.assignedTo) payload.assignedTo = opp.assignedTo;
+  const put = await ghl("/opportunities/" + row.opportunity_id, { method: "PUT", body: JSON.stringify(payload) });
+  if (!put.ok) {
+    const attempts = row.attempts + 1;
+    await patchRow(row.id, { status: attempts >= MAX_ATTEMPTS ? "failed" : "pending",
+      attempts, last_error: "HTTP " + put.status + " " + JSON.stringify(put.body).slice(0, 200) });
+    return { id: row.id, outcome: "retry", status: put.status, body: put.body };
+  }
+
+  // CONFIRM. A 200 is not proof the status changed.
+  await sleep(1200);
+  const after = await ghl("/opportunities/" + row.opportunity_id);
+  const now = String(after.body?.opportunity?.status || "").toLowerCase();
+  if (now === want) {
+    await patchRow(row.id, { status: "sent", attempts: row.attempts + 1,
+      sent_at: new Date().toISOString(), last_error: null,
+      note: "status " + (had || "(none)") + " -> " + want + " (confirmed)" });
+    return { id: row.id, outcome: "status-set", name: opp.name, from: had, to: want };
+  }
+  const attempts = row.attempts + 1;
+  await patchRow(row.id, { status: attempts >= MAX_ATTEMPTS ? "failed" : "pending", attempts,
+    last_error: "GHL accepted the write (HTTP 200) but the status is " +
+      (after.ok ? (now || "(none)") : "(re-read failed: HTTP " + after.status + ")") + ", not " + want +
+      ". Something is reverting it — check for a GHL workflow on opportunity status." });
+  return { id: row.id, outcome: "not-applied", name: opp.name, expected: want, actual: now };
+}
+
 Deno.serve(async (req: Request) => {
   const url = new URL(req.url);
   const auth = req.headers.get("authorization") || "";
@@ -89,15 +150,23 @@ Deno.serve(async (req: Request) => {
 
   if (!pending.length) return json(200, { drained: 0, note: "nothing pending" });
 
+  const results: any[] = [];
+
+  // Status-only rows first: they do not need the pipeline at all.
+  for (const row of pending.filter((r) => !r.target_stage_name)) {
+    results.push(await writeStatus(row, dry));
+    await sleep(150);
+  }
+  const stageRows = pending.filter((r) => r.target_stage_name);
+  if (!stageRows.length) return json(200, { drained: pending.length, dryRun: dry, results });
+
   const pipes = await ghl("/opportunities/pipelines?locationId=" + LOCATION);
   const prod = (pipes.body?.pipelines || []).find((p: any) => p.id === PIPELINE);
-  if (!prod) return json(200, { error: "could not read the Production pipeline", status: pipes.status });
+  if (!prod) return json(200, { error: "could not read the Production pipeline", status: pipes.status, results });
   const stageId = new Map<string, string>((prod.stages || []).map((s: any) => [norm(s.name), s.id]));
   const stageNameById = new Map<string, string>((prod.stages || []).map((s: any) => [s.id, s.name]));
 
-  const results: any[] = [];
-
-  for (const row of pending) {
+  for (const row of stageRows) {
     const target = stageId.get(norm(row.target_stage_name));
     if (!target) {
       await patchRow(row.id, { status: "failed", attempts: row.attempts + 1,

@@ -620,6 +620,18 @@ const supabaseRepo = {
     return rows.length ? scheduleReviewFromRow(rows[0]) : null;
   },
 
+  // Admin-only in the database. What is at stake before marking a job lost or
+  // reopening it: money on the job, the Sales Log's view, the status to restore.
+  async jobStatusPreview(jobId) {
+    return await supabase.rpc("job_status_preview", { p_job: jobId }).then(unwrap);
+  },
+
+  // Admin-only. lost=true marks the job lost; false reopens it to the status it
+  // had before. Locks the status and queues the same change onto GHL.
+  async setJobLost(jobId, lost, note) {
+    return await supabase.rpc("job_set_lost", { p_job: jobId, p_lost: Boolean(lost), p_note: note || null }).then(unwrap);
+  },
+
   async finalizeGp(jobId) {
     return await supabase.rpc("finalize_job_gp", { p_job: jobId }).then(unwrap);
   },
