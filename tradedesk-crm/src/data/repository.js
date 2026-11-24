@@ -83,6 +83,10 @@ const jobFromRow = (r) => ({
   // Admin-only by RLS, so always empty for a project manager.
   clientCredits: [],
   vendorPayments: [],
+  // Vendor credits: money a vendor takes back off this job's cost (credit memo,
+  // returned materials). Own table, stored positive, shown negative; lowers
+  // vendor cost and never counts as cash. Admin-only by RLS.
+  vendorCredits: [],
   // Project manager / installers / services working this job. Filled by
   // loadAll from job_assignments; the calendar reads the same rows.
   assignments: [],
@@ -171,6 +175,19 @@ const clientCreditFromRow = (r) => ({
   createdAt: toIso(r.created_at),
 });
 
+const vendorCreditFromRow = (r) => ({
+  id: r.id,
+  vendorName: r.vendor_name,
+  amount: Number(r.amount || 0),
+  date: toIso(r.credit_date),
+  reason: r.reason || "",
+  // open_bill (lowers an unpaid bill) / on_account (used on a future invoice)
+  // / refund (vendor sends a check). Reported as a credit either way, not cash.
+  settlement: r.settlement || "on_account",
+  vendorPaymentId: r.vendor_payment_id || null,
+  createdAt: toIso(r.created_at),
+});
+
 const vendorPaymentFromRow = (r) => ({
   id: r.id,
   vendorName: r.vendor_name,
@@ -207,6 +224,8 @@ const finalizationFromRow = (r) => ({
   vendorPaid: Number(r.vendor_paid || 0),
   vendorPending: Number(r.vendor_pending || 0),
   vendorTotal: Number(r.vendor_total || 0),
+  // Since 2026-11-24 vendor_total in a snapshot is net of this.
+  vendorCredits: Number(r.vendor_credits || 0),
   margin: Number(r.margin || 0),
   marginPct: Number(r.margin_pct || 0),
   priorMargin: r.prior_margin === null || r.prior_margin === undefined ? null : Number(r.prior_margin),
@@ -295,7 +314,7 @@ const supabaseRepo = {
 
   async loadAll() {
     const [jobRows, vendorRows, cpRows, vpRows, tradeRows, flagRows, payTypeRows, ageRuleRows,
-           roleRows, assigneeRows, assignmentRows, finalRows, appRole, creditRows, jobTypeRows] = await Promise.all([
+           roleRows, assigneeRows, assignmentRows, finalRows, appRole, creditRows, jobTypeRows, vendorCreditRows] = await Promise.all([
       supabase.from("jobs").select("*").order("number", { ascending: false }).then(unwrap),
       supabase.from("vendors").select("*").order("name", { ascending: true }).then(unwrap),
       supabase.from("client_payments").select("*").order("payment_date", { ascending: false }).then(unwrap),
@@ -325,6 +344,8 @@ const supabaseRepo = {
       supabase.from("client_credits").select("*").order("credit_date", { ascending: false }).then(unwrap),
       // Renew / Rehab / Yoak PM. Configuration like trades: one row per type.
       supabase.from("job_types").select("*").eq("active", true).order("sort").then(unwrap),
+      // Admin-only by RLS, like client credits.
+      supabase.from("vendor_credits").select("*").order("credit_date", { ascending: false }).then(unwrap),
     ]);
 
     const jobs = jobRows.map(jobFromRow);
@@ -332,6 +353,7 @@ const supabaseRepo = {
     cpRows.forEach((r) => byId.get(r.job_id)?.clientPayments.push(clientPaymentFromRow(r)));
     creditRows.forEach((r) => byId.get(r.job_id)?.clientCredits.push(clientCreditFromRow(r)));
     vpRows.forEach((r) => byId.get(r.job_id)?.vendorPayments.push(vendorPaymentFromRow(r)));
+    vendorCreditRows.forEach((r) => byId.get(r.job_id)?.vendorCredits.push(vendorCreditFromRow(r)));
     assignmentRows.forEach((r) => byId.get(r.job_id)?.assignments.push(assignmentFromRow(r)));
     finalRows.forEach((r) => { const j = byId.get(r.job_id); if (j) j.finalization = finalizationFromRow(r); });
 
@@ -403,6 +425,36 @@ const supabaseRepo = {
     await supabase.from("client_credits").delete().eq("id", creditId).then(unwrap);
   },
 
+  // Same name-snapshot + directory-link rule as createVendorPayment.
+  // created_by is left to its auth.uid() default.
+  async createVendorCredit(jobId, c) {
+    const match = await supabase
+      .from("vendors")
+      .select("id")
+      .eq("name", c.vendorName)
+      .maybeSingle()
+      .then(unwrap);
+
+    await supabase
+      .from("vendor_credits")
+      .insert({
+        id: c.id,
+        job_id: jobId,
+        vendor_id: match?.id ?? null,
+        vendor_name: c.vendorName,
+        amount: Number(c.amount) || 0,
+        credit_date: toIso(c.date),
+        reason: (c.reason || "").trim(),
+        settlement: c.settlement || "on_account",
+        vendor_payment_id: c.vendorPaymentId || null,
+      })
+      .then(unwrap);
+  },
+
+  async deleteVendorCredit(_jobId, creditId) {
+    await supabase.from("vendor_credits").delete().eq("id", creditId).then(unwrap);
+  },
+
   async createVendorPayment(jobId, p) {
     // vendor_name is stored as a snapshot on the payment; vendor_id links to
     // the directory when a vendor of that name exists, and is simply null for
@@ -460,6 +512,11 @@ const supabaseRepo = {
     if (patch.name !== undefined) {
       await supabase
         .from("vendor_payments")
+        .update({ vendor_name: patch.name })
+        .eq("vendor_id", id)
+        .then(unwrap);
+      await supabase
+        .from("vendor_credits")
         .update({ vendor_name: patch.name })
         .eq("vendor_id", id)
         .then(unwrap);
@@ -731,6 +788,7 @@ const localRepo = {
       cache.assignees = cache.assignees || [];
       cache.jobs = (cache.jobs || []).map((j) => ({
         ...j, assignments: j.assignments || [], clientCredits: j.clientCredits || [],
+        vendorCredits: j.vendorCredits || [],
         finalization: j.finalization || null }));
     }
     return cache;
@@ -762,6 +820,12 @@ const localRepo = {
   },
   async deleteClientCredit(jobId, creditId) {
     return mapJob(jobId, (j) => ({ ...j, clientCredits: (j.clientCredits || []).filter((c) => c.id !== creditId) }));
+  },
+  async createVendorCredit(jobId, c) {
+    return mapJob(jobId, (j) => ({ ...j, vendorCredits: [c, ...(j.vendorCredits || [])] }));
+  },
+  async deleteVendorCredit(jobId, creditId) {
+    return mapJob(jobId, (j) => ({ ...j, vendorCredits: (j.vendorCredits || []).filter((c) => c.id !== creditId) }));
   },
   async createVendorPayment(jobId, p) {
     return mapJob(jobId, (j) => ({ ...j, vendorPayments: [p, ...(j.vendorPayments || [])] }));

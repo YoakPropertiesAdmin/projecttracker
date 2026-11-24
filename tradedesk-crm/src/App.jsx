@@ -504,7 +504,29 @@ const toCents = (n) => Math.round((Number(n) || 0) * 100) / 100;
 const clientBalance = (job) => toCents(Number(job.contractAmount || 0) - clientReceived(job) - clientCredited(job));
 const vendorPaid = (job) => (job.vendorPayments || []).filter((p) => p.status === "paid").reduce((s, p) => s + Number(p.amount || 0), 0);
 const vendorPending = (job) => (job.vendorPayments || []).filter((p) => p.status === "pending").reduce((s, p) => s + Number(p.amount || 0), 0);
-const vendorTotal = (job) => vendorPaid(job) + vendorPending(job);
+// Vendor credits (2026-11-24): money a vendor takes back off this job's cost
+// (credit memo, returned materials). Own table, stored positive, shown as
+// −$. Not cash. vendorTotal is NET of them — the same as job_financials, so
+// margin, GP finalization and the Scorecard agree with the job card.
+const vendorCredited = (job) => (job.vendorCredits || []).reduce((s, c) => s + Number(c.amount || 0), 0);
+const vendorGross = (job) => vendorPaid(job) + vendorPending(job);
+const vendorTotal = (job) => toCents(vendorGross(job) - vendorCredited(job));
+// How each vendor credit comes back to us. All three are reported as credits,
+// never as cash (Joshua, 2026-11-24).
+const VENDOR_CREDIT_SETTLEMENTS = {
+  open_bill: { label: "Open bill", long: "Lowers an unpaid bill" },
+  on_account: { label: "On account", long: "Credit with the vendor for a future invoice" },
+  refund: { label: "Refund check", long: "Vendor is sending a check" },
+};
+const settlementLabel = (k) => (VENDOR_CREDIT_SETTLEMENTS[k] || VENDOR_CREDIT_SETTLEMENTS.on_account).label;
+// Open-bill credits tied to a bill, so the bill (and "owed") can show net.
+const creditsAgainstBill = (job, billId) => (job.vendorCredits || [])
+  .filter((c) => c.settlement === "open_bill" && c.vendorPaymentId === billId)
+  .reduce((s, c) => s + Number(c.amount || 0), 0);
+// What we still owe vendors on this job: pending bills less the open-bill
+// credits taken against them (never below zero per bill).
+const vendorOwed = (job) => toCents((job.vendorPayments || []).filter((p) => p.status === "pending")
+  .reduce((s, p) => s + Math.max(0, Number(p.amount || 0) - creditsAgainstBill(job, p.id)), 0));
 const jobMargin = (job) => netContract(job) - vendorTotal(job);
 const jobMarginPct = (job) => (netContract(job) ? jobMargin(job) / netContract(job) : 0);
 // Credits count toward "covered" here, so a job settled by payment + credit
@@ -892,14 +914,28 @@ export default function App() {
   // calendar asks for them once per block. A map beats a find() per render.
   const assigneeById = useMemo(() => new Map(assignees.map((a) => [a.id, a])), [assignees]);
 
+  // Per vendor: paid, pending (gross bills), credits, and owed = pending less
+  // the open-bill credits taken against those bills. onAccount is credit the
+  // vendor still holds for us; refund is credit coming back as a check.
   const vendorSpend = useMemo(() => {
     const map = {};
-    vendors.forEach((v) => { map[v.name] = { paid: 0, pending: 0, jobCount: 0, jobIds: new Set() }; });
+    const blank = () => ({ paid: 0, pending: 0, owed: 0, credits: 0, onAccount: 0, refund: 0, jobCount: 0, jobIds: new Set() });
+    vendors.forEach((v) => { map[v.name] = blank(); });
     jobs.forEach((j) => {
       (j.vendorPayments || []).forEach((p) => {
-        if (!map[p.vendorName]) map[p.vendorName] = { paid: 0, pending: 0, jobCount: 0, jobIds: new Set() };
-        map[p.vendorName][p.status === "paid" ? "paid" : "pending"] += Number(p.amount || 0);
-        map[p.vendorName].jobIds.add(j.id);
+        if (!map[p.vendorName]) map[p.vendorName] = blank();
+        const e = map[p.vendorName];
+        e[p.status === "paid" ? "paid" : "pending"] += Number(p.amount || 0);
+        if (p.status === "pending") e.owed += Math.max(0, Number(p.amount || 0) - creditsAgainstBill(j, p.id));
+        e.jobIds.add(j.id);
+      });
+      (j.vendorCredits || []).forEach((c) => {
+        if (!map[c.vendorName]) map[c.vendorName] = blank();
+        const e = map[c.vendorName];
+        e.credits += Number(c.amount || 0);
+        if (c.settlement === "on_account") e.onAccount += Number(c.amount || 0);
+        if (c.settlement === "refund") e.refund += Number(c.amount || 0);
+        e.jobIds.add(j.id);
       });
     });
     Object.values(map).forEach((v) => { v.jobCount = v.jobIds.size; });
@@ -983,6 +1019,16 @@ export default function App() {
     persist(() => repo.deleteClientCredit(jobId, creditId), "Deleting the client credit");
   };
 
+  const addVendorCredit = (jobId, credit) => {
+    const c = { id: newId(), date: new Date().toISOString(), reason: "", settlement: "on_account", vendorPaymentId: null, ...credit };
+    setData((prev) => ({ ...prev, jobs: prev.jobs.map((j) => (j.id === jobId ? { ...j, vendorCredits: [c, ...(j.vendorCredits || [])] } : j)) }));
+    persist(() => repo.createVendorCredit(jobId, c), "The vendor credit");
+  };
+  const deleteVendorCredit = (jobId, creditId) => {
+    setData((prev) => ({ ...prev, jobs: prev.jobs.map((j) => (j.id === jobId ? { ...j, vendorCredits: (j.vendorCredits || []).filter((c) => c.id !== creditId) } : j)) }));
+    persist(() => repo.deleteVendorCredit(jobId, creditId), "Deleting the vendor credit");
+  };
+
   const addVendorPayment = (jobId, payment) => {
     const p = { id: newId(), date: new Date().toISOString(), status: "pending", ...payment };
     setData((prev) => ({ ...prev, jobs: prev.jobs.map((j) => (j.id === jobId ? { ...j, vendorPayments: [p, ...(j.vendorPayments || [])] } : j)) }));
@@ -998,7 +1044,13 @@ export default function App() {
     persist(() => repo.updateVendorPayment(jobId, paymentId, patch), "The vendor payment update");
   };
   const deleteVendorPayment = (jobId, paymentId) => {
-    setData((prev) => ({ ...prev, jobs: prev.jobs.map((j) => (j.id === jobId ? { ...j, vendorPayments: (j.vendorPayments || []).filter((p) => p.id !== paymentId) } : j)) }));
+    // A credit taken against this bill stays on the job; the database clears
+    // its link (ON DELETE SET NULL), so clear it here too.
+    setData((prev) => ({ ...prev, jobs: prev.jobs.map((j) => (j.id === jobId ? {
+      ...j,
+      vendorPayments: (j.vendorPayments || []).filter((p) => p.id !== paymentId),
+      vendorCredits: (j.vendorCredits || []).map((c) => (c.vendorPaymentId === paymentId ? { ...c, vendorPaymentId: null } : c)),
+    } : j)) }));
     persist(() => repo.deleteVendorPayment(jobId, paymentId), "Deleting the vendor payment");
   };
 
@@ -1021,6 +1073,8 @@ export default function App() {
             ...j,
             vendorPayments: (j.vendorPayments || []).map((p) =>
               p.vendorName === previousName ? { ...p, vendorName: patch.name } : p),
+            vendorCredits: (j.vendorCredits || []).map((c) =>
+              c.vendorName === previousName ? { ...c, vendorName: patch.name } : c),
           }))
         : prev.jobs,
     }));
@@ -1122,7 +1176,7 @@ export default function App() {
     reviewRows, reviewRecent, reviewLoading, reviewError, loadReview,
     addJob, updateJob, deleteJob,
     addClientPayment, deleteClientPayment, addClientCredit, deleteClientCredit,
-    addVendorPayment, updateVendorPayment, deleteVendorPayment,
+    addVendorPayment, updateVendorPayment, deleteVendorPayment, addVendorCredit, deleteVendorCredit,
     addVendor, updateVendor, deleteVendor,
     addAssignment, updateAssignment, removeAssignment,
     selectedJobId, setSelectedJobId, showAddJob, setShowAddJob, showVendorForm, setShowVendorForm,
@@ -1283,7 +1337,7 @@ function DashboardView({ ctx, setView }) {
   const activeJobs = jobs.filter((j) => j.stage !== "closed");
   const activeContractValue = activeJobs.reduce((s, j) => s + Number(j.contractAmount || 0), 0);
   const arOutstanding = jobs.reduce((s, j) => s + Math.max(0, clientBalance(j)), 0);
-  const apOutstanding = jobs.reduce((s, j) => s + vendorPending(j), 0);
+  const apOutstanding = jobs.reduce((s, j) => s + vendorOwed(j), 0);
 
   const jobsByStage = STAGES.map((s) => ({
     label: s.label,
@@ -1300,6 +1354,7 @@ function DashboardView({ ctx, setView }) {
   jobs.forEach((j) => {
     (j.clientPayments || []).forEach((p) => activity.push({ kind: "client", jobId: j.id, jobLabel: jobNo(j.number) + " · " + j.customerName, amount: p.amount, date: p.date, note: p.note }));
     (j.vendorPayments || []).forEach((p) => activity.push({ kind: "vendor", jobId: j.id, jobLabel: jobNo(j.number) + " · " + j.customerName, amount: p.amount, date: p.date, note: p.vendorName, status: p.status }));
+    (j.vendorCredits || []).forEach((c) => activity.push({ kind: "vcredit", jobId: j.id, jobLabel: jobNo(j.number) + " · " + j.customerName, amount: c.amount, date: c.date, note: c.vendorName, status: c.settlement }));
   });
   activity.sort((a, b) => new Date(b.date) - new Date(a.date));
   const recentActivity = activity.slice(0, 6);
@@ -1358,7 +1413,9 @@ function DashboardView({ ctx, setView }) {
                   <div className="td-comm-icon">{a.kind === "client" ? <Wallet size={13} /> : <HandCoins size={13} />}</div>
                   <div className="td-list-row-main">
                     <div className="td-list-row-title">
-                      {a.kind === "client" ? "Received " + money(a.amount) + " from client" : (a.status === "paid" ? "Paid " : "Bill logged: ") + money(a.amount) + " to " + a.note}
+                      {a.kind === "client" ? "Received " + money(a.amount) + " from client"
+                        : a.kind === "vcredit" ? "Vendor credit: " + money(a.amount) + " from " + a.note + " (" + settlementLabel(a.status) + ")"
+                        : (a.status === "paid" ? "Paid " : "Bill logged: ") + money(a.amount) + " to " + a.note}
                     </div>
                     <div className="td-list-row-sub">{a.jobLabel}{a.kind === "client" && a.note ? " · " + a.note : ""}</div>
                   </div>
@@ -1495,7 +1552,7 @@ function JobsView({ ctx }) {
               <tbody>
                 {[...visible].sort(byColumnOrder).map((j) => {
                   const bal = clientBalance(j);
-                  const owed = vendorPending(j);
+                  const owed = vendorOwed(j);
                   return (
                     <tr key={j.id} className="td-table-row" onClick={() => setSelectedJobId(j.id)}>
                       <td className="td-mono">
@@ -1551,7 +1608,7 @@ function JobTicket({ job, ctx, dragging, onDragStart, onDragEnd }) {
   // full balance due on every card. The contract amount stays — that is the
   // job's worth, which they are meant to see.
   const bal = ctx.isAdmin ? clientBalance(job) : 0;
-  const owed = ctx.isAdmin ? vendorPending(job) : 0;
+  const owed = ctx.isAdmin ? vendorOwed(job) : 0;
   // null (not paid in full), "unset", "in_progress" or "completed". Only
   // "completed" turns the card green.
   const paidState = ctx.isAdmin ? paidStatusOf(job) : null;
@@ -1822,7 +1879,7 @@ function LinkedJobs({ ctx, job }) {
 }
 
 function JobDetailModal({ ctx, job, onClose }) {
-  const { updateJob, deleteJob, addClientPayment, deleteClientPayment, addClientCredit, deleteClientCredit, addVendorPayment, updateVendorPayment, deleteVendorPayment, vendorNames } = ctx;
+  const { updateJob, deleteJob, addClientPayment, deleteClientPayment, addClientCredit, deleteClientCredit, addVendorPayment, updateVendorPayment, deleteVendorPayment, addVendorCredit, deleteVendorCredit, vendorNames } = ctx;
   const [notes, setNotes] = useState(job?.notes || "");
   const [name, setName] = useState(job?.customerName || "");
   const [phone, setPhone] = useState(job?.customerPhone || "");
@@ -1834,6 +1891,10 @@ function JobDetailModal({ ctx, job, onClose }) {
   const [ccOpen, setCcOpen] = useState(false);
   const [ccForm, setCcForm] = useState({ amount: "", date: new Date().toISOString().slice(0, 10), reason: "" });
   const [vpForm, setVpForm] = useState({ vendorName: "", category: VENDOR_CATEGORIES[0], amount: "", date: new Date().toISOString().slice(0, 10), status: "pending", note: "" });
+  // The Vendor credit form — closed by default, like Apply credit.
+  const blankVc = () => ({ vendorName: "", amount: "", date: new Date().toISOString().slice(0, 10), reason: "", settlement: "on_account", vendorPaymentId: "" });
+  const [vcOpen, setVcOpen] = useState(false);
+  const [vcForm, setVcForm] = useState(blankVc);
 
   if (!job) return null;
 
@@ -1907,6 +1968,8 @@ function JobDetailModal({ ctx, job, onClose }) {
   const balance = clientBalance(job);
   const vPaid = vendorPaid(job);
   const vPending = vendorPending(job);
+  const vOwed = vendorOwed(job);
+  const vCredited = vendorCredited(job);
   const margin = jobMargin(job);
   const marginPercent = jobMarginPct(job);
   const fin = job.finalization || null;
@@ -1975,6 +2038,39 @@ function JobDetailModal({ ctx, job, onClose }) {
     )) return;
     addVendorPayment(job.id, { vendorName: vpForm.vendorName.trim(), category: vpForm.category, amount: vpAmount, date: new Date(vpForm.date).toISOString(), status: vpForm.status, note: vpForm.note.trim() });
     setVpForm({ vendorName: "", category: vpForm.category, amount: "", date: new Date().toISOString().slice(0, 10), status: "pending", note: "" });
+  };
+
+  // ---- Vendor credit (2026-11-24) ----
+  // Vendors already on this job come first in the picker; any vendor is allowed.
+  const jobVendorNames = [...new Set((job.vendorPayments || []).map((p) => p.vendorName).filter(Boolean))];
+  const vcVendorOptions = [...jobVendorNames, ...vendorNames.filter((n) => !jobVendorNames.includes(n))];
+  const vcVendor = vcForm.vendorName.trim();
+  const vcAmount = Number(vcForm.amount) || 0;
+  // Net already booked with this vendor on this job, before this credit.
+  const vcVendorBills = (job.vendorPayments || []).filter((p) => p.vendorName === vcVendor);
+  const vcVendorNet = toCents(vcVendorBills.reduce((s, p) => s + Number(p.amount || 0), 0) -
+    (job.vendorCredits || []).filter((c) => c.vendorName === vcVendor).reduce((s, c) => s + Number(c.amount || 0), 0));
+  // Open bill: only this vendor's unpaid bills on this job can be picked.
+  const vcOpenBills = vcVendorBills.filter((p) => p.status === "pending");
+  const vcBill = vcForm.settlement === "open_bill" ? vcOpenBills.find((p) => p.id === vcForm.vendorPaymentId) : null;
+  const vcBillLeft = vcBill ? toCents(Number(vcBill.amount || 0) - creditsAgainstBill(job, vcBill.id)) : 0;
+  const vcMarginAfter = margin + vcAmount;
+  const vcValid = vcVendor !== "" && vcAmount > 0 && vcForm.reason.trim() !== "" && Boolean(vcForm.date) &&
+    (vcForm.settlement !== "open_bill" || Boolean(vcBill));
+
+  const submitVendorCredit = () => {
+    if (!vcValid) return;
+    addVendorCredit(job.id, {
+      vendorName: vcVendor,
+      amount: vcAmount,
+      // Noon local so the day doesn't slide back in UTC (same as client credits).
+      date: new Date(vcForm.date + "T12:00:00").toISOString(),
+      reason: vcForm.reason.trim(),
+      settlement: vcForm.settlement,
+      vendorPaymentId: vcForm.settlement === "open_bill" && vcBill ? vcBill.id : null,
+    });
+    setVcForm(blankVc());
+    setVcOpen(false);
   };
 
   return (
@@ -2147,8 +2243,15 @@ function JobDetailModal({ ctx, job, onClose }) {
           </div>
           <div className="td-payment-summary-item">
             <span className="td-field-label">Vendor costs owed</span>
-            <span className={cls("td-payment-summary-value", vPending > 0 && "td-text-red")}>{money(vPending)}</span>
+            <span className={cls("td-payment-summary-value", vOwed > 0 && "td-text-red")}>{money(vOwed)}</span>
+            {vOwed < vPending - 0.005 && <span className="td-cell-sub">after {money(vPending - vOwed)} in open-bill credits</span>}
           </div>
+          {vCredited > 0 && (
+            <div className="td-payment-summary-item">
+              <span className="td-field-label">Vendor credits</span>
+              <span className="td-payment-summary-value td-credit-text">{creditMoney(vCredited)}</span>
+            </div>
+          )}
           <div className="td-payment-summary-item">
             <span className="td-field-label">{fin ? "Final GP" : "Margin"}</span>
             <span className={cls("td-payment-summary-value", (fin ? fin.margin : margin) < 0 && "td-text-red")}>
@@ -2296,22 +2399,56 @@ function JobDetailModal({ ctx, job, onClose }) {
 
           <div className="td-job-detail-col">
             <div className="td-drawer-section-title" style={{ borderTop: "none", paddingTop: 0 }}>Vendor payments</div>
-            {(job.vendorPayments || []).length === 0 ? <div className="td-muted-line">No vendor costs logged yet.</div> : (
+            {vCredited > 0 && (
+              <div className="td-cell-sub td-vendor-net-strip">
+                Vendor bills <strong>{moneyDec(vendorGross(job))}</strong> · Credits <strong className="td-credit-text">{creditMoney(vCredited)}</strong> · Net cost <strong>{signedMoneyDec(vendorTotal(job))}</strong>
+              </div>
+            )}
+            {(job.vendorPayments || []).length === 0 && (job.vendorCredits || []).length === 0 ? <div className="td-muted-line">No vendor costs logged yet.</div> : (
               <div className="td-payment-list">
-                {[...job.vendorPayments].sort((a, b) => new Date(b.date) - new Date(a.date)).map((p) => (
+                {[...(job.vendorPayments || []).map((p) => ({ ...p, _kind: "bill" })),
+                  ...(job.vendorCredits || []).map((c) => ({ ...c, _kind: "vcredit" }))]
+                  .sort((a, b) => new Date(b.date) - new Date(a.date)).map((p) => p._kind === "vcredit" ? (
+                  <div key={"vc-" + p.id} className="td-payment-row td-credit-row">
+                    <div className="td-payment-row-main">
+                      <div className="td-payment-row-top">
+                        <span className="td-payment-amount td-credit-text">{creditMoney(p.amount)}</span>
+                        <span className="td-cell-sub">{p.vendorName}</span>
+                      </div>
+                      <div className="td-cell-sub">
+                        <span className="td-paytype-chip td-credit-chip" style={{ marginRight: 6 }} title={(VENDOR_CREDIT_SETTLEMENTS[p.settlement] || {}).long}>Vendor credit · {settlementLabel(p.settlement)}</span>
+                        {fmtDate(p.date)}{p.reason ? " \u00b7 \u201c" + p.reason + "\u201d" : ""}
+                        {(() => {
+                          if (p.settlement !== "open_bill") return "";
+                          const b = (job.vendorPayments || []).find((x) => x.id === p.vendorPaymentId);
+                          return b ? " \u00b7 against the " + moneyDec(b.amount) + " bill of " + fmtDate(b.date) : " \u00b7 bill no longer on the job";
+                        })()}
+                      </div>
+                    </div>
+                    <button className="td-iconbtn td-iconbtn-danger" onClick={() => {
+                      if (confirm("Delete this " + creditMoney(p.amount) + " credit from " + p.vendorName + (p.reason ? " (\u201c" + p.reason + "\u201d)" : "") + "? The job's vendor cost will go back up by " + moneyDec(p.amount) + ".")) deleteVendorCredit(job.id, p.id);
+                    }} aria-label="Delete vendor credit"><Trash2 size={12} /></button>
+                  </div>
+                ) : (
                   <div key={p.id} className="td-payment-row">
                     <div className="td-payment-row-main">
                       <div className="td-payment-row-top">
                         <span className="td-payment-amount">{moneyDec(p.amount)}</span>
                         <span className="td-cell-sub">{p.vendorName}</span>
                       </div>
-                      <div className="td-cell-sub">{p.category} · {fmtDate(p.date)}{p.note ? " · " + p.note : ""}</div>
+                      <div className="td-cell-sub">{p.category} · {fmtDate(p.date)}{p.note ? " · " + p.note : ""}
+                        {creditsAgainstBill(job, p.id) > 0 && <> · <span className="td-credit-text">{creditMoney(creditsAgainstBill(job, p.id))} credited</span></>}
+                      </div>
                     </div>
                     <button className={cls("td-toggle-chip", p.status === "paid" && "active")} style={{ padding: "4px 8px", fontSize: 11 }}
                       onClick={() => updateVendorPayment(job.id, p.id, { status: p.status === "paid" ? "pending" : "paid" })}>
                       {p.status === "paid" ? <><Check size={11} /> Paid</> : "Pending"}
                     </button>
-                    <button className="td-iconbtn td-iconbtn-danger" onClick={() => { if (confirm("Delete this " + money(p.amount) + " payment to " + p.vendorName + "?")) deleteVendorPayment(job.id, p.id); }} aria-label="Delete"><Trash2 size={12} /></button>
+                    <button className="td-iconbtn td-iconbtn-danger" onClick={() => {
+                      const linked = creditsAgainstBill(job, p.id);
+                      if (confirm("Delete this " + money(p.amount) + " payment to " + p.vendorName + "?" +
+                        (linked > 0 ? "\n\nThe " + creditMoney(linked) + " credit taken against this bill stays on the job." : ""))) deleteVendorPayment(job.id, p.id);
+                    }} aria-label="Delete"><Trash2 size={12} /></button>
                   </div>
                 ))}
               </div>
@@ -2343,8 +2480,83 @@ function JobDetailModal({ ctx, job, onClose }) {
                   <span>Costs would reach {money(vendorTotal(job) + vpAmount)} against a {money(job.contractAmount)} contract — a {money(-vpMarginAfter)} loss.</span>
                 </div>
               )}
-              <button className="td-btn td-btn-primary td-btn-sm" onClick={submitVendorPayment}><Plus size={13} /> Log vendor cost</button>
+              <div className="td-payment-btns">
+                <button className="td-btn td-btn-primary td-btn-sm" onClick={submitVendorPayment}><Plus size={13} /> Log vendor cost</button>
+                {!vcOpen && (
+                  <button className="td-btn td-btn-sm td-credit-btn" onClick={() => setVcOpen(true)}
+                    title="A vendor took money back off this job's cost — credit memo, returned materials, price correction.">
+                    <Minus size={13} /> Vendor credit
+                  </button>
+                )}
+              </div>
             </div>
+            {vcOpen && (
+              <div className="td-payment-form td-credit-form">
+                <div className="td-credit-form-title">Vendor credit</div>
+                <div className="td-payment-form-row">
+                  <input className="td-input" list="vendor-credit-options" placeholder="Vendor" autoFocus value={vcForm.vendorName}
+                    onChange={(e) => setVcForm((f) => ({ ...f, vendorName: e.target.value, vendorPaymentId: "" }))} />
+                  <input className="td-input td-input-num" type="number" min="0" step="0.01" placeholder="Credit amount"
+                    value={vcForm.amount} onChange={(e) => setVcForm((f) => ({ ...f, amount: e.target.value }))} />
+                </div>
+                <datalist id="vendor-credit-options">
+                  {vcVendorOptions.map((n) => <option key={n} value={n} />)}
+                </datalist>
+                <div className="td-payment-form-row">
+                  <select className="td-select" value={vcForm.settlement} title={VENDOR_CREDIT_SETTLEMENTS[vcForm.settlement].long}
+                    onChange={(e) => setVcForm((f) => ({ ...f, settlement: e.target.value, vendorPaymentId: "" }))}>
+                    {Object.entries(VENDOR_CREDIT_SETTLEMENTS).map(([k, v]) => <option key={k} value={k}>{v.label} — {v.long.toLowerCase()}</option>)}
+                  </select>
+                  <input className="td-input" type="date" value={vcForm.date} onChange={(e) => setVcForm((f) => ({ ...f, date: e.target.value }))} />
+                </div>
+                {vcForm.settlement === "open_bill" && (
+                  vcVendor && vcOpenBills.length === 0 ? (
+                    <div className="td-overage-hint">
+                      <AlertTriangle size={13} />
+                      <span>No unpaid bills from {vcVendor} on this job. If the bill is already paid, use On account or Refund check.</span>
+                    </div>
+                  ) : (
+                    <div className="td-payment-form-row">
+                      <select className="td-select" value={vcForm.vendorPaymentId} disabled={!vcVendor}
+                        onChange={(e) => setVcForm((f) => ({ ...f, vendorPaymentId: e.target.value }))}>
+                        <option value="">{vcVendor ? "Which unpaid bill?" : "Pick the vendor first"}</option>
+                        {vcOpenBills.map((b) => <option key={b.id} value={b.id}>{moneyDec(b.amount)} · {b.category} · {fmtDate(b.date)}{b.note ? " · " + b.note : ""}</option>)}
+                      </select>
+                    </div>
+                  )
+                )}
+                <input className="td-input" placeholder="Reason (required) — e.g. Returned 4 squares of siding, credit memo #1234" value={vcForm.reason}
+                  onChange={(e) => setVcForm((f) => ({ ...f, reason: e.target.value }))}
+                  onKeyDown={(e) => { if (e.key === "Enter") submitVendorCredit(); }} />
+                {vcAmount > 0 && vcVendor && (
+                  <div className="td-cell-sub">
+                    {vcVendor} on this job: <strong>{signedMoneyDec(vcVendorNet)}</strong> → <strong>{signedMoneyDec(toCents(vcVendorNet - vcAmount))}</strong> · Margin <strong>{money(margin)}</strong> → <strong>{money(vcMarginAfter)}</strong>
+                  </div>
+                )}
+                {vcAmount > 0 && vcVendor && vcAmount > vcVendorNet + 0.005 && (
+                  <div className="td-overage-hint">
+                    <AlertTriangle size={13} />
+                    <span>That's more than the {moneyDec(vcVendorNet)} booked with {vcVendor} on this job. Check the amount and the job.</span>
+                  </div>
+                )}
+                {vcBill && vcAmount > vcBillLeft + 0.005 && (
+                  <div className="td-overage-hint">
+                    <AlertTriangle size={13} />
+                    <span>That's more than the {moneyDec(vcBillLeft)} left on that bill.</span>
+                  </div>
+                )}
+                {vcForm.settlement === "on_account" && (
+                  <div className="td-cell-sub">When {vcVendor || "the vendor"} applies this credit to a later invoice, log that bill at its full amount — logging it net counts the credit twice.</div>
+                )}
+                <div className="td-payment-btns">
+                  <button className="td-btn td-btn-sm td-credit-btn td-credit-btn-solid" disabled={!vcValid} onClick={submitVendorCredit}
+                    title={vcValid ? "" : "Enter a vendor, an amount above $0 and a reason" + (vcForm.settlement === "open_bill" ? ", and pick the bill" : "")}>
+                    <Check size={13} /> Apply vendor credit
+                  </button>
+                  <button className="td-btn td-btn-sm" onClick={() => { setVcOpen(false); setVcForm(blankVc()); }}>Cancel</button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
         </>)}
@@ -2402,6 +2614,7 @@ function JobLostControl({ ctx, job }) {
         if (Number(pv.collected)) money_.push("  • " + money(pv.collected) + " collected (" + pv.payment_count + " payment" + (pv.payment_count === 1 ? "" : "s") + ")");
         if (Number(pv.vendor_total)) money_.push("  • " + money(pv.vendor_total) + " in vendor costs (" + pv.vendor_count + ")");
         if (Number(pv.credit_total)) money_.push("  • " + money(pv.credit_total) + " in client credits (" + pv.credit_count + ")");
+        if (Number(pv.vendor_credit_total)) money_.push("  • " + money(pv.vendor_credit_total) + " in vendor credits (" + pv.vendor_credit_count + ")");
         if (money_.length) {
           lines.push("⚠ This job has money recorded:\n" + money_.join("\n") +
             "\nThat money stays in Ledger › Payment reports (tagged Lost) but will not be in Balances owed. " +
@@ -2737,10 +2950,10 @@ function VendorsView({ ctx }) {
       ) : (
         <div className="td-table-wrap">
           <table className="td-table">
-            <thead><tr><th>Vendor</th><th>Category</th><th># of Contracts</th><th>Total Paid</th><th>Total Owed</th><th></th></tr></thead>
+            <thead><tr><th>Vendor</th><th>Category</th><th># of Contracts</th><th>Total Paid</th><th>Total Owed</th><th>Credits</th><th>Net cost</th><th></th></tr></thead>
             <tbody>
               {filtered.map((v) => {
-                const spend = vendorSpend[v.name] || { paid: 0, pending: 0, jobCount: 0 };
+                const spend = vendorSpend[v.name] || { paid: 0, pending: 0, owed: 0, credits: 0, onAccount: 0, refund: 0, jobCount: 0 };
                 return (
                   <tr key={v.id} className="td-table-row" onClick={() => setShowVendorForm(v)}>
                     <td className="td-cell-name">{v.name}</td>
@@ -2749,7 +2962,19 @@ function VendorsView({ ctx }) {
                         directory with nothing booked against them yet reads 0. */}
                     <td>{spend.jobCount}</td>
                     <td>{money(spend.paid)}</td>
-                    <td className={spend.pending > 0 ? "td-text-red" : "td-cell-sub"}>{spend.pending > 0 ? money(spend.pending) : "—"}</td>
+                    {/* Owed is unpaid bills less the open-bill credits taken against them. */}
+                    <td className={spend.owed > 0.005 ? "td-text-red" : "td-cell-sub"}>{spend.owed > 0.005 ? money(spend.owed) : "—"}</td>
+                    <td>
+                      {spend.credits > 0 ? <span className="td-credit-text">{creditMoney(spend.credits)}</span> : <span className="td-cell-sub">—</span>}
+                      {(spend.onAccount > 0 || spend.refund > 0) && (
+                        <div className="td-cell-sub">
+                          {[spend.onAccount > 0 ? money(spend.onAccount) + " on account" : null,
+                            spend.refund > 0 ? money(spend.refund) + " refund" : null].filter(Boolean).join(" · ")}
+                        </div>
+                      )}
+                    </td>
+                    {/* Bills (paid + pending) less every credit from this vendor. */}
+                    <td>{money(spend.paid + spend.pending - spend.credits)}</td>
                     <td onClick={(e) => e.stopPropagation()}>
                       <button className="td-iconbtn td-iconbtn-danger" onClick={() => { if (confirm("Remove " + v.name + " from your vendor directory? Past payments logged on jobs stay untouched.")) deleteVendor(v.id); }} aria-label="Delete vendor"><Trash2 size={13} /></button>
                     </td>
@@ -2995,6 +3220,18 @@ function buildLedgerRows(jobs) {
       tradeKey: j.trade, tradeLabel, stageKey: j.stage, stageLabel, jobStatusKey, jobStatusLabel,
       fromCrm: false, note: p.note || "",
     }));
+    // Vendor credits: money a vendor took back off this job's cost. Not cash
+    // (refund checks included, by decision) — totalled on their own line.
+    (j.vendorCredits || []).forEach((c) => push({
+      id: c.id, direction: "vcredit", ledger: "Vendor credit",
+      date: c.date, amount: Number(c.amount || 0),
+      typeKey: null, typeLabel: "Vendor credit",
+      method: "", vendor: c.vendorName || "", category: "", status: settlementLabel(c.settlement),
+      jobNumber: j.number, projectRef: j.ghlProjectDisplayId || "",
+      customer: j.customerName, address: j.customerAddress || "",
+      tradeKey: j.trade, tradeLabel, stageKey: j.stage, stageLabel, jobStatusKey, jobStatusLabel,
+      fromCrm: false, note: c.reason || "",
+    }));
     (j.clientCredits || []).forEach((c) => push({
       id: c.id, direction: "credit", ledger: "Client credit",
       date: c.date, amount: Number(c.amount || 0),
@@ -3071,7 +3308,8 @@ async function exportXlsx(rows, filename, summary) {
   aoa.push([]);
   if (rows.some((r) => r.direction === "in")) aoa.push(["TOTAL MONEY IN", "", "", sumOf("in")]);
   if (rows.some((r) => r.direction === "out")) aoa.push(["TOTAL MONEY OUT", "", "", sumOf("out")]);
-  if (rows.some((r) => r.direction === "credit")) aoa.push(["TOTAL CREDITS APPLIED", "", "", sumOf("credit")]);
+  if (rows.some((r) => r.direction === "credit")) aoa.push(["TOTAL CLIENT CREDITS APPLIED", "", "", sumOf("credit")]);
+  if (rows.some((r) => r.direction === "vcredit")) aoa.push(["TOTAL VENDOR CREDITS", "", "", sumOf("vcredit")]);
 
   const ws = XLSX.utils.aoa_to_sheet(aoa);
   const amountCol = EXPORT_COLUMNS.findIndex((c) => c.money);
@@ -3086,16 +3324,16 @@ async function exportXlsx(rows, filename, summary) {
   XLSX.utils.book_append_sheet(wb, ws, "Transactions");
 
   if (summary && summary.length) {
-    const sAoa = [["Group", "Count", "Money in", "Money out", "Net (cash)", "Credits applied"]];
-    summary.forEach((g) => sAoa.push([g.label, g.count, g.moneyIn, g.moneyOut, g.net, g.credits]));
+    const sAoa = [["Group", "Count", "Money in", "Money out", "Net (cash)", "Client credits", "Vendor credits"]];
+    summary.forEach((g) => sAoa.push([g.label, g.count, g.moneyIn, g.moneyOut, g.net, g.credits, g.vcredits]));
     const sws = XLSX.utils.aoa_to_sheet(sAoa);
     for (let i = 1; i < sAoa.length; i++) {
-      [2, 3, 4, 5].forEach((c) => {
+      [2, 3, 4, 5, 6].forEach((c) => {
         const ref = XLSX.utils.encode_cell({ r: i, c });
         if (sws[ref] && typeof sws[ref].v === "number") sws[ref].z = '"$"#,##0.00';
       });
     }
-    sws["!cols"] = [{ wch: 26 }, { wch: 8 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 15 }];
+    sws["!cols"] = [{ wch: 26 }, { wch: 8 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 15 }, { wch: 15 }];
     XLSX.utils.book_append_sheet(wb, sws, "Summary");
   }
 
@@ -3984,8 +4222,10 @@ function TransactionReport({ jobs }) {
   // Which ledgers the "Show" choice includes. "both" stays payments + costs
   // (cash only); "all" adds client credits on top.
   const showIn = ["in", "both", "all"].includes(direction);
-  const showOut = ["out", "both", "all"].includes(direction);
+  const showOut = ["out", "vendor", "both", "all"].includes(direction);
   const showCredit = ["credit", "all"].includes(direction);
+  // Vendor credits: their own option, the vendor view (costs + credits), and Everything.
+  const showVCredit = ["vcredit", "vendor", "all"].includes(direction);
   const showNet = showIn && showOut;
 
   const rows = useMemo(() => {
@@ -3996,6 +4236,7 @@ function TransactionReport({ jobs }) {
       if (r.direction === "in" && !showIn) return false;
       if (r.direction === "out" && !showOut) return false;
       if (r.direction === "credit" && !showCredit) return false;
+      if (r.direction === "vcredit" && !showVCredit) return false;
       if (fType && r.typeKey !== fType) return false;
       if (fMethod && r.method !== fMethod) return false;
       if (fTrade && r.tradeKey !== fTrade) return false;
@@ -4013,30 +4254,32 @@ function TransactionReport({ jobs }) {
                  String(r.projectRef).toLowerCase().includes(q))) return false;
       return true;
     }).sort((a, b) => b.when - a.when);
-  }, [allRows, from, to, showIn, showOut, showCredit, fType, fMethod, fTrade, fStage, fVendor, fCategory, fStatus, fJobStatus, search]);
+  }, [allRows, from, to, showIn, showOut, showCredit, showVCredit, fType, fMethod, fTrade, fStage, fVendor, fCategory, fStatus, fJobStatus, search]);
 
   const groups = useMemo(() => {
     const g = GROUPINGS[groupBy] || GROUPINGS.none;
     const map = new Map();
     rows.forEach((r) => {
       const key = g.key(r.when, r);
-      const e = map.get(key) || { key, count: 0, moneyIn: 0, moneyOut: 0, credits: 0 };
+      const e = map.get(key) || { key, count: 0, moneyIn: 0, moneyOut: 0, credits: 0, vcredits: 0 };
       e.count += 1;
       if (r.direction === "in") e.moneyIn += r.amount;
       else if (r.direction === "out") e.moneyOut += r.amount;
       else if (r.direction === "credit") e.credits += r.amount;
+      else if (r.direction === "vcredit") e.vcredits += r.amount;
       map.set(key, e);
     });
     const dateGrouped = ["day", "week", "month", "quarter", "year"].includes(groupBy);
     return [...map.values()]
       .map((e) => ({ ...e, net: e.moneyIn - e.moneyOut, label: groupLabel(groupBy, e.key) }))
-      .sort((a, b) => dateGrouped ? (a.key < b.key ? 1 : -1) : (b.moneyIn + b.moneyOut + b.credits) - (a.moneyIn + a.moneyOut + a.credits));
+      .sort((a, b) => dateGrouped ? (a.key < b.key ? 1 : -1) : (b.moneyIn + b.moneyOut + b.credits + b.vcredits) - (a.moneyIn + a.moneyOut + a.credits + a.vcredits));
   }, [rows, groupBy]);
 
   const totalIn = rows.filter((r) => r.direction === "in").reduce((s, r) => s + r.amount, 0);
   const totalOut = rows.filter((r) => r.direction === "out").reduce((s, r) => s + r.amount, 0);
   const totalCredit = rows.filter((r) => r.direction === "credit").reduce((s, r) => s + r.amount, 0);
   const creditJobs = new Set(rows.filter((r) => r.direction === "credit").map((r) => r.jobNumber)).size;
+  const totalVCredit = rows.filter((r) => r.direction === "vcredit").reduce((s, r) => s + r.amount, 0);
   // Rows on lost/abandoned jobs stay in every total above; this only says how
   // many there are, because those jobs are missing from Balances owed.
   const deadRows = rows.filter((r) => r.jobStatusKey !== "live");
@@ -4047,7 +4290,7 @@ function TransactionReport({ jobs }) {
 
   const rangeLabel = isoDay(from) + "_to_" + isoDay(to);
   const filenameBase = "tradedesk_" +
-    ({ in: "client-payments", out: "vendor-costs", credit: "client-credits", both: "payments-and-costs", all: "all-transactions" }[direction] || "transactions") +
+    ({ in: "client-payments", out: "vendor-costs", vendor: "vendor-costs-and-credits", vcredit: "vendor-credits", credit: "client-credits", both: "payments-and-costs", all: "all-transactions" }[direction] || "transactions") +
     "_" + rangeLabel;
 
   const doExport = async (kind) => {
@@ -4107,6 +4350,8 @@ function TransactionReport({ jobs }) {
           <select className="td-select" value={direction} onChange={(e) => setDirection(e.target.value)}>
             <option value="in">Client payments (money in)</option>
             <option value="out">Vendor costs (money out)</option>
+            <option value="vendor">Vendor costs + vendor credits</option>
+            <option value="vcredit">Vendor credits</option>
             <option value="credit">Client credits</option>
             <option value="both">Payments + costs</option>
             <option value="all">Everything (incl. credits)</option>
@@ -4206,6 +4451,8 @@ function TransactionReport({ jobs }) {
         {showNet && <div title="Cash only — client credits are not money in or out"><span className="td-field-label">Net</span><strong className={totalIn - totalOut < 0 ? "td-text-red" : "td-text-green"}>{money(totalIn - totalOut)}</strong></div>}
         {showCredit && <div title="Taken off what clients owe. Not cash, not refunds."><span className="td-field-label">Credits applied</span><strong className="td-credit-text">{totalCredit ? "\u2212" + money(totalCredit) : money(0)}</strong></div>}
         {showCredit && <div><span className="td-field-label">Jobs credited</span><strong>{creditJobs}</strong></div>}
+        {showVCredit && <div title="Taken back off job costs by vendors. Not cash — refund checks included."><span className="td-field-label">Vendor credits</span><strong className="td-credit-text">{money(totalVCredit)}</strong></div>}
+        {showVCredit && showOut && <div title="Vendor costs less vendor credits"><span className="td-field-label">Net vendor cost</span><strong>{money(totalOut - totalVCredit)}</strong></div>}
         {deadRows.length > 0 && (
           <div title="Included in the totals. These jobs are lost or abandoned, so they are not in Booked, the Scorecard or Balances owed.">
             <span className="td-field-label">On lost jobs</span>
@@ -4238,6 +4485,7 @@ function TransactionReport({ jobs }) {
                   {showOut && <th className="td-num">Money out</th>}
                   {showNet && <th className="td-num">Net</th>}
                   {showCredit && <th className="td-num">Credits applied</th>}
+                  {showVCredit && <th className="td-num">Vendor credits</th>}
                 </tr>
               </thead>
               <tbody>
@@ -4249,6 +4497,7 @@ function TransactionReport({ jobs }) {
                     {showOut && <td className="td-num td-text-red">{money(g.moneyOut)}</td>}
                     {showNet && <td className={"td-num " + (g.net < 0 ? "td-text-red" : "td-text-green")}>{money(g.net)}</td>}
                     {showCredit && <td className="td-num td-credit-text">{g.credits ? "\u2212" + money(g.credits) : money(0)}</td>}
+                    {showVCredit && <td className="td-num td-credit-text">{money(g.vcredits)}</td>}
                   </tr>
                 ))}
               </tbody>
@@ -4260,6 +4509,7 @@ function TransactionReport({ jobs }) {
                   {showOut && <td className="td-num"><strong>{money(totalOut)}</strong></td>}
                   {showNet && <td className="td-num"><strong>{money(totalIn - totalOut)}</strong></td>}
                   {showCredit && <td className="td-num"><strong>{totalCredit ? "\u2212" + money(totalCredit) : money(0)}</strong></td>}
+                  {showVCredit && <td className="td-num"><strong>{money(totalVCredit)}</strong></td>}
                 </tr>
               </tfoot>
             </table>
@@ -4283,13 +4533,13 @@ function TransactionReport({ jobs }) {
                     <tr key={r.direction + r.id}>
                       <td>{fmtDate(r.date)}</td>
                       <td>{r.typeLabel}{r.fromCrm && <span className="td-ghl-badge" style={{ marginLeft: 6 }}>GHL</span>}</td>
-                      <td className={"td-num " + (r.direction === "in" ? "td-text-green" : r.direction === "credit" ? "td-credit-text" : "td-text-red")}>
-                        {r.direction === "in" ? "" : "\u2212"}{moneyDec(r.amount)}
+                      <td className={"td-num " + (r.direction === "in" ? "td-text-green" : (r.direction === "credit" || r.direction === "vcredit") ? "td-credit-text" : "td-text-red")}>
+                        {r.direction === "in" ? "" : r.direction === "vcredit" ? "+" : "\u2212"}{moneyDec(r.amount)}
                       </td>
                       <td>{r.customer}</td>
                       <td>{jobNo(r.jobNumber)}{r.jobStatusKey !== "live" && <span className="td-linked-lost" style={{ marginLeft: 6 }}>{r.jobStatusLabel}</span>}</td>
                       <td className="td-cell-sub">
-                        {[r.method, r.vendor, r.direction === "out" ? r.status : null, r.direction === "credit" && r.note ? "\u201c" + r.note + "\u201d" : r.note]
+                        {[r.method, r.vendor, (r.direction === "out" || r.direction === "vcredit") ? r.status : null, (r.direction === "credit" || r.direction === "vcredit") && r.note ? "\u201c" + r.note + "\u201d" : r.note]
                           .filter(Boolean).join(" · ")}
                       </td>
                     </tr>
@@ -5823,6 +6073,7 @@ function GlobalStyle() {
       .td-btn.td-credit-btn-solid { background: #6A4C93; color: #fff; border-color: #6A4C93; }
       .td-btn.td-credit-btn-solid:disabled { opacity: .5; cursor: not-allowed; }
       .td-credit-form { margin-top: 10px; border-top-color: #CDBFE0; }
+      .td-vendor-net-strip { margin: -2px 0 8px; }
       .td-credit-form-title { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; font-weight: 700; color: #6A4C93; }
 
       /* ---------- Responsive ---------- */

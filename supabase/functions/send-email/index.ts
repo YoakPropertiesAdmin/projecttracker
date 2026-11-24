@@ -68,7 +68,7 @@ function render(job: any, f: any, revised: boolean, threshold: number | null) {
       : `This job was finalized before, but was healthy enough then that nothing was sent. `) +
     `Gross profit was <strong>${esc(money(f.prior_margin))}</strong> and is now ` +
     `<strong>${esc(money(f.margin))}</strong> — a change of <strong>${esc((delta >= 0 ? "+" : "") + money(delta))}</strong>, ` +
-    `normally a vendor bill that arrived after the first finalization.</p>`;
+    `normally a vendor bill or vendor credit that arrived after the first finalization.</p>`;
 
   const why = thin
     ? `You are seeing this because the gross profit came in under ${esc(mark)}.`
@@ -93,6 +93,7 @@ function render(job: any, f: any, revised: boolean, threshold: number | null) {
     row("Client received", money(f.client_received)) +
     row("Vendor costs paid", money(f.vendor_paid)) +
     row("Vendor costs pending", money(f.vendor_pending)) +
+    (Number(f.vendor_credits || 0) > 0 ? row("Vendor credits", money(-Number(f.vendor_credits))) : "") +
     row("Total costs", money(f.vendor_total)) +
     row("Gross profit", money(f.margin) + "  (" + pct(f.margin_pct) + ")", true) +
     `</table>` +
@@ -114,6 +115,7 @@ function render(job: any, f: any, revised: boolean, threshold: number | null) {
     "Client received      " + money(f.client_received),
     "Vendor costs paid    " + money(f.vendor_paid),
     "Vendor costs pending " + money(f.vendor_pending),
+    Number(f.vendor_credits || 0) > 0 ? "Vendor credits       " + money(-Number(f.vendor_credits)) : "",
     "Total costs          " + money(f.vendor_total),
     "Gross profit         " + money(f.margin) + "  (" + pct(f.margin_pct) + ")",
     "",
