@@ -9,6 +9,12 @@ import { crm, db, DEFAULT_LOCATION, exchangeLocationToken, logSync } from "../_s
  *     Unsigned or tampered -> 401.
  *  2. Events TradeDesk does not act on (tags, tasks, notes, records, other
  *     pipelines, other locations) -> 200 at once, no database work.
+ *     (v6, 2026-11-24: OpportunityDelete from other pipelines is dropped here
+ *     too. A bulk delete of ~7,500 Facebook-lead opportunities sent one
+ *     delivery each in two minutes; every one did 3-4 database calls and the
+ *     API timed out (522) for everyone, including TradeDesk in the CRM.
+ *     TradeDesk jobs only come from the Production pipeline, and the delete
+ *     handler only ever logged a line, so nothing is lost.)
  *  3. Everything else -> 200 at once. Storing (dedupe on webhookId, the PK of
  *     ghl_webhook_events) and processing run in EdgeRuntime.waitUntil, with the
  *     store retried, so a slow or briefly failing database never makes GHL wait
@@ -130,7 +136,9 @@ function ignoreReason(ev: any): string | null {
   const type: string = ev.type || "";
   if (type === "INSTALL" || type === "UNINSTALL") return null;
   if (ev.locationId && DEFAULT_LOCATION && ev.locationId !== DEFAULT_LOCATION) return "other location";
-  if (type === "ContactUpdate" || type === "ContactDelete" || type === "OpportunityDelete") return null;
+  if (type === "ContactUpdate" || type === "ContactDelete") return null;
+  // Every Opportunity* event, OpportunityDelete included (v6), is dropped when
+  // it names another pipeline. A delete with no pipelineId is still handled.
   if (type.startsWith("Opportunity")) {
     if (ev.pipelineId && ev.pipelineId !== PIPELINE) return "not the Production pipeline";
     return null;
