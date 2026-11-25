@@ -196,6 +196,36 @@ const vendorPaymentFromRow = (r) => ({
   date: toIso(r.payment_date),
   status: r.status,
   note: r.note || "",
+  // Invoices / receipts attached to this bill (vendor_payment_documents).
+  // Optional; admin-only by RLS like the bill itself.
+  documents: [],
+});
+
+/* ---- Vendor payment documents (2026-11-24) -------------------------------
+   The file lives in the private Storage bucket "vendor-docs"; the row in
+   vendor_payment_documents links it to the bill. Opening a file uses a
+   signed link (1 hour), never a public URL. Removing a document removes the
+   row only, so Undo can put it back; the file stays in the bucket. */
+export const VENDOR_DOC_BUCKET = "vendor-docs";
+export const VENDOR_DOC_MAX_BYTES = 20 * 1024 * 1024;
+export const VENDOR_DOC_TYPES = ["application/pdf", "image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"];
+const safeFileName = (name) => (String(name || "file").normalize("NFKD")
+  .replace(/[^A-Za-z0-9._-]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "").slice(-120) || "file");
+export const vendorDocPath = (jobId, paymentId, docId, name) => jobId + "/" + paymentId + "/" + docId + "-" + safeFileName(name);
+
+const vendorDocFromRow = (r) => ({
+  id: r.id,
+  vendorPaymentId: r.vendor_payment_id,
+  jobId: r.job_id,
+  path: r.storage_path,
+  fileName: r.file_name,
+  contentType: r.content_type || "",
+  size: Number(r.size_bytes || 0),
+  uploadedAt: toIso(r.uploaded_at),
+});
+const vendorDocToRow = (d) => ({
+  id: d.id, vendor_payment_id: d.vendorPaymentId, job_id: d.jobId, storage_path: d.path,
+  file_name: d.fileName, content_type: d.contentType || "", size_bytes: Number(d.size) || 0,
 });
 
 const assigneeFromRow = (r) => ({
@@ -314,7 +344,7 @@ const supabaseRepo = {
 
   async loadAll() {
     const [jobRows, vendorRows, cpRows, vpRows, tradeRows, flagRows, payTypeRows, ageRuleRows,
-           roleRows, assigneeRows, assignmentRows, finalRows, appRole, creditRows, jobTypeRows, vendorCreditRows] = await Promise.all([
+           roleRows, assigneeRows, assignmentRows, finalRows, appRole, creditRows, jobTypeRows, vendorCreditRows, vendorDocRows] = await Promise.all([
       supabase.from("jobs").select("*").order("number", { ascending: false }).then(unwrap),
       supabase.from("vendors").select("*").order("name", { ascending: true }).then(unwrap),
       supabase.from("client_payments").select("*").order("payment_date", { ascending: false }).then(unwrap),
@@ -346,13 +376,23 @@ const supabaseRepo = {
       supabase.from("job_types").select("*").eq("active", true).order("sort").then(unwrap),
       // Admin-only by RLS, like client credits.
       supabase.from("vendor_credits").select("*").order("credit_date", { ascending: false }).then(unwrap),
+      // Admin-only by RLS. A failure here must not blank the board, so it
+      // falls back to no documents rather than throwing.
+      supabase.from("vendor_payment_documents").select("*").order("uploaded_at", { ascending: true })
+        .then(({ data, error }) => (error ? [] : data || [])),
     ]);
 
     const jobs = jobRows.map(jobFromRow);
     const byId = new Map(jobs.map((j) => [j.id, j]));
     cpRows.forEach((r) => byId.get(r.job_id)?.clientPayments.push(clientPaymentFromRow(r)));
     creditRows.forEach((r) => byId.get(r.job_id)?.clientCredits.push(clientCreditFromRow(r)));
-    vpRows.forEach((r) => byId.get(r.job_id)?.vendorPayments.push(vendorPaymentFromRow(r)));
+    const billById = new Map();
+    vpRows.forEach((r) => {
+      const bill = vendorPaymentFromRow(r);
+      billById.set(bill.id, bill);
+      byId.get(r.job_id)?.vendorPayments.push(bill);
+    });
+    vendorDocRows.forEach((r) => billById.get(r.vendor_payment_id)?.documents.push(vendorDocFromRow(r)));
     vendorCreditRows.forEach((r) => byId.get(r.job_id)?.vendorCredits.push(vendorCreditFromRow(r)));
     assignmentRows.forEach((r) => byId.get(r.job_id)?.assignments.push(assignmentFromRow(r)));
     finalRows.forEach((r) => { const j = byId.get(r.job_id); if (j) j.finalization = finalizationFromRow(r); });
@@ -453,6 +493,50 @@ const supabaseRepo = {
 
   async deleteVendorCredit(_jobId, creditId) {
     await supabase.from("vendor_credits").delete().eq("id", creditId).then(unwrap);
+  },
+
+  // Only the bill link changes after the fact (Undo of a bill delete puts it
+  // back). Amount, vendor and reason are fixed once applied: delete instead.
+  async updateVendorCredit(_jobId, creditId, patch) {
+    const row = {};
+    if (patch.vendorPaymentId !== undefined) row.vendor_payment_id = patch.vendorPaymentId || null;
+    if (!Object.keys(row).length) return;
+    await supabase.from("vendor_credits").update(row).eq("id", creditId).then(unwrap);
+  },
+
+  // Upload the file, then link it. If the link can't be written the file is
+  // removed again, so nothing is left in the bucket that the app can't see.
+  async uploadVendorDocument(_jobId, doc, file) {
+    const up = await supabase.storage.from(VENDOR_DOC_BUCKET)
+      .upload(doc.path, file, { contentType: file.type || "application/octet-stream", upsert: false });
+    if (up.error) {
+      const e = new Error(up.error.message || "the upload was refused");
+      throw e;
+    }
+    const ins = await supabase.from("vendor_payment_documents").insert(vendorDocToRow(doc));
+    if (ins.error) {
+      await supabase.storage.from(VENDOR_DOC_BUCKET).remove([doc.path]).catch(() => {});
+      unwrap(ins);
+    }
+  },
+
+  async deleteVendorDocument(_jobId, docId) {
+    await supabase.from("vendor_payment_documents").delete().eq("id", docId).then(unwrap);
+  },
+
+  // Undo of a remove (or of a bill delete): the file never left the bucket.
+  async restoreVendorDocument(_jobId, doc) {
+    await supabase.from("vendor_payment_documents").insert(vendorDocToRow(doc)).then(unwrap);
+  },
+
+  // Signed links for opening files: { path: url }. One call per job card.
+  async vendorDocumentUrls(paths) {
+    if (!paths.length) return {};
+    const { data, error } = await supabase.storage.from(VENDOR_DOC_BUCKET).createSignedUrls(paths, 3600);
+    if (error) throw new Error(error.message || "could not open the documents");
+    const out = {};
+    (data || []).forEach((d) => { if (d.signedUrl && d.path) out[d.path] = d.signedUrl; });
+    return out;
   },
 
   async createVendorPayment(jobId, p) {
@@ -768,6 +852,7 @@ const mapJob = (jobId, fn) => {
   return persistLocal();
 };
 
+const localDocUrls = {};
 const localRepo = {
   mode: "local",
 
@@ -827,6 +912,9 @@ const localRepo = {
   async deleteVendorCredit(jobId, creditId) {
     return mapJob(jobId, (j) => ({ ...j, vendorCredits: (j.vendorCredits || []).filter((c) => c.id !== creditId) }));
   },
+  async updateVendorCredit(jobId, creditId, patch) {
+    return mapJob(jobId, (j) => ({ ...j, vendorCredits: (j.vendorCredits || []).map((c) => (c.id === creditId ? { ...c, ...patch } : c)) }));
+  },
   async createVendorPayment(jobId, p) {
     return mapJob(jobId, (j) => ({ ...j, vendorPayments: [p, ...(j.vendorPayments || [])] }));
   },
@@ -838,6 +926,26 @@ const localRepo = {
   },
   async deleteVendorPayment(jobId, paymentId) {
     return mapJob(jobId, (j) => ({ ...j, vendorPayments: (j.vendorPayments || []).filter((p) => p.id !== paymentId) }));
+  },
+  // Dev fallback: no bucket, so the file is held as an in-memory object URL
+  // (gone after a reload). Enough to exercise the screens.
+  async uploadVendorDocument(jobId, doc, file) {
+    localDocUrls[doc.path] = URL.createObjectURL(file);
+    return mapJob(jobId, (j) => ({ ...j, vendorPayments: (j.vendorPayments || []).map((p) =>
+      (p.id === doc.vendorPaymentId ? { ...p, documents: [...(p.documents || []).filter((d) => d.id !== doc.id), doc] } : p)) }));
+  },
+  async deleteVendorDocument(jobId, docId) {
+    return mapJob(jobId, (j) => ({ ...j, vendorPayments: (j.vendorPayments || []).map((p) =>
+      ({ ...p, documents: (p.documents || []).filter((d) => d.id !== docId) })) }));
+  },
+  async restoreVendorDocument(jobId, doc) {
+    return mapJob(jobId, (j) => ({ ...j, vendorPayments: (j.vendorPayments || []).map((p) =>
+      (p.id === doc.vendorPaymentId ? { ...p, documents: [...(p.documents || []).filter((d) => d.id !== doc.id), doc] } : p)) }));
+  },
+  async vendorDocumentUrls(paths) {
+    const out = {};
+    paths.forEach((pth) => { if (localDocUrls[pth]) out[pth] = localDocUrls[pth]; });
+    return out;
   },
 
   // The dev fallback keeps assignees alongside jobs in the same blob. The

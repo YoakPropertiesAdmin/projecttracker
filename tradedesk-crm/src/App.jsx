@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
-import { repo } from "./data/repository.js";
+import { repo, vendorDocPath, VENDOR_DOC_MAX_BYTES, VENDOR_DOC_TYPES } from "./data/repository.js";
 import { supabase, isSupabaseConfigured } from "./data/supabaseClient.js";
 import {
   LayoutDashboard, LayoutGrid, List, Truck, TrendingUp,
@@ -9,7 +9,7 @@ import {
   AlertTriangle, Tag, Building2, Menu, ClipboardList, RefreshCw,
   Wallet, HandCoins, Percent, Calendar as CalendarIcon, LogOut,
   Hammer, Wrench, PaintBucket, Droplets, Thermometer, PackageCheck, ShoppingCart,
-  Download, FileSpreadsheet, SlidersHorizontal, ArrowDownUp, ShieldCheck, Link2, Lock, Send, CalendarCheck, ExternalLink
+  Download, FileSpreadsheet, SlidersHorizontal, ArrowDownUp, ShieldCheck, Link2, Lock, Send, CalendarCheck, ExternalLink, Paperclip, FileText
 } from "lucide-react";
 
 /* =========================================================================
@@ -518,6 +518,22 @@ const VENDOR_CREDIT_SETTLEMENTS = {
   on_account: { label: "On account", long: "Credit with the vendor for a future invoice" },
   refund: { label: "Refund check", long: "Vendor is sending a check" },
 };
+// Vendor bill documents: what can be attached, and why a file was refused.
+// Windows often gives HEIC (and sometimes PDF) files no type, so the
+// extension decides when the browser doesn't say.
+const DOC_EXT_TYPES = { pdf: "application/pdf", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", heic: "image/heic", heif: "image/heif" };
+const docTypeOf = (file) => file.type || DOC_EXT_TYPES[(String(file.name).split(".").pop() || "").toLowerCase()] || "";
+const DOC_ACCEPT = Object.keys(DOC_EXT_TYPES).map((e) => "." + e).join(",") + "," + VENDOR_DOC_TYPES.join(",");
+const docProblem = (file) => {
+  if (!VENDOR_DOC_TYPES.includes(docTypeOf(file))) return file.name + " isn't a PDF or photo (PDF, JPG, PNG, WEBP or HEIC)";
+  if (file.size > VENDOR_DOC_MAX_BYTES) return file.name + " is " + (file.size / 1048576).toFixed(1) + " MB; the limit is 20 MB";
+  if (file.size === 0) return file.name + " is empty";
+  return null;
+};
+const fileSize = (n) => (n >= 1048576 ? (n / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(n / 1024)) + " KB");
+
+// "a, b and c" for hint text.
+const listJoin = (xs) => (xs.length <= 1 ? xs.join("") : xs.slice(0, -1).join(", ") + " and " + xs[xs.length - 1]);
 const settlementLabel = (k) => (VENDOR_CREDIT_SETTLEMENTS[k] || VENDOR_CREDIT_SETTLEMENTS.on_account).label;
 // Open-bill credits tied to a bill, so the bill (and "owed") can show net.
 const creditsAgainstBill = (job, billId) => (job.vendorCredits || [])
@@ -959,7 +975,7 @@ export default function App() {
    * the database so what you see is what is stored.
    */
   const persist = (work, label) => {
-    Promise.resolve()
+    return Promise.resolve()
       .then(work)
       .then(() => setPersistError(""))
       .catch((err) => {
@@ -999,40 +1015,154 @@ export default function App() {
     persist(() => repo.deleteJob(id), "Deleting the job");
   };
 
+  /* ---- Money rows: success message + Undo (2026-11-24) ----------------
+     Logging or deleting a payment, cost or credit happens at once and says so
+     in a message with Undo (12 s, paused while hovered or focused) instead
+     of asking "Are you sure?" first. Undo replays the exact row (same id),
+     so it is reliable. The one exception is a client payment that came from
+     GoHighLevel: re-creating it here would lose its link to the CRM field,
+     so that delete still asks first and offers no Undo.
+     Writes are tracked per row id so an Undo never races the write it is
+     undoing (an insert still in flight is awaited before its delete). */
+  const inflight = useRef(new Map());
+  const track = (rowId, promise) => {
+    inflight.current.set(rowId, promise);
+    promise.finally(() => { if (inflight.current.get(rowId) === promise) inflight.current.delete(rowId); });
+    return promise;
+  };
+  const after = (rowId) => inflight.current.get(rowId) || Promise.resolve();
+  const writeRow = (rowId, work, label) => { const prior = after(rowId); return track(rowId, persist(() => prior.then(work), label)); };
+  const jobLabelOf = (jobId) => { const j = safeData.jobs.find((x) => x.id === jobId); return j ? jobNo(j.number) : "the job"; };
+  const rowOf = (jobId, key, rowId) => ((safeData.jobs.find((x) => x.id === jobId) || {})[key] || []).find((r) => r.id === rowId);
+  const putRow = (jobId, key, row) => setData((prev) => ({ ...prev, jobs: prev.jobs.map((j) => (j.id === jobId ? { ...j, [key]: [row, ...(j[key] || []).filter((r) => r.id !== row.id)] } : j)) }));
+  const dropRow = (jobId, key, rowId) => setData((prev) => ({ ...prev, jobs: prev.jobs.map((j) => (j.id === jobId ? { ...j, [key]: (j[key] || []).filter((r) => r.id !== rowId) } : j)) }));
+  const [toast, setToast] = useState(null);
+  const showToast = (message, undo) => setToast({ id: newId(), message, undo: undo || null });
+
   const addClientPayment = (jobId, payment) => {
     const p = { id: newId(), date: new Date().toISOString(), ...payment };
-    setData((prev) => ({ ...prev, jobs: prev.jobs.map((j) => (j.id === jobId ? { ...j, clientPayments: [p, ...(j.clientPayments || [])] } : j)) }));
-    persist(() => repo.createClientPayment(jobId, p), "The client payment");
+    putRow(jobId, "clientPayments", p);
+    writeRow(p.id, () => repo.createClientPayment(jobId, p), "The client payment");
+    const what = moneyDec(p.amount) + " client payment";
+    showToast("Logged " + what + " on " + jobLabelOf(jobId) + ".", () => {
+      dropRow(jobId, "clientPayments", p.id);
+      writeRow(p.id, () => repo.deleteClientPayment(jobId, p.id), "Undoing the client payment");
+      showToast("Removed the " + what + ".");
+    });
   };
   const deleteClientPayment = (jobId, paymentId) => {
-    setData((prev) => ({ ...prev, jobs: prev.jobs.map((j) => (j.id === jobId ? { ...j, clientPayments: (j.clientPayments || []).filter((p) => p.id !== paymentId) } : j)) }));
-    persist(() => repo.deleteClientPayment(jobId, paymentId), "Deleting the client payment");
+    const p = rowOf(jobId, "clientPayments", paymentId);
+    dropRow(jobId, "clientPayments", paymentId);
+    writeRow(paymentId, () => repo.deleteClientPayment(jobId, paymentId), "Deleting the client payment");
+    if (!p) return;
+    const what = moneyDec(p.amount) + " client payment";
+    showToast("Deleted the " + what + " from " + jobLabelOf(jobId) + ".", p.sourceRef ? null : () => {
+      putRow(jobId, "clientPayments", p);
+      writeRow(p.id, () => repo.createClientPayment(jobId, p), "Restoring the client payment");
+      showToast("Restored the " + what + ".");
+    });
   };
 
   const addClientCredit = (jobId, credit) => {
     const c = { id: newId(), date: new Date().toISOString(), reason: "", ...credit };
-    setData((prev) => ({ ...prev, jobs: prev.jobs.map((j) => (j.id === jobId ? { ...j, clientCredits: [c, ...(j.clientCredits || [])] } : j)) }));
-    persist(() => repo.createClientCredit(jobId, c), "The client credit");
+    putRow(jobId, "clientCredits", c);
+    writeRow(c.id, () => repo.createClientCredit(jobId, c), "The client credit");
+    const what = moneyDec(c.amount) + " client credit";
+    showToast("Applied a " + what + " on " + jobLabelOf(jobId) + ".", () => {
+      dropRow(jobId, "clientCredits", c.id);
+      writeRow(c.id, () => repo.deleteClientCredit(jobId, c.id), "Undoing the client credit");
+      showToast("Removed the " + what + ".");
+    });
   };
   const deleteClientCredit = (jobId, creditId) => {
-    setData((prev) => ({ ...prev, jobs: prev.jobs.map((j) => (j.id === jobId ? { ...j, clientCredits: (j.clientCredits || []).filter((c) => c.id !== creditId) } : j)) }));
-    persist(() => repo.deleteClientCredit(jobId, creditId), "Deleting the client credit");
+    const c = rowOf(jobId, "clientCredits", creditId);
+    dropRow(jobId, "clientCredits", creditId);
+    writeRow(creditId, () => repo.deleteClientCredit(jobId, creditId), "Deleting the client credit");
+    if (!c) return;
+    const what = moneyDec(c.amount) + " client credit";
+    showToast("Deleted the " + what + " from " + jobLabelOf(jobId) + ". The balance due went back up.", () => {
+      putRow(jobId, "clientCredits", c);
+      writeRow(c.id, () => repo.createClientCredit(jobId, c), "Restoring the client credit");
+      showToast("Restored the " + what + ".");
+    });
   };
 
   const addVendorCredit = (jobId, credit) => {
     const c = { id: newId(), date: new Date().toISOString(), reason: "", settlement: "on_account", vendorPaymentId: null, ...credit };
-    setData((prev) => ({ ...prev, jobs: prev.jobs.map((j) => (j.id === jobId ? { ...j, vendorCredits: [c, ...(j.vendorCredits || [])] } : j)) }));
-    persist(() => repo.createVendorCredit(jobId, c), "The vendor credit");
+    putRow(jobId, "vendorCredits", c);
+    writeRow(c.id, () => repo.createVendorCredit(jobId, c), "The vendor credit");
+    const what = moneyDec(c.amount) + " credit from " + c.vendorName;
+    showToast("Applied a " + what + " on " + jobLabelOf(jobId) + ".", () => {
+      dropRow(jobId, "vendorCredits", c.id);
+      writeRow(c.id, () => repo.deleteVendorCredit(jobId, c.id), "Undoing the vendor credit");
+      showToast("Removed the " + what + ".");
+    });
   };
   const deleteVendorCredit = (jobId, creditId) => {
-    setData((prev) => ({ ...prev, jobs: prev.jobs.map((j) => (j.id === jobId ? { ...j, vendorCredits: (j.vendorCredits || []).filter((c) => c.id !== creditId) } : j)) }));
-    persist(() => repo.deleteVendorCredit(jobId, creditId), "Deleting the vendor credit");
+    const c = rowOf(jobId, "vendorCredits", creditId);
+    dropRow(jobId, "vendorCredits", creditId);
+    writeRow(creditId, () => repo.deleteVendorCredit(jobId, creditId), "Deleting the vendor credit");
+    if (!c) return;
+    const what = moneyDec(c.amount) + " credit from " + c.vendorName;
+    showToast("Deleted the " + what + " on " + jobLabelOf(jobId) + ". The job's vendor cost went back up.", () => {
+      putRow(jobId, "vendorCredits", c);
+      writeRow(c.id, () => repo.createVendorCredit(jobId, c), "Restoring the vendor credit");
+      showToast("Restored the " + what + ".");
+    });
   };
 
-  const addVendorPayment = (jobId, payment) => {
-    const p = { id: newId(), date: new Date().toISOString(), status: "pending", ...payment };
-    setData((prev) => ({ ...prev, jobs: prev.jobs.map((j) => (j.id === jobId ? { ...j, vendorPayments: [p, ...(j.vendorPayments || [])] } : j)) }));
-    persist(() => repo.createVendorPayment(jobId, p), "The vendor payment");
+  /* ---- Bill documents (2026-11-24) ----
+     Optional invoices / receipts on a vendor bill. Upload waits for the bill's
+     own insert (same per-row queue as Undo), shows "Uploading…" on the row
+     until it lands, and a remove is a row delete with Undo — the file stays
+     in the bucket, so putting it back is exact. */
+  const setBillDocs = (jobId, paymentId, fn) => setData((prev) => ({ ...prev, jobs: prev.jobs.map((j) => (j.id === jobId ? {
+    ...j, vendorPayments: (j.vendorPayments || []).map((b) => (b.id === paymentId ? { ...b, documents: fn(b.documents || []) } : b)),
+  } : j)) }));
+  const attachVendorDocument = (jobId, paymentId, file, { quiet } = {}) => {
+    const problem = docProblem(file);
+    if (problem) { showToast(problem + ". Nothing was attached."); return; }
+    const id = newId();
+    const doc = { id, vendorPaymentId: paymentId, jobId, path: vendorDocPath(jobId, paymentId, id, file.name),
+                  fileName: file.name, contentType: docTypeOf(file), size: file.size, uploadedAt: new Date().toISOString(), uploading: true };
+    setBillDocs(jobId, paymentId, (ds) => [...ds, doc]);
+    const prior = after(paymentId);
+    const upload = new File([file], file.name, { type: doc.contentType });
+    track(id, persist(() => prior
+      .then(() => repo.uploadVendorDocument(jobId, doc, upload))
+      .then(() => {
+        setBillDocs(jobId, paymentId, (ds) => ds.map((d) => (d.id === id ? { ...d, uploading: false } : d)));
+        if (!quiet) {
+          const b = rowOf(jobId, "vendorPayments", paymentId);
+          showToast("Attached " + file.name + (b ? " to the " + moneyDec(b.amount) + " bill from " + b.vendorName : "") + ".");
+        }
+      }), "Uploading " + file.name));
+  };
+  const removeVendorDocument = (jobId, paymentId, docId) => {
+    const b = rowOf(jobId, "vendorPayments", paymentId);
+    const doc = ((b && b.documents) || []).find((d) => d.id === docId);
+    setBillDocs(jobId, paymentId, (ds) => ds.filter((d) => d.id !== docId));
+    writeRow(docId, () => repo.deleteVendorDocument(jobId, docId), "Removing the document");
+    if (!doc) return;
+    showToast("Removed " + doc.fileName + " from the " + moneyDec(b.amount) + " bill from " + b.vendorName + ".", () => {
+      setBillDocs(jobId, paymentId, (ds) => [...ds.filter((d) => d.id !== docId), { ...doc, uploading: false }]);
+      writeRow(docId, () => repo.restoreVendorDocument(jobId, doc), "Putting the document back");
+      showToast("Put back " + doc.fileName + ".");
+    });
+  };
+
+  const addVendorPayment = (jobId, payment, files = []) => {
+    const p = { id: newId(), date: new Date().toISOString(), status: "pending", ...payment, documents: [] };
+    putRow(jobId, "vendorPayments", p);
+    writeRow(p.id, () => repo.createVendorPayment(jobId, p), "The vendor payment");
+    files.forEach((f) => attachVendorDocument(jobId, p.id, f, { quiet: true }));
+    const what = moneyDec(p.amount) + " " + (p.status === "paid" ? "paid" : "pending") + " bill from " + p.vendorName;
+    const attached = files.length ? " with " + (files.length === 1 ? files[0].name : files.length + " documents") : "";
+    showToast("Logged a " + what + attached + " on " + jobLabelOf(jobId) + ".", () => {
+      dropRow(jobId, "vendorPayments", p.id);
+      writeRow(p.id, () => repo.deleteVendorPayment(jobId, p.id), "Undoing the vendor payment");
+      showToast("Removed the " + what + ".");
+    });
   };
   const updateVendorPayment = (jobId, paymentId, patch) => {
     setData((prev) => ({
@@ -1044,14 +1174,35 @@ export default function App() {
     persist(() => repo.updateVendorPayment(jobId, paymentId, patch), "The vendor payment update");
   };
   const deleteVendorPayment = (jobId, paymentId) => {
-    // A credit taken against this bill stays on the job; the database clears
-    // its link (ON DELETE SET NULL), so clear it here too.
+    const p = rowOf(jobId, "vendorPayments", paymentId);
+    // Open-bill credits taken against this bill stay on the job; the database
+    // clears their link (ON DELETE SET NULL), so clear it here too — and
+    // remember which ones, so Undo can put the link back.
+    const linked = ((safeData.jobs.find((x) => x.id === jobId) || {}).vendorCredits || [])
+      .filter((c) => c.vendorPaymentId === paymentId).map((c) => c.id);
     setData((prev) => ({ ...prev, jobs: prev.jobs.map((j) => (j.id === jobId ? {
       ...j,
-      vendorPayments: (j.vendorPayments || []).filter((p) => p.id !== paymentId),
+      vendorPayments: (j.vendorPayments || []).filter((x) => x.id !== paymentId),
       vendorCredits: (j.vendorCredits || []).map((c) => (c.vendorPaymentId === paymentId ? { ...c, vendorPaymentId: null } : c)),
     } : j)) }));
-    persist(() => repo.deleteVendorPayment(jobId, paymentId), "Deleting the vendor payment");
+    writeRow(paymentId, () => repo.deleteVendorPayment(jobId, paymentId), "Deleting the vendor payment");
+    if (!p) return;
+    const what = moneyDec(p.amount) + " bill from " + p.vendorName;
+    showToast("Deleted the " + what + " on " + jobLabelOf(jobId) + "." +
+      (linked.length ? " The credit taken against it stays on the job." : ""), () => {
+      setData((prev) => ({ ...prev, jobs: prev.jobs.map((j) => (j.id === jobId ? {
+        ...j,
+        vendorPayments: [p, ...(j.vendorPayments || []).filter((x) => x.id !== p.id)],
+        vendorCredits: (j.vendorCredits || []).map((c) => (linked.includes(c.id) ? { ...c, vendorPaymentId: p.id } : c)),
+      } : j)) }));
+      writeRow(p.id, async () => {
+        await repo.createVendorPayment(jobId, p);
+        for (const id of linked) await repo.updateVendorCredit(jobId, id, { vendorPaymentId: p.id });
+        // Its documents' rows went with it (cascade); the files did not.
+        for (const d of (p.documents || [])) if (!d.uploading) await repo.restoreVendorDocument(jobId, d);
+      }, "Restoring the vendor payment");
+      showToast("Restored the " + what + ".");
+    });
   };
 
   const addVendor = (vendor) => {
@@ -1177,6 +1328,8 @@ export default function App() {
     addJob, updateJob, deleteJob,
     addClientPayment, deleteClientPayment, addClientCredit, deleteClientCredit,
     addVendorPayment, updateVendorPayment, deleteVendorPayment, addVendorCredit, deleteVendorCredit,
+    attachVendorDocument, removeVendorDocument,
+    showToast,
     addVendor, updateVendor, deleteVendor,
     addAssignment, updateAssignment, removeAssignment,
     selectedJobId, setSelectedJobId, showAddJob, setShowAddJob, showVendorForm, setShowVendorForm,
@@ -1312,6 +1465,7 @@ export default function App() {
       {selectedJobId && (
         <JobDetailModal ctx={ctx} job={jobs.find((j) => j.id === selectedJobId)} onClose={() => setSelectedJobId(null)} />
       )}
+      <UndoToast toast={toast} onClose={() => setToast(null)} />
       {showAddJob && (
         <JobFormModal jobs={jobs} onClose={() => setShowAddJob(false)}
           onSave={(j) => { const created = addJob(j); setShowAddJob(false); setSelectedJobId(created.id); }} />
@@ -1878,8 +2032,39 @@ function LinkedJobs({ ctx, job }) {
   );
 }
 
+/**
+ * One message at a time, bottom of the screen, above any open card. The live
+ * region is always in the page so screen readers announce each new message;
+ * the message never takes focus. Stays 12 s, paused while the pointer or
+ * keyboard focus is on it, and can be closed. Undo runs the action's own
+ * undo, which replaces this message with what it put back.
+ */
+function UndoToast({ toast, onClose }) {
+  const [paused, setPaused] = useState(false);
+  useEffect(() => {
+    if (!toast || paused) return undefined;
+    const t = setTimeout(onClose, 12000);
+    return () => clearTimeout(t);
+  }, [toast && toast.id, paused]);
+  useEffect(() => { setPaused(false); }, [toast && toast.id]);
+  return (
+    <div className="td-toast-region" role="status" aria-live="polite">
+      {toast && (
+        <div className="td-toast" key={toast.id}
+          onMouseEnter={() => setPaused(true)} onMouseLeave={() => setPaused(false)}
+          onFocus={() => setPaused(true)} onBlur={() => setPaused(false)}>
+          <Check size={14} aria-hidden="true" className="td-toast-icon" />
+          <span className="td-toast-msg">{toast.message}</span>
+          {toast.undo && <button type="button" className="td-toast-undo" onClick={() => toast.undo()}>Undo</button>}
+          <button type="button" className="td-toast-close" aria-label="Close message" onClick={onClose}><X size={14} /></button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function JobDetailModal({ ctx, job, onClose }) {
-  const { updateJob, deleteJob, addClientPayment, deleteClientPayment, addClientCredit, deleteClientCredit, addVendorPayment, updateVendorPayment, deleteVendorPayment, addVendorCredit, deleteVendorCredit, vendorNames } = ctx;
+  const { updateJob, deleteJob, addClientPayment, deleteClientPayment, addClientCredit, deleteClientCredit, addVendorPayment, updateVendorPayment, deleteVendorPayment, addVendorCredit, deleteVendorCredit, vendorNames, showToast, attachVendorDocument, removeVendorDocument } = ctx;
   const [notes, setNotes] = useState(job?.notes || "");
   const [name, setName] = useState(job?.customerName || "");
   const [phone, setPhone] = useState(job?.customerPhone || "");
@@ -1893,10 +2078,39 @@ function JobDetailModal({ ctx, job, onClose }) {
   const [vpForm, setVpForm] = useState({ vendorName: "", category: VENDOR_CATEGORIES[0], amount: "", date: new Date().toISOString().slice(0, 10), status: "pending", note: "" });
   // The Vendor credit form — closed by default, like Apply credit.
   const blankVc = () => ({ vendorName: "", amount: "", date: new Date().toISOString().slice(0, 10), reason: "", settlement: "on_account", vendorPaymentId: "" });
+  // Files picked in the Log vendor cost form (optional), and why any were refused.
+  const [vpFiles, setVpFiles] = useState([]);
+  const [vpFileNote, setVpFileNote] = useState("");
+  const vpFileInput = useRef(null);
+  // One hidden picker for "attach to this bill" buttons; billPick says which bill.
+  const billFileInput = useRef(null);
+  const [billPick, setBillPick] = useState(null);
+  // Signed links (1 hour) for this job's bill documents, fetched when the card
+  // opens and again whenever a document finishes uploading.
+  const [docUrls, setDocUrls] = useState({});
+  const docPaths = job ? (job.vendorPayments || []).flatMap((b) => (b.documents || []).filter((d) => !d.uploading).map((d) => d.path)) : [];
+  const docKey = docPaths.join("|");
+  useEffect(() => {
+    if (!docPaths.length) return undefined;
+    let live = true;
+    repo.vendorDocumentUrls(docPaths).then((m) => { if (live) setDocUrls(m); }).catch(() => {});
+    return () => { live = false; };
+  }, [docKey]);
   const [vcOpen, setVcOpen] = useState(false);
+  // Set when Apply is pressed with something missing: the form then says what
+  // is missing instead of the button sitting disabled with a tooltip.
+  const [vcTried, setVcTried] = useState(false);
+  const [ccTried, setCcTried] = useState(false);
   const [vcForm, setVcForm] = useState(blankVc);
 
   if (!job) return null;
+
+  // After a row is deleted its button is gone; put focus on the list heading
+  // rather than letting it fall to the page.
+  const focusList = (which) => requestAnimationFrame(() => {
+    const el = document.getElementById(which + "-title-" + job.id);
+    if (el) el.focus();
+  });
 
   // A project manager can change the notes on a job and the dates of their own
   // assignment, and nothing else. Both guard triggers in the database enforce
@@ -1987,9 +2201,20 @@ function JobDetailModal({ ctx, job, onClose }) {
   const ccAmount = Number(ccForm.amount) || 0;
   const ccBalanceAfter = balance - ccAmount;
   const ccValid = ccAmount > 0 && ccForm.reason.trim() !== "" && Boolean(ccForm.date);
+  const ccMissing = [
+    ccAmount > 0 ? null : ["an amount above $0", "cc-amount-"],
+    ccForm.date ? null : ["a date", "cc-date-"],
+    ccForm.reason.trim() ? null : ["a reason", "cc-reason-"],
+  ].filter(Boolean);
 
   const submitClientCredit = () => {
-    if (!ccValid) return;
+    if (!ccValid) {
+      setCcTried(true);
+      const el = document.getElementById(ccMissing[0][1] + job.id);
+      if (el) el.focus();
+      return;
+    }
+    setCcTried(false);
     addClientCredit(job.id, {
       amount: ccAmount,
       // Noon local time so the stored instant lands on the chosen day in any
@@ -2027,6 +2252,14 @@ function JobDetailModal({ ctx, job, onClose }) {
   const vpAmount = Number(vpForm.amount) || 0;
   const vpMarginAfter = netContract(job) - (vendorTotal(job) + vpAmount);
 
+  // Keep good files, say which were refused and why (never silently drop).
+  const pickVpFiles = (list) => {
+    const files = Array.from(list || []);
+    const bad = files.map(docProblem).filter(Boolean);
+    const good = files.filter((f) => !docProblem(f));
+    setVpFiles((cur) => [...cur, ...good.filter((g) => !cur.some((c) => c.name === g.name && c.size === g.size))]);
+    setVpFileNote(bad.length ? bad.join("; ") + "." : "");
+  };
   const submitVendorPayment = () => {
     if (!vpForm.vendorName.trim() || !vpForm.amount || vpAmount <= 0) return;
     if (vpMarginAfter < 0 && !confirm(
@@ -2036,8 +2269,9 @@ function JobDetailModal({ ctx, job, onClose }) {
       "If a change order raised the price, update the contract amount first so " +
       "the margin reports stay honest.\n\nLog the cost anyway?"
     )) return;
-    addVendorPayment(job.id, { vendorName: vpForm.vendorName.trim(), category: vpForm.category, amount: vpAmount, date: new Date(vpForm.date).toISOString(), status: vpForm.status, note: vpForm.note.trim() });
+    addVendorPayment(job.id, { vendorName: vpForm.vendorName.trim(), category: vpForm.category, amount: vpAmount, date: new Date(vpForm.date).toISOString(), status: vpForm.status, note: vpForm.note.trim() }, vpFiles);
     setVpForm({ vendorName: "", category: vpForm.category, amount: "", date: new Date().toISOString().slice(0, 10), status: "pending", note: "" });
+    setVpFiles([]); setVpFileNote("");
   };
 
   // ---- Vendor credit (2026-11-24) ----
@@ -2058,8 +2292,21 @@ function JobDetailModal({ ctx, job, onClose }) {
   const vcValid = vcVendor !== "" && vcAmount > 0 && vcForm.reason.trim() !== "" && Boolean(vcForm.date) &&
     (vcForm.settlement !== "open_bill" || Boolean(vcBill));
 
+  const vcMissing = [
+    vcVendor ? null : ["the vendor", "vc-vendor-"],
+    vcAmount > 0 ? null : ["an amount above $0", "vc-amount-"],
+    vcForm.date ? null : ["a date", "vc-date-"],
+    vcForm.settlement !== "open_bill" || vcBill ? null : ["the unpaid bill it's against", "vc-bill-"],
+    vcForm.reason.trim() ? null : ["a reason", "vc-reason-"],
+  ].filter(Boolean);
   const submitVendorCredit = () => {
-    if (!vcValid) return;
+    if (!vcValid) {
+      setVcTried(true);
+      const el = document.getElementById(vcMissing[0][1] + job.id);
+      if (el) el.focus();
+      return;
+    }
+    setVcTried(false);
     addVendorCredit(job.id, {
       vendorName: vcVendor,
       amount: vcAmount,
@@ -2077,7 +2324,35 @@ function JobDetailModal({ ctx, job, onClose }) {
     <Modal title={jobRef(job) + " · " + job.customerName} onClose={onClose} wide
       footer={<>
         {canManage && (
-          <button className="td-btn td-btn-danger" onClick={() => { if (confirm("Delete this job? This can't be undone.")) deleteJob(job.id); }}><Trash2 size={13} /> Delete job</button>
+          <button className="td-btn td-btn-danger" onClick={() => {
+            // Deleting a job erases its money rows with it (cascade), and that
+            // cannot be undone. With no money on it, one plain question. With
+            // money, the count and totals are named, Mark lost is offered as
+            // the way that keeps history, and the job number must be typed.
+            const who = jobNo(job.number) + " \u00b7 " + job.customerName;
+            const nIn = (job.clientPayments || []).length, nOut = (job.vendorPayments || []).length;
+            const nCr = (job.clientCredits || []).length + (job.vendorCredits || []).length;
+            if (nIn + nOut + nCr === 0) {
+              if (!confirm("Delete " + who + "? It has no payments, costs or credits. This can't be undone.")) return;
+            } else {
+              const parts = [
+                nIn ? nIn + " client payment" + (nIn === 1 ? "" : "s") + " (" + moneyDec(received) + ")" : null,
+                nOut ? nOut + " vendor bill" + (nOut === 1 ? "" : "s") + " (" + moneyDec(vendorGross(job)) + ")" : null,
+                nCr ? nCr + " credit" + (nCr === 1 ? "" : "s") : null,
+              ].filter(Boolean);
+              const typed = prompt("Delete " + who + " for good?\n\n" +
+                "This also erases " + listJoin(parts) + ". The Ledger and reports lose these records, and it can't be undone.\n\n" +
+                "If this job just didn't happen, cancel and use Mark lost instead \u2014 it keeps the money history.\n\n" +
+                "To delete anyway, type the job number (" + job.number + "):");
+              if (typed === null) return;
+              if (typed.trim().replace(/^JOB-0*/i, "") !== String(job.number)) {
+                alert("That wasn't " + job.number + ", so nothing was deleted.");
+                return;
+              }
+            }
+            deleteJob(job.id);
+            if (showToast) showToast("Deleted " + who + ".");
+          }}><Trash2 size={13} /> Delete job</button>
         )}
         <div style={{ flex: 1 }} />
         <button className="td-btn td-btn-primary" onClick={() => {
@@ -2223,47 +2498,94 @@ function JobDetailModal({ ctx, job, onClose }) {
         <LinkedJobs ctx={ctx} job={job} />
 
         {canManage && (<>
-        <div className="td-payment-summary">
-          <div className="td-payment-summary-item">
-            <span className="td-field-label">Contract</span>
-            <span className="td-payment-summary-value">{moneyDec(job.contractAmount)}</span>
-          </div>
-          <div className="td-payment-summary-item">
-            <span className="td-field-label">Received</span>
-            <span className="td-payment-summary-value td-text-green">{moneyDec(received)}</span>
-          </div>
-          <div className="td-payment-summary-item">
-            <span className="td-field-label">Client credits</span>
-            <span className={cls("td-payment-summary-value", credited > 0 ? "td-credit-text" : "td-cell-sub")}>{credited > 0 ? creditMoney(credited) : "$0.00"}</span>
-          </div>
-          <div className="td-payment-summary-item">
-            <span className="td-field-label">Balance due</span>
-            <span className={cls("td-payment-summary-value", balance > 0 && "td-text-red")}>{signedMoneyDec(balance)}</span>
-            {isPaidInFull(job) && balance > -0.005 && <span className="td-cell-sub td-text-green"><Check size={11} style={{ verticalAlign: -1 }} /> Paid in full</span>}
-          </div>
-          <div className="td-payment-summary-item">
-            <span className="td-field-label">Vendor costs owed</span>
-            <span className={cls("td-payment-summary-value", vOwed > 0 && "td-text-red")}>{money(vOwed)}</span>
-            {vOwed < vPending - 0.005 && <span className="td-cell-sub">after {money(vPending - vOwed)} in open-bill credits</span>}
-          </div>
-          {vCredited > 0 && (
-            <div className="td-payment-summary-item">
-              <span className="td-field-label">Vendor credits</span>
-              <span className="td-payment-summary-value td-credit-text">{creditMoney(vCredited)}</span>
+        {/* Money summary (2026-11-24): client side and vendor side as two
+            matching columns, read top to bottom — what it's worth, what has
+            been paid, what credits came off, what is still owed. Margin spans
+            the bottom. A credits row shows on both sides when either side has
+            one, so the Balance due / Owed rows stay level.
+            Built as heading + <dl> per side so a screen reader hears each
+            figure with its label and its side ("Vendors, Vendor costs owed,
+            $3,800.00"), not a run of loose numbers. */}
+        {(() => {
+          const showCredits = credited > 0 || vCredited > 0;
+          const shownMargin = fin ? fin.margin : margin;
+          // No bills and no credits yet: the margin is just the contract, so
+          // "100%" would read as a result. Say why instead (empty state).
+          const noCosts = (job.vendorPayments || []).length === 0 && vCredited === 0;
+          const none = <span className="td-money-val td-money-zero"><span aria-hidden="true">{"\u2014"}</span><span className="td-sr-only">None</span></span>;
+          return (
+            <div className="td-money">
+              <section className="td-money-col" aria-labelledby={"money-client-" + job.id}>
+                <h3 className="td-money-head" id={"money-client-" + job.id}>Client</h3>
+                <dl className="td-money-list">
+                  <div className="td-money-row td-money-row-top">
+                    <dt className="td-field-label">Contract</dt>
+                    <dd className="td-money-val-wrap"><span className="td-money-val">{moneyDec(job.contractAmount)}</span></dd>
+                  </div>
+                  <div className="td-money-row">
+                    <dt className="td-field-label">Received</dt>
+                    <dd className="td-money-val-wrap"><span className={cls("td-money-val", received > 0 ? "td-text-green" : "td-money-zero")}>{moneyDec(received)}</span></dd>
+                  </div>
+                  {showCredits && (
+                    <div className="td-money-row">
+                      <dt className="td-field-label">Client credits</dt>
+                      <dd className="td-money-val-wrap">{credited > 0 ? <span className="td-money-val td-credit-text">{creditMoney(credited)}</span> : none}</dd>
+                    </div>
+                  )}
+                  <div className="td-money-row td-money-row-end">
+                    <dt className="td-field-label">Balance due</dt>
+                    <dd className="td-money-val-wrap">
+                      <span className={cls("td-money-val", balance > 0.005 ? "td-text-red" : "td-money-zero")}>{signedMoneyDec(balance)}</span>
+                      {isPaidInFull(job) && balance > -0.005 && <span className="td-cell-sub td-text-green"><Check size={11} style={{ verticalAlign: -1 }} aria-hidden="true" /> Paid in full</span>}
+                    </dd>
+                  </div>
+                </dl>
+              </section>
+
+              <section className="td-money-col" aria-labelledby={"money-vendors-" + job.id}>
+                <h3 className="td-money-head" id={"money-vendors-" + job.id}>Vendors</h3>
+                <dl className="td-money-list">
+                  <div className="td-money-row td-money-row-top">
+                    <dt className="td-field-label">Total vendor cost</dt>
+                    <dd className="td-money-val-wrap"><span className="td-money-val">{signedMoneyDec(vendorTotal(job))}</span></dd>
+                  </div>
+                  <div className="td-money-row">
+                    <dt className="td-field-label">Vendor costs paid</dt>
+                    <dd className="td-money-val-wrap"><span className={cls("td-money-val", vPaid > 0 ? "td-text-green" : "td-money-zero")}>{moneyDec(vPaid)}</span></dd>
+                  </div>
+                  {showCredits && (
+                    <div className="td-money-row">
+                      <dt className="td-field-label">Vendor credits</dt>
+                      <dd className="td-money-val-wrap">{vCredited > 0 ? <span className="td-money-val td-credit-text">{creditMoney(vCredited)}</span> : none}</dd>
+                    </div>
+                  )}
+                  <div className="td-money-row td-money-row-end">
+                    <dt className="td-field-label">Vendor costs owed</dt>
+                    <dd className="td-money-val-wrap">
+                      <span className={cls("td-money-val", vOwed > 0.005 ? "td-text-red" : "td-money-zero")}>{moneyDec(vOwed)}</span>
+                      {vOwed < vPending - 0.005 && <span className="td-cell-sub">{money(vPending - vOwed)} credited on unpaid bills</span>}
+                    </dd>
+                  </div>
+                </dl>
+              </section>
+
+              <dl className="td-money-foot">
+                <dt className="td-field-label">{fin ? "Final GP" : "Margin"}</dt>
+                <dd className="td-money-val-wrap">
+                  <span className={cls("td-money-val", shownMargin < 0 && "td-text-red")}>
+                    {moneyDec(shownMargin)} <span className="td-cell-sub">({pct(fin ? fin.marginPct : marginPercent)})</span>
+                  </span>
+                  {noCosts && !fin && <span className="td-cell-sub">No vendor costs logged yet</span>}
+                  {/* The frozen number is the one of record. When later costs have
+                      moved the live figure the two are shown together, because a
+                      silent gap between what was reported and what the job now says
+                      is the thing finalizing was meant to prevent. */}
+                  {gpDrift && <span className="td-gp-drift" title="Costs have changed since this was finalized">Live figure {moneyDec(margin)}</span>}
+                </dd>
+              </dl>
             </div>
-          )}
-          <div className="td-payment-summary-item">
-            <span className="td-field-label">{fin ? "Final GP" : "Margin"}</span>
-            <span className={cls("td-payment-summary-value", (fin ? fin.margin : margin) < 0 && "td-text-red")}>
-              {money(fin ? fin.margin : margin)} <span className="td-cell-sub">({pct(fin ? fin.marginPct : marginPercent)})</span>
-            </span>
-            {/* The frozen number is the one of record. When later costs have
-                moved the live figure the two are shown together, because a
-                silent gap between what was reported and what the job now says
-                is the thing finalizing was meant to prevent. */}
-            {gpDrift && <span className="td-gp-drift" title="Costs have changed since this was finalized">live {money(margin)}</span>}
-          </div>
-        </div>
+          );
+        })()}
         <ProgressBar value={paidPct(job)} tone={balance <= 0 ? "green" : undefined} />
 
         {isPaidInFull(job) && (
@@ -2286,7 +2608,7 @@ function JobDetailModal({ ctx, job, onClose }) {
 
         <div className="td-job-detail-cols">
           <div className="td-job-detail-col">
-            <div className="td-drawer-section-title" style={{ borderTop: "none", paddingTop: 0 }}>Client payments</div>
+            <div className="td-drawer-section-title" id={"cp-title-" + job.id} tabIndex={-1} style={{ borderTop: "none", paddingTop: 0 }}>Client payments</div>
             {(job.clientPayments || []).length === 0 && (job.clientCredits || []).length === 0 ? <div className="td-muted-line">No payments logged yet.</div> : (
               <div className="td-payment-list">
                 {[...(job.clientPayments || []).map((p) => ({ ...p, _kind: "payment" })),
@@ -2300,9 +2622,8 @@ function JobDetailModal({ ctx, job, onClose }) {
                       </div>
                       <div className="td-cell-sub">{fmtDate(p.date)}{p.reason ? " \u00b7 \u201c" + p.reason + "\u201d" : ""}</div>
                     </div>
-                    <button className="td-iconbtn td-iconbtn-danger" onClick={() => {
-                      if (confirm("Delete this " + creditMoney(p.amount) + " client credit" + (p.reason ? " (\u201c" + p.reason + "\u201d)" : "") + "? The balance due will go back up by " + moneyDec(p.amount) + ".")) deleteClientCredit(job.id, p.id);
-                    }} aria-label="Delete client credit"><Trash2 size={12} /></button>
+                    <button className="td-iconbtn td-iconbtn-danger" onClick={() => { deleteClientCredit(job.id, p.id); focusList("cp"); }}
+                      aria-label={"Delete " + creditMoney(p.amount) + " client credit of " + fmtDate(p.date)} title="Delete this credit (you can undo)"><Trash2 size={12} /></button>
                   </div>
                 ) : (
                   <div key={p.id} className="td-payment-row">
@@ -2321,11 +2642,12 @@ function JobDetailModal({ ctx, job, onClose }) {
                       </div>
                     </div>
                     <button className="td-iconbtn td-iconbtn-danger" onClick={() => {
-                      const msg = p.sourceRef
-                        ? "Delete this " + money(p.amount) + " payment? It came from GoHighLevel, so the next update for this job will put it back — clear the field in the CRM instead if it shouldn't be there."
-                        : "Delete this " + money(p.amount) + " client payment? The balance due will go back up.";
-                      if (confirm(msg)) deleteClientPayment(job.id, p.id);
-                    }} aria-label="Delete payment"><Trash2 size={12} /></button>
+                      // A GHL payment can't be reliably undone (re-creating it here
+                      // would lose its CRM link), so it still asks first.
+                      if (p.sourceRef && !confirm("Delete this " + money(p.amount) + " payment? It came from GoHighLevel, so the next update for this job will put it back \u2014 clear the field in the CRM instead if it shouldn't be there.")) return;
+                      deleteClientPayment(job.id, p.id); focusList("cp");
+                    }} aria-label={"Delete " + moneyDec(p.amount) + " client payment of " + fmtDate(p.date)}
+                      title={p.sourceRef ? "Delete this payment" : "Delete this payment (you can undo)"}><Trash2 size={12} /></button>
                   </div>
                 ))}
               </div>
@@ -2370,11 +2692,11 @@ function JobDetailModal({ ctx, job, onClose }) {
               <div className="td-payment-form td-credit-form">
                 <div className="td-credit-form-title">Apply client credit</div>
                 <div className="td-payment-form-row">
-                  <input className="td-input td-input-num" type="number" min="0" step="0.01" placeholder="Credit amount" autoFocus
+                  <input className="td-input td-input-num" id={"cc-amount-" + job.id} aria-label="Credit amount" type="number" min="0" step="0.01" placeholder="Credit amount" autoFocus
                     value={ccForm.amount} onChange={(e) => setCcForm((f) => ({ ...f, amount: e.target.value }))} />
-                  <input className="td-input" type="date" value={ccForm.date} onChange={(e) => setCcForm((f) => ({ ...f, date: e.target.value }))} />
+                  <input className="td-input" id={"cc-date-" + job.id} aria-label="Credit date" type="date" value={ccForm.date} onChange={(e) => setCcForm((f) => ({ ...f, date: e.target.value }))} />
                 </div>
-                <input className="td-input" placeholder="Reason (required) — e.g. Gutter color change" value={ccForm.reason}
+                <input className="td-input" id={"cc-reason-" + job.id} aria-label="Reason (required)" placeholder="Reason (required) — e.g. Gutter color change" value={ccForm.reason}
                   onChange={(e) => setCcForm((f) => ({ ...f, reason: e.target.value }))}
                   onKeyDown={(e) => { if (e.key === "Enter") submitClientCredit(); }} />
                 {ccAmount > 0 && (
@@ -2386,19 +2708,32 @@ function JobDetailModal({ ctx, job, onClose }) {
                     <span>This leaves a {signedMoneyDec(ccBalanceAfter)} balance. Credits aren't refunds — check the amount.</span>
                   </div>
                 )}
+                {ccTried && !ccValid && (
+                  <div className="td-overage-hint" id={"cc-missing-" + job.id} role="alert">
+                    <AlertTriangle size={13} aria-hidden="true" />
+                    <span>To apply this credit, add {listJoin(ccMissing.map((m) => m[0]))}.</span>
+                  </div>
+                )}
                 <div className="td-payment-btns">
-                  <button className="td-btn td-btn-sm td-credit-btn td-credit-btn-solid" disabled={!ccValid} onClick={submitClientCredit}
-                    title={ccValid ? "" : "Enter an amount above $0 and a reason"}>
+                  <button className="td-btn td-btn-sm td-credit-btn td-credit-btn-solid" onClick={submitClientCredit}
+                    aria-describedby={ccTried && !ccValid ? "cc-missing-" + job.id : undefined}>
                     <Check size={13} /> Apply credit
                   </button>
-                  <button className="td-btn td-btn-sm" onClick={() => { setCcOpen(false); setCcForm({ amount: "", date: new Date().toISOString().slice(0, 10), reason: "" }); }}>Cancel</button>
+                  <button className="td-btn td-btn-sm" onClick={() => { setCcOpen(false); setCcTried(false); setCcForm({ amount: "", date: new Date().toISOString().slice(0, 10), reason: "" }); }}>Cancel</button>
                 </div>
               </div>
             )}
           </div>
 
           <div className="td-job-detail-col">
-            <div className="td-drawer-section-title" style={{ borderTop: "none", paddingTop: 0 }}>Vendor payments</div>
+            <div className="td-drawer-section-title" id={"vp-title-" + job.id} tabIndex={-1} style={{ borderTop: "none", paddingTop: 0 }}>Vendor payments</div>
+            <input ref={billFileInput} type="file" multiple accept={DOC_ACCEPT} hidden
+              onChange={(e) => {
+                const files = Array.from(e.target.files || []);
+                e.target.value = "";
+                if (billPick) files.forEach((f) => attachVendorDocument(job.id, billPick, f));
+                setBillPick(null);
+              }} />
             {vCredited > 0 && (
               <div className="td-cell-sub td-vendor-net-strip">
                 Vendor bills <strong>{moneyDec(vendorGross(job))}</strong> · Credits <strong className="td-credit-text">{creditMoney(vCredited)}</strong> · Net cost <strong>{signedMoneyDec(vendorTotal(job))}</strong>
@@ -2425,9 +2760,8 @@ function JobDetailModal({ ctx, job, onClose }) {
                         })()}
                       </div>
                     </div>
-                    <button className="td-iconbtn td-iconbtn-danger" onClick={() => {
-                      if (confirm("Delete this " + creditMoney(p.amount) + " credit from " + p.vendorName + (p.reason ? " (\u201c" + p.reason + "\u201d)" : "") + "? The job's vendor cost will go back up by " + moneyDec(p.amount) + ".")) deleteVendorCredit(job.id, p.id);
-                    }} aria-label="Delete vendor credit"><Trash2 size={12} /></button>
+                    <button className="td-iconbtn td-iconbtn-danger" onClick={() => { deleteVendorCredit(job.id, p.id); focusList("vp"); }}
+                      aria-label={"Delete " + creditMoney(p.amount) + " credit from " + p.vendorName} title="Delete this credit (you can undo)"><Trash2 size={12} /></button>
                   </div>
                 ) : (
                   <div key={p.id} className="td-payment-row">
@@ -2439,41 +2773,93 @@ function JobDetailModal({ ctx, job, onClose }) {
                       <div className="td-cell-sub">{p.category} · {fmtDate(p.date)}{p.note ? " · " + p.note : ""}
                         {creditsAgainstBill(job, p.id) > 0 && <> · <span className="td-credit-text">{creditMoney(creditsAgainstBill(job, p.id))} credited</span></>}
                       </div>
+                      {(p.documents || []).length > 0 && (
+                        <ul className="td-doc-list" aria-label={"Documents on the " + moneyDec(p.amount) + " bill from " + p.vendorName}>
+                          {p.documents.map((d) => (
+                            <li key={d.id} className="td-doc-chip">
+                              <FileText size={12} aria-hidden="true" />
+                              {d.uploading ? (
+                                <span className="td-doc-name td-cell-sub">Uploading {d.fileName}…</span>
+                              ) : docUrls[d.path] ? (
+                                <a className="td-doc-name" href={docUrls[d.path]} target="_blank" rel="noopener noreferrer"
+                                  title={"Open " + d.fileName + " (" + fileSize(d.size) + ") in a new tab"}>{d.fileName}</a>
+                              ) : (
+                                <span className="td-doc-name td-cell-sub" title="Getting a link to open this file">{d.fileName}</span>
+                              )}
+                              {!d.uploading && (
+                                <button type="button" className="td-doc-x" aria-label={"Remove " + d.fileName + " from this bill"}
+                                  title="Remove from this bill (you can undo)"
+                                  onClick={() => removeVendorDocument(job.id, p.id, d.id)}><X size={12} /></button>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
                     </div>
+                    <button type="button" className="td-iconbtn" onClick={() => { setBillPick(p.id); if (billFileInput.current) billFileInput.current.click(); }}
+                      aria-label={"Attach a document to the " + moneyDec(p.amount) + " bill from " + p.vendorName}
+                      title="Attach an invoice or receipt (PDF or photo, up to 20 MB)"><Paperclip size={12} /></button>
                     <button className={cls("td-toggle-chip", p.status === "paid" && "active")} style={{ padding: "4px 8px", fontSize: 11 }}
+                      aria-pressed={p.status === "paid"}
+                      aria-label={moneyDec(p.amount) + " bill from " + p.vendorName + ": " + (p.status === "paid" ? "paid" : "pending") + ". Press to mark " + (p.status === "paid" ? "pending" : "paid")}
                       onClick={() => updateVendorPayment(job.id, p.id, { status: p.status === "paid" ? "pending" : "paid" })}>
                       {p.status === "paid" ? <><Check size={11} /> Paid</> : "Pending"}
                     </button>
-                    <button className="td-iconbtn td-iconbtn-danger" onClick={() => {
-                      const linked = creditsAgainstBill(job, p.id);
-                      if (confirm("Delete this " + money(p.amount) + " payment to " + p.vendorName + "?" +
-                        (linked > 0 ? "\n\nThe " + creditMoney(linked) + " credit taken against this bill stays on the job." : ""))) deleteVendorPayment(job.id, p.id);
-                    }} aria-label="Delete"><Trash2 size={12} /></button>
+                    <button className="td-iconbtn td-iconbtn-danger" onClick={() => { deleteVendorPayment(job.id, p.id); focusList("vp"); }}
+                      aria-label={"Delete " + moneyDec(p.amount) + " bill from " + p.vendorName} title="Delete this bill (you can undo)"><Trash2 size={12} /></button>
                   </div>
                 ))}
               </div>
             )}
             <div className="td-payment-form">
               <div className="td-payment-form-row">
-                <input className="td-input" list="vendor-name-options" placeholder="Vendor name" value={vpForm.vendorName} onChange={(e) => setVpForm((f) => ({ ...f, vendorName: e.target.value }))} />
-                <input className="td-input td-input-num" type="number" placeholder="Amount" value={vpForm.amount} onChange={(e) => setVpForm((f) => ({ ...f, amount: e.target.value }))} />
+                <input className="td-input" aria-label="Vendor name" list="vendor-name-options" placeholder="Vendor name" value={vpForm.vendorName} onChange={(e) => setVpForm((f) => ({ ...f, vendorName: e.target.value }))} />
+                <input className="td-input td-input-num" aria-label="Bill amount" type="number" placeholder="Amount" value={vpForm.amount} onChange={(e) => setVpForm((f) => ({ ...f, amount: e.target.value }))} />
               </div>
               <datalist id="vendor-name-options">
                 {vendorNames.map((n) => <option key={n} value={n} />)}
               </datalist>
               <div className="td-payment-form-row">
-                <select className="td-select" value={vpForm.category} onChange={(e) => setVpForm((f) => ({ ...f, category: e.target.value }))}>
+                <select className="td-select" aria-label="Cost category" value={vpForm.category} onChange={(e) => setVpForm((f) => ({ ...f, category: e.target.value }))}>
                   {VENDOR_CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
                 </select>
-                <input className="td-input" type="date" value={vpForm.date} onChange={(e) => setVpForm((f) => ({ ...f, date: e.target.value }))} />
+                <input className="td-input" aria-label="Bill date" type="date" value={vpForm.date} onChange={(e) => setVpForm((f) => ({ ...f, date: e.target.value }))} />
               </div>
               <div className="td-payment-form-row">
-                <select className="td-select" value={vpForm.status} onChange={(e) => setVpForm((f) => ({ ...f, status: e.target.value }))}>
+                <select className="td-select" aria-label="Paid or pending" value={vpForm.status} onChange={(e) => setVpForm((f) => ({ ...f, status: e.target.value }))}>
                   <option value="pending">Pending (owed)</option>
                   <option value="paid">Paid</option>
                 </select>
-                <input className="td-input" placeholder="Note (optional)" value={vpForm.note} onChange={(e) => setVpForm((f) => ({ ...f, note: e.target.value }))} />
+                <input className="td-input" aria-label="Note (optional)" placeholder="Note (optional)" value={vpForm.note} onChange={(e) => setVpForm((f) => ({ ...f, note: e.target.value }))} />
               </div>
+              <div className="td-doc-pick">
+                <button type="button" className="td-btn td-btn-sm" onClick={() => vpFileInput.current && vpFileInput.current.click()}
+                  aria-describedby={"vp-doc-help-" + job.id}>
+                  <Paperclip size={13} aria-hidden="true" /> Attach invoice or receipt
+                </button>
+                <span className="td-cell-sub" id={"vp-doc-help-" + job.id}>Optional · PDF or photo, up to 20 MB</span>
+                <input ref={vpFileInput} type="file" multiple accept={DOC_ACCEPT} hidden
+                  onChange={(e) => { pickVpFiles(e.target.files); e.target.value = ""; }} />
+              </div>
+              {vpFiles.length > 0 && (
+                <ul className="td-doc-list" aria-label="Documents to attach">
+                  {vpFiles.map((f, i) => (
+                    <li key={f.name + f.size} className="td-doc-chip">
+                      <FileText size={12} aria-hidden="true" />
+                      <span className="td-doc-name">{f.name}</span>
+                      <span className="td-cell-sub">{fileSize(f.size)}</span>
+                      <button type="button" className="td-doc-x" aria-label={"Don't attach " + f.name}
+                        onClick={() => setVpFiles((cur) => cur.filter((_, k) => k !== i))}><X size={12} /></button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {vpFileNote && (
+                <div className="td-overage-hint" role="alert">
+                  <AlertTriangle size={13} aria-hidden="true" />
+                  <span>Not added: {vpFileNote}</span>
+                </div>
+              )}
               {vpAmount > 0 && vpMarginAfter < 0 && (
                 <div className="td-overage-hint td-overage-hint-loss">
                   <AlertTriangle size={13} />
@@ -2494,20 +2880,20 @@ function JobDetailModal({ ctx, job, onClose }) {
               <div className="td-payment-form td-credit-form">
                 <div className="td-credit-form-title">Vendor credit</div>
                 <div className="td-payment-form-row">
-                  <input className="td-input" list="vendor-credit-options" placeholder="Vendor" autoFocus value={vcForm.vendorName}
+                  <input className="td-input" id={"vc-vendor-" + job.id} aria-label="Vendor" list="vendor-credit-options" placeholder="Vendor" autoFocus value={vcForm.vendorName}
                     onChange={(e) => setVcForm((f) => ({ ...f, vendorName: e.target.value, vendorPaymentId: "" }))} />
-                  <input className="td-input td-input-num" type="number" min="0" step="0.01" placeholder="Credit amount"
+                  <input className="td-input td-input-num" id={"vc-amount-" + job.id} aria-label="Credit amount" type="number" min="0" step="0.01" placeholder="Credit amount"
                     value={vcForm.amount} onChange={(e) => setVcForm((f) => ({ ...f, amount: e.target.value }))} />
                 </div>
                 <datalist id="vendor-credit-options">
                   {vcVendorOptions.map((n) => <option key={n} value={n} />)}
                 </datalist>
                 <div className="td-payment-form-row">
-                  <select className="td-select" value={vcForm.settlement} title={VENDOR_CREDIT_SETTLEMENTS[vcForm.settlement].long}
+                  <select className="td-select" aria-label="How the credit comes back" value={vcForm.settlement} title={VENDOR_CREDIT_SETTLEMENTS[vcForm.settlement].long}
                     onChange={(e) => setVcForm((f) => ({ ...f, settlement: e.target.value, vendorPaymentId: "" }))}>
                     {Object.entries(VENDOR_CREDIT_SETTLEMENTS).map(([k, v]) => <option key={k} value={k}>{v.label} — {v.long.toLowerCase()}</option>)}
                   </select>
-                  <input className="td-input" type="date" value={vcForm.date} onChange={(e) => setVcForm((f) => ({ ...f, date: e.target.value }))} />
+                  <input className="td-input" id={"vc-date-" + job.id} aria-label="Credit date" type="date" value={vcForm.date} onChange={(e) => setVcForm((f) => ({ ...f, date: e.target.value }))} />
                 </div>
                 {vcForm.settlement === "open_bill" && (
                   vcVendor && vcOpenBills.length === 0 ? (
@@ -2517,7 +2903,7 @@ function JobDetailModal({ ctx, job, onClose }) {
                     </div>
                   ) : (
                     <div className="td-payment-form-row">
-                      <select className="td-select" value={vcForm.vendorPaymentId} disabled={!vcVendor}
+                      <select className="td-select" id={"vc-bill-" + job.id} aria-label="Unpaid bill this credit is against" value={vcForm.vendorPaymentId} disabled={!vcVendor}
                         onChange={(e) => setVcForm((f) => ({ ...f, vendorPaymentId: e.target.value }))}>
                         <option value="">{vcVendor ? "Which unpaid bill?" : "Pick the vendor first"}</option>
                         {vcOpenBills.map((b) => <option key={b.id} value={b.id}>{moneyDec(b.amount)} · {b.category} · {fmtDate(b.date)}{b.note ? " · " + b.note : ""}</option>)}
@@ -2525,7 +2911,7 @@ function JobDetailModal({ ctx, job, onClose }) {
                     </div>
                   )
                 )}
-                <input className="td-input" placeholder="Reason (required) — e.g. Returned 4 squares of siding, credit memo #1234" value={vcForm.reason}
+                <input className="td-input" id={"vc-reason-" + job.id} aria-label="Reason (required)" placeholder="Reason (required) — e.g. Returned 4 squares of siding, credit memo #1234" value={vcForm.reason}
                   onChange={(e) => setVcForm((f) => ({ ...f, reason: e.target.value }))}
                   onKeyDown={(e) => { if (e.key === "Enter") submitVendorCredit(); }} />
                 {vcAmount > 0 && vcVendor && (
@@ -2548,12 +2934,18 @@ function JobDetailModal({ ctx, job, onClose }) {
                 {vcForm.settlement === "on_account" && (
                   <div className="td-cell-sub">When {vcVendor || "the vendor"} applies this credit to a later invoice, log that bill at its full amount — logging it net counts the credit twice.</div>
                 )}
+                {vcTried && !vcValid && (
+                  <div className="td-overage-hint" id={"vc-missing-" + job.id} role="alert">
+                    <AlertTriangle size={13} aria-hidden="true" />
+                    <span>To apply this credit, add {listJoin(vcMissing.map((m) => m[0]))}.</span>
+                  </div>
+                )}
                 <div className="td-payment-btns">
-                  <button className="td-btn td-btn-sm td-credit-btn td-credit-btn-solid" disabled={!vcValid} onClick={submitVendorCredit}
-                    title={vcValid ? "" : "Enter a vendor, an amount above $0 and a reason" + (vcForm.settlement === "open_bill" ? ", and pick the bill" : "")}>
+                  <button className="td-btn td-btn-sm td-credit-btn td-credit-btn-solid" onClick={submitVendorCredit}
+                    aria-describedby={vcTried && !vcValid ? "vc-missing-" + job.id : undefined}>
                     <Check size={13} /> Apply vendor credit
                   </button>
-                  <button className="td-btn td-btn-sm" onClick={() => { setVcOpen(false); setVcForm(blankVc()); }}>Cancel</button>
+                  <button className="td-btn td-btn-sm" onClick={() => { setVcOpen(false); setVcTried(false); setVcForm(blankVc()); }}>Cancel</button>
                 </div>
               </div>
             )}
@@ -5607,6 +5999,21 @@ function GlobalStyle() {
       .td-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 
       /* ---------- Modal ---------- */
+      .td-doc-pick { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .td-doc-list { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+      .td-doc-chip { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; background: var(--td-paper); border: 1px solid var(--td-border); border-radius: 6px; padding: 2px 4px 2px 7px; font-size: 12px; }
+      .td-doc-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
+      a.td-doc-name { color: var(--td-text); text-decoration: underline; text-underline-offset: 2px; }
+      .td-doc-x { background: none; border: none; color: var(--td-muted); cursor: pointer; padding: 2px; display: flex; border-radius: 4px; }
+      .td-doc-x:hover, .td-doc-x:focus-visible { color: var(--td-red); background: rgba(0,0,0,0.05); }
+      .td-toast-region { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 200; width: max-content; max-width: calc(100vw - 32px); pointer-events: none; }
+      .td-toast { pointer-events: auto; display: flex; align-items: center; gap: 10px; background: var(--td-ink); color: var(--td-ink-text); border-radius: 8px; padding: 10px 10px 10px 14px; box-shadow: 0 10px 30px rgba(15,12,6,0.35); font-size: 13.5px; }
+      .td-toast-icon { color: #7FC79A; flex-shrink: 0; }
+      .td-toast-msg { line-height: 1.4; }
+      .td-toast-undo { background: none; border: 1px solid var(--td-ink-border); color: #F2C46D; font-weight: 700; border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 13px; flex-shrink: 0; }
+      .td-toast-undo:hover, .td-toast-undo:focus-visible { background: rgba(255,255,255,0.08); }
+      .td-toast-close { background: none; border: none; color: var(--td-ink-muted); cursor: pointer; padding: 4px; display: flex; flex-shrink: 0; }
+      .td-toast-close:hover, .td-toast-close:focus-visible { color: var(--td-ink-text); }
       .td-modal-veil { position: fixed; inset: 0; background: rgba(20,17,10,0.45); display: flex; align-items: center; justify-content: center; z-index: 100; padding: 16px; }
       .td-modal { background: var(--td-paper); border-radius: 8px; width: 100%; max-width: 460px; max-height: 88vh; display: flex; flex-direction: column; box-shadow: 0 24px 60px rgba(15,12,6,0.35); }
       .td-modal-wide { max-width: 780px; }
@@ -6052,6 +6459,25 @@ function GlobalStyle() {
       .td-linked-add .td-input { max-width: 200px; }
       .td-linked-err { color: #9A2E1C; font-size: 12px; margin-top: 6px; }
       @media (max-width: 640px) { .td-linked-list li { grid-template-columns: 70px 1fr auto auto; } }
+      .td-sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+      .td-money { display: grid; grid-template-columns: 1fr 1fr; background: var(--td-card); border: 1px solid var(--td-border); border-radius: var(--td-radius); margin: 12px 0 4px; overflow: hidden; }
+      .td-money-col { display: flex; flex-direction: column; padding: 10px 16px 12px; min-width: 0; }
+      .td-money-list { display: flex; flex-direction: column; flex: 1; margin: 0; }
+      .td-money dt, .td-money dd { margin: 0; }
+      .td-money-col + .td-money-col { border-left: 1px solid var(--td-border); }
+      .td-money-head { margin: 0; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; font-weight: 700; color: var(--td-text); padding-bottom: 6px; border-bottom: 2px solid var(--td-text); margin-bottom: 2px; }
+      .td-money-row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 7px 0; border-bottom: 1px dashed var(--td-border); }
+      .td-money-row:has(+ .td-money-row-end) { border-bottom: none; }
+      .td-money-row-end { border-bottom: none; border-top: 1px solid var(--td-border); margin-top: auto; padding-top: 9px; }
+      .td-money-row-top .td-money-val { font-size: 19px; }
+      .td-money-val { font-family: 'Oswald', sans-serif; font-size: 17px; font-weight: 600; white-space: nowrap; }
+      .td-money-zero { color: var(--td-muted); font-weight: 500; }
+      .td-money-val-wrap { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; text-align: right; }
+      .td-money-foot { margin: 0; grid-column: 1 / -1; display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 9px 16px; background: var(--td-paper); border-top: 1px solid var(--td-border); }
+      @media (max-width: 640px) {
+        .td-money { grid-template-columns: 1fr; }
+        .td-money-col + .td-money-col { border-left: none; border-top: 1px solid var(--td-border); }
+      }
       .td-payment-summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; background: var(--td-card); border: 1px solid var(--td-border); border-radius: var(--td-radius); padding: 12px 14px; margin: 12px 0 4px; }
       .td-payment-summary-item { display: flex; flex-direction: column; gap: 4px; }
       .td-payment-summary-value { font-family: 'Oswald', sans-serif; font-size: 17px; font-weight: 600; }
