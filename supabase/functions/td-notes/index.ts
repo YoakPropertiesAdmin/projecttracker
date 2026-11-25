@@ -1,6 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2.45.4";
-import { db, ghlFetch, logSync } from "../_shared/crm-client.ts";
+import { db, DEFAULT_LOCATION, ghlFetch, logSync } from "../_shared/crm-client.ts";
 
 /**
  * Job notes (2026-11-25). GHL owns notes: they live on the GHL contact's Notes
@@ -20,6 +20,13 @@ import { db, ghlFetch, logSync } from "../_shared/crm-client.ts";
  *   POST { action: "seed", offset?, limit? }         one-time pull of every monitored contact's notes
  *   POST { action: "migrate_apply", limit? }         carry out the planned note_migration rows
  * No schedule calls this. GHL is written only by "add" and by an approved migrate_apply.
+ *
+ * Writing (v2, 2026-11-25): the app cannot get contacts.write, so notes are created
+ * with the Notes API (POST /notes/, Version v3, scope notes.write) attached to the
+ * contact through relations [{ objectKey: "contact" }]. That API requires a GHL
+ * userId: the writer's linked GHL user, else the GHL user with the same email,
+ * else GHL_NOTES_FALLBACK_USER_ID (Joshua Egan) with the note signed by the writer.
+ * Reading still uses GET /contacts/:id/notes (contacts.readonly).
  */
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
@@ -29,6 +36,7 @@ const ORIGINS = (Deno.env.get("APP_ORIGINS") ||
   .split(",").map((s) => s.trim()).filter(Boolean);
 const MAX_BODY = 5000;
 const MIGRATED_ON = "11/25/2026";
+const FALLBACK_GHL_USER = (Deno.env.get("GHL_NOTES_FALLBACK_USER_ID") || "IMVODLnWE1xJBob2r4tK").trim();
 
 function cors(req: Request) {
   const o = req.headers.get("origin") || "";
@@ -93,6 +101,11 @@ async function author(userId: string, email: string | null) {
     if (gu?.deleted) ghlUserId = null;
     name = gu?.name || null;
   }
+  if (!ghlUserId && email) {
+    const { data: byEmail } = await db().from("ghl_users").select("ghl_user_id,name")
+      .ilike("email", email).eq("deleted", false).limit(1).maybeSingle();
+    if (byEmail?.ghl_user_id) { ghlUserId = byEmail.ghl_user_id; name = name || byEmail.name || null; }
+  }
   if (!name) {
     const { data: a } = await db().from("assignees").select("name").eq("user_id", userId).limit(1).maybeSingle();
     name = a?.name || null;
@@ -100,12 +113,12 @@ async function author(userId: string, email: string | null) {
   return { ghlUserId, name: name || (email ? email.split("@")[0] : "TradeDesk user") };
 }
 
-/** Create a note on a GHL contact. */
+/** Create a note on a GHL contact (Notes API, notes.write). */
 async function createGhlNote(contactId: string, body: string, ghlUserId: string | null) {
-  const payload: Record<string, unknown> = { body };
-  if (ghlUserId) payload.userId = ghlUserId;
-  return await ghlFetch("/contacts/" + encodeURIComponent(contactId) + "/notes",
-    { method: "POST", body: JSON.stringify(payload) });
+  const payload = { body, userId: ghlUserId || FALLBACK_GHL_USER,
+                    relations: [{ objectKey: "contact", recordId: contactId }] };
+  return await ghlFetch("/notes/?locationId=" + encodeURIComponent(DEFAULT_LOCATION),
+    { method: "POST", headers: { Version: "v3" }, body: JSON.stringify(payload) });
 }
 
 // ---------------- user actions ----------------
