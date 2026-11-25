@@ -60,6 +60,10 @@ const jobFromRow = (r) => ({
   // 'open' jobs are managed by the sync; the rest are kept as history.
   ghlStatus: r.ghl_status || "open",
   ghlProjectDisplayId: r.ghl_project_display_id || null,
+  // Read-only. A job whose contact came from a GHL opportunity (a monitored
+  // pipeline) shows that contact's GHL notes; see JobNotes in App.jsx.
+  ghlContactId: r.ghl_contact_id || null,
+  ghlOpportunityId: r.ghl_opportunity_id || null,
   // Jobs that belong to one customer project (phases, add-ons, a re-sell after
   // a cancellation) share a group. Set automatically when two jobs carry the
   // same GHL project #, or by hand with linkJobs(). Each job keeps its own
@@ -721,6 +725,33 @@ const supabaseRepo = {
     return rows.map(scheduleReviewFromRow);
   },
 
+  /**
+   * Job notes (2026-11-25). GHL owns them: the td-notes edge function re-reads
+   * the customer's GHL contact notes and returns the job's log (newest first;
+   * the old TradeDesk notes box, moved over, sorts last). If the function
+   * can't be reached, the last mirrored copy is read straight from the
+   * database and marked stale.
+   */
+  async jobNotes(jobId) {
+    const { data, error } = await supabase.functions.invoke("td-notes", { body: { action: "list", job_id: jobId } });
+    if (!error && data && Array.isArray(data.notes)) {
+      return { notes: data.notes, stale: Boolean(data.stale), inGhl: Boolean(data.in_ghl) };
+    }
+    const rows = await supabase.rpc("job_notes", { p_job: jobId }).then(unwrap);
+    return { notes: rows || [], stale: true, inGhl: null };
+  },
+
+  /** Write a note: to the GHL contact when the job has one, else kept in TradeDesk. */
+  async addJobNote(jobId, body) {
+    const { data, error } = await supabase.functions.invoke("td-notes", { body: { action: "add", job_id: jobId, body } });
+    if (error) {
+      let msg = "";
+      try { msg = (await error.context.json()).error || ""; } catch { /* not JSON */ }
+      throw new Error(msg || "The note didn't save. Check your connection and try again.");
+    }
+    return { notes: data.notes || [], stale: Boolean(data.stale), inGhl: Boolean(data.in_ghl) };
+  },
+
   async whoAmI() {
     const { data } = await supabase.auth.getUser();
     return (data && data.user && data.user.email) || "unknown";
@@ -991,6 +1022,22 @@ const localRepo = {
     return persistLocal();
   },
 
+  // Dev-only stand-in for td-notes: the old notes box shows as the first entry.
+  async jobNotes(jobId) {
+    const j = cache.jobs.find((x) => x.id === jobId) || {};
+    const added = (cache.jobNotes && cache.jobNotes[jobId]) || [];
+    const legacy = j.notes ? [{ id: "legacy-" + jobId, body: j.notes, author: "TradeDesk (before 11/25/2026)",
+      date_added: j.createdAt, source: "migration", job_id: jobId, job_number: j.number, in_ghl: false }] : [];
+    return { notes: [...added, ...legacy], stale: false, inGhl: false };
+  },
+  async addJobNote(jobId, body) {
+    const j = cache.jobs.find((x) => x.id === jobId) || {};
+    cache.jobNotes = cache.jobNotes || {};
+    cache.jobNotes[jobId] = [{ id: crypto.randomUUID(), body, author: "You", date_added: new Date().toISOString(),
+      source: "local", job_id: jobId, job_number: j.number, in_ghl: false }, ...(cache.jobNotes[jobId] || [])];
+    await persistLocal();
+    return this.jobNotes(jobId);
+  },
   async finalizeGp() { throw new Error("finalizing gross profit needs Supabase"); },
   async reportMonthlyScorecard() { throw new Error("reports need Supabase"); },
   async reportBookedByType() { throw new Error("reports need Supabase"); },

@@ -7,8 +7,13 @@ import { crm, db, DEFAULT_LOCATION, exchangeLocationToken, logSync } from "../_s
  *
  *  1. Verify X-GHL-Signature (Ed25519, base64) against GHL's public key.
  *     Unsigned or tampered -> 401.
- *  2. Events TradeDesk does not act on (tags, tasks, notes, records, other
- *     pipelines, other locations) -> 200 at once, no database work.
+ *  2. Events TradeDesk does not act on (tags, tasks, records, other
+ *     pipelines, other locations, notes on contacts that are not on a
+ *     monitored-pipeline job) -> 200 at once, no database work.
+ *     (v7, 2026-11-25: NoteCreate / NoteUpdate / NoteDelete are mirrored into
+ *     contact_notes, but only for contacts on a TradeDesk job with a GHL
+ *     opportunity. The contact list is cached for 5 minutes, so the AI call
+ *     transcripts and other lead notes never touch the database.)
  *     (v6, 2026-11-24: OpportunityDelete from other pipelines is dropped here
  *     too. A bulk delete of ~7,500 Facebook-lead opportunities sent one
  *     delivery each in two minutes; every one did 3-4 database calls and the
@@ -131,12 +136,37 @@ async function stageNames(loc: string) {
   return map;
 }
 
+// ---------- contacts whose notes TradeDesk mirrors ----------
+// A contact on a TradeDesk job that came from a monitored pipeline (has a GHL
+// opportunity). Cached; a miss re-reads at most once a minute so a brand-new
+// job's contact is picked up quickly without a query per note.
+let monitoredCache: { at: number; set: Set<string> } | null = null;
+async function loadMonitored() {
+  const { data, error } = await db().from("jobs").select("ghl_contact_id")
+    .not("ghl_contact_id", "is", null).not("ghl_opportunity_id", "is", null);
+  if (error) throw new Error("monitored contacts: " + error.message);
+  monitoredCache = { at: Date.now(), set: new Set((data || []).map((r: any) => r.ghl_contact_id as string)) };
+  return monitoredCache.set;
+}
+async function isMonitoredContact(contactId: string): Promise<boolean> {
+  const age = monitoredCache ? Date.now() - monitoredCache.at : Infinity;
+  if (monitoredCache && age < 5 * 60 * 1000 && monitoredCache.set.has(contactId)) return true;
+  if (monitoredCache && age < 60 * 1000) return false;
+  return (await loadMonitored()).has(contactId);
+}
+const NOTE_EVENTS = new Set(["NoteCreate", "NoteUpdate", "NoteDelete"]);
+
 /** Events TradeDesk acts on. Anything else is answered 200 and dropped. */
-function ignoreReason(ev: any): string | null {
+async function ignoreReason(ev: any): Promise<string | null> {
   const type: string = ev.type || "";
   if (type === "INSTALL" || type === "UNINSTALL") return null;
   if (ev.locationId && DEFAULT_LOCATION && ev.locationId !== DEFAULT_LOCATION) return "other location";
   if (type === "ContactUpdate" || type === "ContactDelete") return null;
+  if (NOTE_EVENTS.has(type)) {
+    if (!ev.contactId) return type === "NoteDelete" ? null : "note without a contact";
+    try { return (await isMonitoredContact(ev.contactId)) ? null : "contact not on a monitored-pipeline job"; }
+    catch { return null; } // can't tell: store it and let the database decide
+  }
   // Every Opportunity* event, OpportunityDelete included (v6), is dropped when
   // it names another pipeline. A delete with no pipelineId is still handled.
   if (type.startsWith("Opportunity")) {
@@ -183,6 +213,20 @@ async function handle(ev: any): Promise<{ result: unknown; error?: string }> {
     await logSync({ direction: "in", entity: "contact", action: "contact_deleted_in_crm", ok: true,
                     ghl_id: ev.id, source: "marketplace_webhook" });
     return { result: { noted: "ContactDelete" } };
+  }
+
+  if (NOTE_EVENTS.has(type)) {
+    if (type === "NoteDelete") {
+      const { data, error } = await db().rpc("contact_notes_mark_deleted", { p_note: ev.id });
+      if (error) return { result: null, error: error.message };
+      return { result: { note_deleted: data } };
+    }
+    // contact_notes_upsert re-checks that the contact is monitored.
+    const note = { id: ev.id, contactId: ev.contactId, body: ev.body ?? ev.bodyText ?? "",
+                   userId: ev.userId || null, dateAdded: ev.dateAdded || null };
+    const { data, error } = await db().rpc("contact_notes_upsert", { p_notes: [note] });
+    if (error) return { result: null, error: error.message };
+    return { result: data };
   }
 
   if (type === "OpportunityDelete") {
@@ -247,7 +291,7 @@ Deno.serve(async (req: Request) => {
   const webhookId: string = ev.webhookId || ev.webhook_id || "";
   if (!webhookId) return json(400, { error: "no webhookId" });
 
-  const skip = ignoreReason(ev);
+  const skip = await ignoreReason(ev);
   if (skip) return json(200, { ok: true, ignored: skip });
 
   const work = (async () => {

@@ -987,7 +987,10 @@ export default function App() {
       });
   };
 
-  const addJob = (job) => {
+  const addJob = (input) => {
+    // A note typed in the New job form becomes the job's first note (job
+    // notes live in GHL / the note log now, not in jobs.notes).
+    const { firstNote, ...job } = input;
     const j = {
       id: newId(), number: nextJobNo(), stage: "signed", notes: "", createdAt: new Date().toISOString(),
       clientPayments: [], clientCredits: [], vendorPayments: [], ...job,
@@ -1002,6 +1005,7 @@ export default function App() {
         // The database may also settle the type (a "Yoak PM" name forces it).
         jobs: prev.jobs.map((x) => (x.id === j.id ? { ...x, number: saved.number, jobType: saved.jobType } : x)),
       }));
+      if (firstNote && firstNote.trim()) await repo.addJobNote(j.id, firstNote.trim());
     }, "The new job");
     return j;
   };
@@ -1891,7 +1895,7 @@ function JobFormModal({ jobs, onClose, onSave }) {
           jobType,
           customerName: finalName,
           customerPhone: form.customerPhone, customerEmail: form.customerEmail,
-          customerAddress: form.customerAddress, trade: form.trade, stage: form.stage, notes: form.notes,
+          customerAddress: form.customerAddress, trade: form.trade, stage: form.stage, firstNote: form.notes,
           contractAmount: Number(form.contractAmount),
           contractSignedDate: form.contractSignedDate,
           ghlProjectDisplayId: projectNo || null,
@@ -2063,9 +2067,147 @@ function UndoToast({ toast, onClose }) {
   );
 }
 
+/**
+ * Job notes (2026-11-25). GHL owns notes: they live on the customer's GHL
+ * contact (Notes tab), and this is a read-only log of them, newest first,
+ * re-read from GHL each time the card opens. "Add note" writes to GHL (tagged
+ * JOB-####) and the log refreshes. Only contacts on a monitored-pipeline job
+ * are mirrored. A job with no GHL contact keeps its notes in TradeDesk.
+ * The old notes box was moved over as each job's first entry, so it sorts last.
+ */
+const NOTE_CLAMP = 420;
+const noteText = (body) => {
+  const html = String(body || "");
+  if (!/[<&]/.test(html)) return html.trim();
+  const withBreaks = html.replace(/<br\s*\/?>/gi, "\n").replace(/<\/(p|div|li|h\d)>/gi, "\n").replace(/<li[^>]*>/gi, "• ");
+  let text = withBreaks.replace(/<[^>]+>/g, "");
+  try { text = new DOMParser().parseFromString(text, "text/html").documentElement.textContent || text; } catch { /* keep as is */ }
+  return text.replace(/\n{3,}/g, "\n\n").trim();
+};
+const noteWhen = (iso) => {
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  const sameYear = d.getFullYear() === new Date().getFullYear();
+  return d.toLocaleString("en-US", { month: "short", day: "numeric", ...(sameYear ? {} : { year: "numeric" }), hour: "numeric", minute: "2-digit" });
+};
+const NOTE_SOURCE = {
+  tradedesk: "Added in TradeDesk",
+  migration: "Old TradeDesk notes",
+  local: "TradeDesk only",
+};
+
+function JobNotes({ job, showToast }) {
+  const [st, setSt] = useState({ loading: true, notes: [], stale: false, inGhl: Boolean(job.ghlContactId && job.ghlOpportunityId), error: "" });
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveErr, setSaveErr] = useState("");
+  const [expanded, setExpanded] = useState({});
+  const box = useRef(null);
+  const live = useRef(true);
+  useEffect(() => () => { live.current = false; }, []);
+
+  const apply = (r) => live.current && setSt((s) => ({ loading: false, notes: r.notes, stale: r.stale,
+    inGhl: r.inGhl === null ? s.inGhl : r.inGhl, error: "" }));
+  const load = () => {
+    setSt((s) => ({ ...s, loading: true, error: "" }));
+    repo.jobNotes(job.id).then(apply).catch((e) => live.current && setSt((s) => ({ ...s, loading: false, error: e.message || "Couldn't load notes." })));
+  };
+  useEffect(load, [job.id]);
+  useEffect(() => { if (open && box.current) box.current.focus(); }, [open]);
+
+  const where = st.inGhl ? "the customer's Notes tab in GHL" : "TradeDesk (this job has no GHL contact)";
+  const save = async () => {
+    const text = draft.trim();
+    if (!text || saving) return;
+    setSaving(true); setSaveErr("");
+    try {
+      apply(await repo.addJobNote(job.id, text));
+      setDraft(""); setOpen(false);
+      if (showToast) showToast(st.inGhl ? "Note saved to GHL." : "Note saved.");
+    } catch (e) {
+      setSaveErr(e.message || "The note didn't save.");
+    } finally {
+      if (live.current) setSaving(false);
+    }
+  };
+
+  return (
+    <section className="td-notes" aria-labelledby={"notes-title-" + job.id}>
+      <div className="td-notes-head">
+        <div className="td-drawer-section-title td-notes-title" id={"notes-title-" + job.id} tabIndex={-1}>Notes</div>
+        <span className="td-cell-sub td-notes-where">{st.inGhl ? "From the customer's GHL contact" : "Kept in TradeDesk"}</span>
+        <div style={{ flex: 1 }} />
+        <button type="button" className="td-iconbtn" onClick={load} disabled={st.loading} aria-label="Reload notes" title="Reload notes">
+          <RefreshCw size={13} className={st.loading ? "td-spin" : undefined} />
+        </button>
+        {!open && (
+          <button type="button" className="td-btn td-btn-sm" onClick={() => { setOpen(true); setSaveErr(""); }}>
+            <Plus size={13} /> Add note
+          </button>
+        )}
+      </div>
+
+      {open && (
+        <div className="td-note-form">
+          <textarea ref={box} className="td-textarea" rows={3} value={draft} maxLength={5000}
+            aria-label={"New note for " + job.customerName}
+            placeholder="Site access, material changes, punch list items…"
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); save(); } }} />
+          <div className="td-cell-sub">Saves to {where}{st.inGhl ? ", marked JOB-" + String(job.number).padStart(4, "0") : ""}. Ctrl+Enter to save.</div>
+          {saveErr && (
+            <div className="td-overage-hint" role="alert"><AlertTriangle size={13} aria-hidden="true" /><span>{saveErr}</span></div>
+          )}
+          <div className="td-payment-btns">
+            <button type="button" className="td-btn td-btn-sm td-btn-primary" onClick={save} disabled={!draft.trim() || saving}>
+              <Check size={13} /> {saving ? "Saving…" : "Save note"}
+            </button>
+            <button type="button" className="td-btn td-btn-sm" disabled={saving} onClick={() => { setOpen(false); setDraft(""); setSaveErr(""); }}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {st.stale && !st.loading && <div className="td-cell-sub td-notes-warn" role="status"><AlertTriangle size={12} aria-hidden="true" /> Couldn't reach GHL just now — showing the last copy.</div>}
+      {st.error && <div className="td-overage-hint" role="alert"><AlertTriangle size={13} aria-hidden="true" /><span>{st.error}</span></div>}
+
+      {st.loading && st.notes.length === 0 ? (
+        <div className="td-muted-line" role="status">Loading notes…</div>
+      ) : st.notes.length === 0 && !st.error ? (
+        <div className="td-muted-line">{st.inGhl ? "No notes on this customer in GHL yet." : "No notes yet."}</div>
+      ) : (
+        <ol className="td-note-list">
+          {st.notes.map((n) => {
+            const text = noteText(n.body);
+            const long = text.length > NOTE_CLAMP;
+            const shown = long && !expanded[n.id] ? text.slice(0, NOTE_CLAMP).replace(/\s+\S*$/, "") + "…" : text;
+            const otherJob = n.job_number && Number(n.job_number) !== Number(job.number);
+            return (
+              <li key={n.id} className={"td-note" + (n.source === "migration" ? " td-note-legacy" : "")}>
+                <div className="td-note-meta">
+                  <span className="td-note-author">{n.author === "GHL automation" ? "GHL" : n.author}</span>
+                  {n.source === "migration" ? null : <span>{noteWhen(n.date_added)}</span>}
+                  {NOTE_SOURCE[n.source] && <span className="td-paytype-chip">{NOTE_SOURCE[n.source]}</span>}
+                  {otherJob && <span className="td-paytype-chip">JOB-{String(n.job_number).padStart(4, "0")}</span>}
+                </div>
+                <div className="td-note-body">{shown}</div>
+                {long && (
+                  <button type="button" className="td-link-btn" aria-expanded={Boolean(expanded[n.id])}
+                    onClick={() => setExpanded((x) => ({ ...x, [n.id]: !x[n.id] }))}>
+                    {expanded[n.id] ? "Show less" : "Show more"}
+                  </button>
+                )}
+              </li>
+            );
+          })}
+        </ol>
+      )}
+    </section>
+  );
+}
+
 function JobDetailModal({ ctx, job, onClose }) {
   const { updateJob, deleteJob, addClientPayment, deleteClientPayment, addClientCredit, deleteClientCredit, addVendorPayment, updateVendorPayment, deleteVendorPayment, addVendorCredit, deleteVendorCredit, vendorNames, showToast, attachVendorDocument, removeVendorDocument } = ctx;
-  const [notes, setNotes] = useState(job?.notes || "");
   const [name, setName] = useState(job?.customerName || "");
   const [phone, setPhone] = useState(job?.customerPhone || "");
   const [email, setEmail] = useState(job?.customerEmail || "");
@@ -2112,8 +2254,8 @@ function JobDetailModal({ ctx, job, onClose }) {
     if (el) el.focus();
   });
 
-  // A project manager can change the notes on a job and the dates of their own
-  // assignment, and nothing else. Both guard triggers in the database enforce
+  // A project manager can add notes to a job (JobNotes) and change the dates of
+  // their own assignment, and nothing else. Both guard triggers in the database enforce
   // that; this keeps the controls off the screen rather than letting someone
   // type into a field whose save will be refused.
   const canManage = ctx.isAdmin;
@@ -2357,11 +2499,11 @@ function JobDetailModal({ ctx, job, onClose }) {
         <div style={{ flex: 1 }} />
         <button className="td-btn td-btn-primary" onClick={() => {
           const next = name.trim();
-          const patch = { notes };
+          const patch = {};
           if (next && next !== job.customerName) patch.customerName = next;
           if (phone.trim() !== (job.customerPhone || "")) patch.customerPhone = phone.trim();
           if (email.trim() !== (job.customerEmail || "")) patch.customerEmail = email.trim();
-          updateJob(job.id, patch);
+          if (Object.keys(patch).length) updateJob(job.id, patch);
           onClose();
         }}>Save & close</button>
       </>}>
@@ -2953,9 +3095,7 @@ function JobDetailModal({ ctx, job, onClose }) {
         </div>
         </>)}
 
-        <Field label="Job notes">
-          <textarea className="td-textarea" rows={3} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Site access notes, material changes, punch list items…" />
-        </Field>
+        <JobNotes job={job} showToast={showToast} />
       </div>
     </Modal>
   );
@@ -6022,6 +6162,17 @@ function GlobalStyle() {
       .td-modal-body { padding: 18px 20px; overflow-y: auto; }
       .td-modal-foot { display: flex; align-items: center; gap: 8px; padding: 14px 20px; border-top: 1px solid var(--td-border); }
 
+      .td-notes { margin-top: 6px; }
+      .td-notes-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; border-top: 1px dashed var(--td-border); padding-top: 14px; margin-bottom: 9px; }
+      .td-notes-head .td-notes-title { border-top: none; padding-top: 0; margin-bottom: 0; }
+      .td-note-form { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+      .td-notes-warn { margin-bottom: 8px; color: #8A5A00; }
+      .td-note-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+      .td-note { border: 1px solid var(--td-border); border-radius: 4px; padding: 8px 10px; background: var(--td-card); }
+      .td-note-legacy { border-style: dashed; }
+      .td-note-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; font-size: 12px; color: var(--td-muted); margin-bottom: 4px; }
+      .td-note-author { font-weight: 600; color: var(--td-text); }
+      .td-note-body { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.45; }
       .td-drawer-section-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--td-muted); font-weight: 700; margin-bottom: 9px; border-top: 1px dashed var(--td-border); padding-top: 14px; }
       .td-muted-line { font-size: 12.5px; color: var(--td-muted); font-style: italic; }
       .td-info-row { display: flex; align-items: center; gap: 9px; font-size: 13px; color: var(--td-text); margin-bottom: 4px; }
