@@ -9,7 +9,8 @@ import {
   AlertTriangle, Tag, Building2, Menu, ClipboardList, RefreshCw,
   Wallet, HandCoins, Percent, Calendar as CalendarIcon, LogOut,
   Hammer, Wrench, PaintBucket, Droplets, Thermometer, PackageCheck, ShoppingCart,
-  Download, FileSpreadsheet, SlidersHorizontal, ArrowDownUp, ShieldCheck, Link2, Lock, Send, CalendarCheck, ExternalLink, Paperclip, FileText
+  Download, FileSpreadsheet, SlidersHorizontal, ArrowDownUp, ShieldCheck, Link2, Lock, Send, CalendarCheck, ExternalLink, Paperclip, FileText,
+  Gauge
 } from "lucide-react";
 
 /* =========================================================================
@@ -408,6 +409,10 @@ const STAGES = [
   { key: "completed", label: "Completed" },
   { key: "closed", label: "Closed / Paid" },
 ];
+// The stages job_stages marks is_complete. A job in one of these needs a
+// Completed date entered by hand; nothing sets it automatically.
+const DONE_STAGE_KEYS = new Set(["completed", "closed"]);
+const needsCompletedDate = (job) => Boolean(job) && DONE_STAGE_KEYS.has(job.stage) && !job.completedDate;
 
 const PAYMENT_METHODS = ["Check", "ACH / Bank Transfer", "Credit Card", "Cash", "Financing"];
 const VENDOR_CATEGORIES = ["Materials", "Subcontractor Labor", "Permit / Fees", "Equipment / Dumpster", "Other"];
@@ -474,6 +479,7 @@ const addDays = (iso, n) => {
 const isPast = (iso) => iso && new Date(iso).getTime() < Date.now();
 
 const cls = (...parts) => parts.filter(Boolean).join(" ");
+const urlParams = () => new URLSearchParams(typeof window === "undefined" ? "" : window.location.search);
 
 const jobNo = (n) => "JOB-" + String(n).padStart(4, "0");
 
@@ -893,7 +899,39 @@ function DonutChart({ data, size }) {
 export default function App() {
   const { data, setData, status, reload, loadError } = useJobTrackerData();
   const [persistError, setPersistError] = useState("");
-  const [view, setView] = useState("dashboard");
+  // The page, the open report and its period live in the URL (?view=reports&report=owed&period=ytd)
+  // so a view can be bookmarked, shared, and survives a reload.
+  const [view, setView] = useState(() => urlParams().get("view") || "dashboard");
+  const [rptRoute, setRptRoute] = useState(() => {
+    const p = urlParams(), on = p.get("view") === "reports";
+    return { report: (on && p.get("report")) || "", period: (on && p.get("period")) || "ytd",
+      from: (on && p.get("from")) || "", to: (on && p.get("to")) || "" };
+  });
+  const [snapRoute, setSnapRoute] = useState(() => {
+    const p = urlParams(), on = p.get("view") === "snapshot";
+    return { period: (on && p.get("period")) || "this_month", cmp: (on && p.get("cmp")) || "",
+      from: (on && p.get("from")) || "", to: (on && p.get("to")) || "" };
+  });
+  useEffect(() => {
+    const p = urlParams();
+    ["view", "report", "period", "from", "to", "cmp"].forEach((k) => p.delete(k));
+    if (view !== "dashboard") p.set("view", view);
+    const route = view === "reports" ? rptRoute : view === "snapshot" ? snapRoute : null;
+    if (route) {
+      if (route.report) p.set("report", route.report);
+      if (route.period) p.set("period", route.period);
+      if (route.period === "custom") { if (route.from) p.set("from", route.from); if (route.to) p.set("to", route.to); }
+      if (route.cmp) p.set("cmp", route.cmp);
+    }
+    const qs = p.toString();
+    const next = window.location.pathname + (qs ? "?" + qs : "") + window.location.hash;
+    if (next !== window.location.pathname + window.location.search + window.location.hash) window.history.replaceState(window.history.state, "", next);
+  }, [view, rptRoute, snapRoute]);
+  // A Snapshot figure opens its report with the same period.
+  const openReport = (key, fromRoute) => {
+    setRptRoute({ report: key, period: fromRoute.period, from: fromRoute.from || "", to: fromRoute.to || "" });
+    setView("reports");
+  };
   const [search, setSearch] = useState("");
   const [selectedJobId, setSelectedJobId] = useState(null);
   const [showAddJob, setShowAddJob] = useState(false);
@@ -1349,9 +1387,12 @@ export default function App() {
     // closed to that role too; this only stops the empty screen.
     ...(isAdmin ? [
       { key: "vendors", label: "Vendors", icon: Truck },
+      // Snapshot: the headline figures, each opening the report behind it.
+      // Reports: a list of plain questions, one simple report each.
+      { key: "snapshot", label: "Snapshot", icon: Gauge },
       { key: "reports", label: "Reports", icon: TrendingUp },
-      // The query tool over every payment and cost; the named reports above are
-      // what ownership reads, this is what the office digs with.
+      // The query tool over every payment and cost; the reports above are what
+      // most people read, this is what the office digs with.
       { key: "ledger", label: "Ledger", icon: List },
       // The badge is the whole point of the nav entry: nobody opens a queue
       // page speculatively, so the count has to come to them.
@@ -1406,7 +1447,11 @@ export default function App() {
             {NAV.map((n) => (
               <button key={n.key} type="button"
                 className={cls("td-nav-item", safeView === n.key && "active")}
-                onClick={() => { setView(n.key); setSidebarOpen(false); }}>
+                onClick={() => {
+                  // Clicking Reports again goes back to the list of questions.
+                  if (n.key === "reports" && safeView === "reports") setRptRoute((r) => ({ ...r, report: "" }));
+                  setView(n.key); setSidebarOpen(false);
+                }}>
                 <n.icon size={16} strokeWidth={2.2} />
                 <span>{n.label}</span>
                 {n.badge > 0 && <span className="td-nav-badge">{n.badge}</span>}
@@ -1458,7 +1503,8 @@ export default function App() {
             {safeView === "jobs" && <JobsView ctx={ctx} />}
             {safeView === "calendar" && <CalendarView ctx={ctx} />}
             {safeView === "vendors" && isAdmin && <VendorsView ctx={ctx} />}
-            {safeView === "reports" && isAdmin && <ReportsView />}
+            {safeView === "snapshot" && isAdmin && <SnapshotView ctx={ctx} route={snapRoute} setRoute={setSnapRoute} openReport={openReport} />}
+            {safeView === "reports" && isAdmin && <ReportsView ctx={ctx} route={rptRoute} setRoute={setRptRoute} />}
             {safeView === "ledger" && isAdmin && <LedgerView ctx={ctx} />}
             {safeView === "schedule" && isAdmin && <ScheduleReviewView ctx={ctx} />}
             {safeView === "access" && isSuperAdmin && <AccessView ctx={ctx} />}
@@ -2609,6 +2655,15 @@ function JobDetailModal({ ctx, job, onClose }) {
               <input className="td-input" type="date" value={job.materialsOrderedDate || ""}
                 onChange={(e) => updateJob(job.id, { materialsOrderedDate: e.target.value || null })} />
             </label>
+            <label className="td-deal-field">
+              <span className="td-field-label">Completed</span>
+              {/* Entered by hand, never set by a stage move. The reports date
+                  completed work and gross profit by this field alone. */}
+              <input className={cls("td-input", needsCompletedDate(job) && "td-input-missing")} type="date"
+                value={job.completedDate || ""} aria-invalid={needsCompletedDate(job) || undefined}
+                onChange={(e) => updateJob(job.id, { completedDate: e.target.value || null })} />
+              {needsCompletedDate(job) && <span className="td-field-missing">Required: this job is done</span>}
+            </label>
           </div>
           ) : (
             <ReadOnlyDealFields job={job} />
@@ -3302,6 +3357,10 @@ function ReadOnlyDealFields({ job }) {
         <span className="td-field-label">Materials ordered</span>
         <span className="td-deal-ro-value">{job.materialsOrderedDate ? fmtDateNum(job.materialsOrderedDate) : "—"}</span>
       </div>
+      <div className="td-deal-field">
+        <span className="td-field-label">Completed</span>
+        <span className="td-deal-ro-value">{job.completedDate ? fmtDateNum(job.completedDate) : "—"}</span>
+      </div>
     </div>
   );
 }
@@ -3882,47 +3941,792 @@ async function exportXlsx(rows, filename, summary) {
    in one place (see the comment on each function) and the browser never sees
    the underlying money tables in bulk. */
 
-const NAMED_REPORTS = [
-  { key: "scorecard", label: "Monthly scorecard", blurb: "Booked, collected, completed and gross profit, month by month." },
+/* =========================================================================
+   SNAPSHOT + REPORTS — TradeDesk records only
+   =========================================================================
+   Every figure on these two pages comes from what is entered in TradeDesk:
+   jobs (contract, signed date, Completed date, stage, marker), client payments
+   and credits, vendor payments and credits. The Sales Log and Completion Log
+   sheets are not read here; they are only used to correct TradeDesk records.
+
+   Snapshot = the headline figures, each a button into the report behind it.
+   Reports  = a short list of plain questions; each opens one simple report.
+   Ledger   = the payment query tool for digging (unchanged). */
+
+const RP_PERIODS = [
+  { key: "this_month", label: "This month" },
+  { key: "last_month", label: "Last month" },
+  { key: "this_quarter", label: "This quarter" },
+  { key: "ytd", label: "This year" },
+  { key: "last_year", label: "Last year" },
+  { key: "last12", label: "Last 12 months" },
+  { key: "custom", label: "Custom dates" },
+];
+const RP_COMPARE = [
+  { key: "", label: "No comparison" },
+  { key: "prev", label: "Previous period" },
+  { key: "year", label: "Same period last year" },
 ];
 
-function ReportsView() {
-  const [active, setActive] = useState(NAMED_REPORTS[0].key);
-  const report = NAMED_REPORTS.find((r) => r.key === active) || NAMED_REPORTS[0];
-  return (
-    <div className="td-view">
-      <div className="td-rpt-tabs" role="tablist">
-        {NAMED_REPORTS.map((r) => (
-          <button key={r.key} role="tab" aria-selected={r.key === active}
-            className={cls("td-rpt-tab", r.key === active && "td-rpt-tab-on")} onClick={() => setActive(r.key)}>
-            {r.label}
-          </button>
-        ))}
+const rpYmd = (d) => {
+  const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  return x.getFullYear() + "-" + String(x.getMonth() + 1).padStart(2, "0") + "-" + String(x.getDate()).padStart(2, "0");
+};
+const rpDate = (ymd) => { const [y, m, d] = String(ymd).slice(0, 10).split("-").map(Number); return new Date(y, m - 1, d); };
+const rpFmt = (ymd) => (ymd ? rpDate(ymd).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "—");
+const rpRangeText = (r) => rpFmt(r.from) + " – " + rpFmt(r.to);
+const rpAsOf = (iso) => (iso ? "as of " + new Date(iso).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "");
+
+/** A period key (plus custom dates) as an inclusive YYYY-MM-DD range. */
+function rpRange(period, from, to) {
+  const now = new Date();
+  const y = now.getFullYear(), m = now.getMonth();
+  const today = rpYmd(now);
+  switch (period) {
+    case "this_month": return { from: rpYmd(new Date(y, m, 1)), to: today };
+    case "last_month": return { from: rpYmd(new Date(y, m - 1, 1)), to: rpYmd(new Date(y, m, 0)) };
+    case "this_quarter": return { from: rpYmd(new Date(y, Math.floor(m / 3) * 3, 1)), to: today };
+    case "last_year": return { from: (y - 1) + "-01-01", to: (y - 1) + "-12-31" };
+    case "last12": return { from: rpYmd(new Date(y, m - 11, 1)), to: today };
+    case "custom": {
+      const f = from || rpYmd(new Date(y, m, 1)), t = to || today;
+      return f <= t ? { from: f, to: t } : { from: t, to: f };
+    }
+    default: return { from: y + "-01-01", to: today };
+  }
+}
+
+/** The range to compare against: the same length just before, or a year back. */
+function rpCompareRange(r, mode, period) {
+  if (!mode) return null;
+  const f = rpDate(r.from), t = rpDate(r.to);
+  // "Previous period" for a calendar year means the year before.
+  if (mode === "year" || period === "ytd" || period === "last_year") {
+    const back = (d) => { const x = new Date(d); x.setFullYear(x.getFullYear() - 1); return x; };
+    return { from: rpYmd(back(f)), to: rpYmd(back(t)) };
+  }
+  // Month-aligned ranges step back whole months (Oct 1–25 before Nov 1–25);
+  // anything else steps back the same number of days.
+  if (f.getDate() === 1) {
+    const months = (t.getFullYear() - f.getFullYear()) * 12 + t.getMonth() - f.getMonth() + 1;
+    const pf = new Date(f.getFullYear(), f.getMonth() - months, 1);
+    const lastOfMonth = new Date(t.getFullYear(), t.getMonth() - months + 1, 0);
+    const pt = new Date(t.getFullYear(), t.getMonth() - months, Math.min(t.getDate(), lastOfMonth.getDate()));
+    return { from: rpYmd(pf), to: rpYmd(pt) };
+  }
+  const days = Math.round((t - f) / 86400000) + 1;
+  const pt = new Date(f); pt.setDate(pt.getDate() - 1);
+  const pf = new Date(pt); pf.setDate(pf.getDate() - (days - 1));
+  return { from: rpYmd(pf), to: rpYmd(pt) };
+}
+
+const rpInRange = (ymd, r) => Boolean(ymd) && ymd >= r.from && ymd <= r.to;
+// Payments and credits are stored as instants; the office reads them as local days.
+const rpDay = (iso) => (iso ? rpYmd(new Date(iso)) : null);
+const rpIsLost = (j) => ["lost", "abandoned"].includes(j.ghlStatus);
+const rpTypeLabel = (k) => (JOB_TYPES[k] ? JOB_TYPES[k].label : k || "—");
+const rpTradeLabel = (k) => (TRADES[k] ? TRADES[k].label : k || "—");
+const rpSum = (rows, f) => rows.reduce((s, r) => s + (Number(typeof f === "function" ? f(r) : r[f]) || 0), 0);
+const rpPlural = (n, one, many) => n + " " + (n === 1 ? one : (many || one + "s"));
+
+/* ---------- Figures computed from the jobs already loaded in the app ---------- */
+
+/** Sold = contract amounts signed in the range on live jobs that are not on hold. */
+function rpSales(jobs, r) {
+  const rows = [], held = [];
+  jobs.forEach((j) => {
+    if (rpIsLost(j) || !rpInRange(j.contractSignedDate, r)) return;
+    (j.flag === "on_hold" ? held : rows).push(j);
+  });
+  return { rows, held, total: rpSum(rows, "contractAmount") };
+}
+
+/** Cash collected = client payments dated in the range, on any job. */
+function rpCash(jobs, r) {
+  const rows = [];
+  jobs.forEach((j) => (j.clientPayments || []).forEach((p) => {
+    const day = rpDay(p.date);
+    if (!rpInRange(day, r)) return;
+    rows.push({ id: p.id, day, job_id: j.id, number: j.number, customer: j.customerName, job_type: j.jobType,
+      method: p.method || "—", type: p.paymentType ? (PAYMENT_TYPES[p.paymentType] || {}).label || p.paymentType : "—",
+      amount: Number(p.amount || 0), lost: rpIsLost(j) });
+  }));
+  rows.sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0));
+  return { rows, total: rpSum(rows, "amount") };
+}
+
+/** Client and vendor credits dated in the range. */
+function rpCredits(jobs, r) {
+  const rows = [];
+  jobs.forEach((j) => {
+    (j.clientCredits || []).forEach((c) => {
+      const day = rpDay(c.date);
+      if (rpInRange(day, r)) rows.push({ id: c.id, day, kind: "client", job_id: j.id, number: j.number, customer: j.customerName,
+        party: "Client", settlement: "Off the balance due", reason: c.reason, amount: Number(c.amount || 0) });
+    });
+    (j.vendorCredits || []).forEach((c) => {
+      const day = rpDay(c.date);
+      if (rpInRange(day, r)) rows.push({ id: c.id, day, kind: "vendor", job_id: j.id, number: j.number, customer: j.customerName,
+        party: c.vendorName || "Vendor", settlement: settlementLabel(c.settlement), reason: c.reason, amount: Number(c.amount || 0) });
+    });
+  });
+  rows.sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0));
+  return {
+    rows,
+    client: rpSum(rows.filter((x) => x.kind === "client"), "amount"),
+    vendor: rpSum(rows.filter((x) => x.kind === "vendor"), "amount"),
+  };
+}
+
+/** Finished jobs with no Completed date: left out of Completed and gross profit until one is entered. */
+const rpMissingCompleted = (jobs) => jobs.filter((j) => !rpIsLost(j) && needsCompletedDate(j));
+
+/* ---------- Shared pieces ---------- */
+
+/** Loads one report RPC; reloads when `deps` change or when refresh() is called. */
+function useRpData(load, deps) {
+  const [state, setState] = useState({ data: null, error: "", loading: true });
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    let live = true;
+    setState((s) => ({ ...s, loading: true, error: "" }));
+    Promise.resolve().then(load)
+      .then((d) => { if (live) setState({ data: d, error: "", loading: false }); })
+      .catch((e) => { if (live) setState({ data: null, error: e.message || String(e), loading: false }); });
+    return () => { live = false; };
+  }, [...deps, tick]);
+  return { ...state, refresh: () => setTick((t) => t + 1) };
+}
+
+/** A headline figure that opens the report behind it. */
+function RpStat({ label, value, foot, delta, accent, icon: Icon, onClick, title }) {
+  const body = (
+    <>
+      <div className="td-ticket-stat-top">
+        <span className="td-ticket-stat-label">{label}</span>
+        {Icon && <Icon size={16} strokeWidth={2.2} />}
       </div>
-      {report.key === "scorecard" && <ScorecardReport />}
+      <div className="td-ticket-stat-value">{value}</div>
+      {delta && <div className={cls("td-rp-delta", delta.tone && "td-rp-delta-" + delta.tone)}>{delta.text}</div>}
+      {foot && <div className="td-ticket-stat-foot">{foot}</div>}
+      {onClick && <div className="td-rp-open">See the list <ChevronRight size={12} /></div>}
+    </>
+  );
+  return onClick ? (
+    <button type="button" className="td-ticket-stat td-rp-stat" style={{ "--tc": accent }} onClick={onClick} title={title}>{body}</button>
+  ) : (
+    <div className="td-ticket-stat" style={{ "--tc": accent }}>{body}</div>
+  );
+}
+
+/** "+12% vs Oct 1 – Oct 25 ($40,120)" — or nothing when not comparing. */
+function rpDelta(cur, prev, cmpRange) {
+  if (!cmpRange || prev === null || prev === undefined) return null;
+  const diff = cur - prev;
+  const tail = " vs " + rpRangeText(cmpRange) + " (" + money(prev) + ")";
+  if (Math.abs(prev) < 0.5) return { text: (Math.abs(cur) < 0.5 ? "No change" : "Up from $0") + tail, tone: cur > 0.5 ? "up" : "" };
+  const p = diff / Math.abs(prev);
+  const arrow = diff > 0 ? "▲ " : diff < 0 ? "▼ " : "";
+  return { text: arrow + (diff >= 0 ? "+" : "−") + Math.round(Math.abs(p) * 100) + "%" + tail, tone: diff > 0 ? "up" : diff < 0 ? "down" : "" };
+}
+
+/** Period picker shared by Snapshot and the dated reports. */
+function RpPeriodControl({ route, setRoute, withCompare, asOf }) {
+  const r = rpRange(route.period, route.from, route.to);
+  const set = (patch) => setRoute({ ...route, ...patch });
+  return (
+    <div className="td-report-controls td-rp-controls">
+      <label className="td-deal-field">
+        <span className="td-field-label">Period</span>
+        <select className="td-select" value={route.period}
+          onChange={(e) => set(e.target.value === "custom" ? { period: "custom", from: r.from, to: r.to } : { period: e.target.value })}>
+          {RP_PERIODS.map((p) => <option key={p.key} value={p.key}>{p.label}</option>)}
+        </select>
+      </label>
+      {route.period === "custom" && (
+        <>
+          <label className="td-deal-field">
+            <span className="td-field-label">From</span>
+            <input className="td-input" type="date" value={r.from} onChange={(e) => e.target.value && set({ from: e.target.value })} />
+          </label>
+          <label className="td-deal-field">
+            <span className="td-field-label">To</span>
+            <input className="td-input" type="date" value={r.to} onChange={(e) => e.target.value && set({ to: e.target.value })} />
+          </label>
+        </>
+      )}
+      {withCompare && (
+        <label className="td-deal-field">
+          <span className="td-field-label">Compare to</span>
+          <select className="td-select" value={route.cmp || ""} onChange={(e) => set({ cmp: e.target.value })}>
+            {RP_COMPARE.map((c) => <option key={c.key} value={c.key}>{c.label}</option>)}
+          </select>
+        </label>
+      )}
+      <span className="td-report-range">{rpRangeText(r)}{asOf ? " · " + asOf : ""}</span>
     </div>
   );
 }
 
-const LEDGER_TABS = [
-  { key: "balances", label: "Balances owed" },
-  { key: "payments", label: "Payment reports" },
-];
-
-function LedgerView({ ctx }) {
-  const [tab, setTab] = useState(LEDGER_TABS[0].key);
+/** One report: question heading, one-sentence answer, actions, states. */
+function RpShell({ question, answer, asOf, loading, error, onRefresh, onExport, children, controls }) {
+  const [busy, setBusy] = useState(false);
+  const [exportError, setExportError] = useState("");
+  const doExport = async () => {
+    setBusy(true); setExportError("");
+    try { await onExport(); } catch (e) { setExportError(e.message || String(e)); } finally { setBusy(false); }
+  };
   return (
-    <div className="td-view">
-      <div className="td-rpt-tabs" role="tablist">
-        {LEDGER_TABS.map((t) => (
-          <button key={t.key} role="tab" aria-selected={t.key === tab}
-            className={cls("td-rpt-tab", t.key === tab && "td-rpt-tab-on")} onClick={() => setTab(t.key)}>
-            {t.label}
-          </button>
+    <div className="td-panel td-report td-rp">
+      <div className="td-panel-head">
+        <h2 className="td-rp-question">{question}</h2>
+        <div className="td-report-actions">
+          {onRefresh && (
+            <button className="td-btn" disabled={loading} onClick={onRefresh} title="Load the latest figures">
+              <RefreshCw size={13} /> Refresh
+            </button>
+          )}
+          {onExport && (
+            <button className="td-btn" disabled={loading || busy} onClick={doExport}>
+              <FileSpreadsheet size={13} /> {busy ? "Building…" : "Excel"}
+            </button>
+          )}
+        </div>
+      </div>
+      {controls}
+      {exportError && <div className="td-sync-banner"><AlertTriangle size={15} /><span>Export failed: {exportError}</span></div>}
+      {error && (
+        <div className="td-sync-banner"><AlertTriangle size={15} /><span>Couldn't load this report: {error}</span>
+          {onRefresh && <button type="button" onClick={onRefresh}>Reload</button>}</div>
+      )}
+      {loading && !error && <div className="td-rp-skeleton" aria-busy="true"><span /><span /><span /></div>}
+      {!loading && !error && (
+        <>
+          {answer && <p className="td-rp-answer">{answer}{asOf ? <span className="td-rp-asof"> {asOf}</span> : null}</p>}
+          {children}
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * A plain table. columns: { key, header, num, money, render(row), get(row) }.
+ * Rows with a job_id open that job. `foot` is an optional totals row.
+ */
+function RpTable({ columns, rows, onOpenJob, foot, rowClass, empty }) {
+  if (!rows.length) return <EmptyState icon={FileText} title={empty || "Nothing in this period"} sub="Try a longer period." />;
+  return (
+    <div className="td-table-wrap">
+      <table className="td-table td-rp-table">
+        <thead><tr>{columns.map((c) => <th key={c.key} className={c.num || c.money ? "td-num" : undefined}>{c.header}</th>)}</tr></thead>
+        <tbody>
+          {rows.map((r, i) => (
+            <tr key={r.id || r.job_id || r.payment_id || i}
+              className={cls(r.job_id && onOpenJob && "td-bal-row", rowClass && rowClass(r))}
+              onClick={r.job_id && onOpenJob ? () => onOpenJob(r.job_id) : undefined}
+              title={r.job_id && onOpenJob ? "Open this job" : undefined}>
+              {columns.map((c) => (
+                <td key={c.key} className={c.num || c.money ? "td-num" : undefined}>
+                  {c.render ? c.render(r) : c.money ? money(c.get ? c.get(r) : r[c.key]) : (c.get ? c.get(r) : r[c.key])}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+        {foot && (
+          <tfoot><tr>{columns.map((c, i) => (
+            <td key={c.key} className={c.num || c.money ? "td-num" : undefined}>
+              {i === 0 ? <strong>Total</strong> : foot[c.key] === undefined ? "" : <strong>{c.money ? money(foot[c.key]) : foot[c.key]}</strong>}
+            </td>
+          ))}</tr></tfoot>
+        )}
+      </table>
+    </div>
+  );
+}
+
+/** Excel export of what is on screen: one sheet per section. */
+async function rpExport(filename, sheets) {
+  const XLSX = await import("xlsx");
+  const wb = XLSX.utils.book_new();
+  const fmt = '"$"#,##0.00;[Red]-"$"#,##0.00';
+  sheets.forEach(({ name, columns, rows, note }) => {
+    const cols = columns.filter((c) => c.get || c.key);
+    const val = (c, r) => {
+      const v = c.get ? c.get(r) : r[c.key];
+      return c.money ? Number(v || 0) : v === null || v === undefined ? "" : typeof v === "object" ? "" : v;
+    };
+    const aoa = [cols.map((c) => c.header), ...rows.map((r) => cols.map((c) => val(c, r)))];
+    if (note) aoa.push([], [note]);
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    cols.forEach((c, ci) => {
+      if (!c.money) return;
+      for (let i = 1; i <= rows.length; i++) {
+        const ref = XLSX.utils.encode_cell({ r: i, c: ci });
+        if (ws[ref] && typeof ws[ref].v === "number") ws[ref].z = fmt;
+      }
+    });
+    ws["!cols"] = cols.map((c) => ({ wch: c.money ? 14 : c.key === "customer" || c.key === "vendor" ? 24 : 13 }));
+    XLSX.utils.book_append_sheet(wb, ws, name.slice(0, 31));
+  });
+  const out = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+  downloadBlob(new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), filename);
+}
+
+const rpJobCol = { key: "job", header: "Job", get: (r) => jobNo(r.number), render: (r) => <span className="td-bal-job">{jobNo(r.number)}</span> };
+const rpCustCol = { key: "customer", header: "Customer", get: (r) => r.customer || "" };
+const rpTypeCol = { key: "job_type", header: "Type", get: (r) => rpTypeLabel(r.job_type) };
+
+/* =========================================================================
+   SNAPSHOT
+   ========================================================================= */
+
+function SnapshotView({ ctx, route, setRoute, openReport }) {
+  const jobs = ctx.jobs;
+  const r = rpRange(route.period, route.from, route.to);
+  const cr = rpCompareRange(r, route.cmp, route.period);
+  const prof = useRpData(() => repo.reportJobProfitability(r.from, r.to), [r.from, r.to]);
+  const profCmp = useRpData(() => (cr ? repo.reportJobProfitability(cr.from, cr.to) : null), [cr && cr.from, cr && cr.to]);
+  const owed = useRpData(() => repo.reportBalancesOwed(), []);
+  const backlog = useRpData(() => repo.reportBacklog(), []);
+  const vend = useRpData(() => repo.reportVendorOwed(), []);
+
+  const sales = rpSales(jobs, r), cash = rpCash(jobs, r);
+  const salesCmp = cr ? rpSales(jobs, cr) : null, cashCmp = cr ? rpCash(jobs, cr) : null;
+  const profit = (d) => {
+    const rows = (d && d.rows) || [];
+    const costed = rows.filter((x) => x.has_costs);
+    const rev = rpSum(costed, "revenue"), gp = rpSum(costed, "gp");
+    return { jobs: rows.length, completed: rpSum(rows, "revenue"), costed: costed.length, rev, gp, pct: rev > 0 ? gp / rev : null };
+  };
+  const p = profit(prof.data), pc = cr ? profit(profCmp.data) : null;
+
+  const owedRows = (owed.data && owed.data.rows) || [];
+  const fin = owedRows.filter((x) => x.finished && x.balance >= 1);
+  const open = owedRows.filter((x) => !x.finished && x.balance >= 1);
+  const over90 = fin.filter((x) => x.days_since_complete > 90);
+  const bl = (backlog.data && backlog.data.rows) || [];
+  const blLive = bl.filter((x) => !x.on_hold);
+  const vRows = (vend.data && vend.data.rows) || [];
+  const vOver60 = vRows.filter((x) => x.days_old > 60);
+  const missing = rpMissingCompleted(jobs);
+  const asOf = rpAsOf((owed.data && owed.data.generated_at) || (prof.data && prof.data.generated_at) || new Date().toISOString());
+  const loadingAny = prof.loading || owed.loading || backlog.loading || vend.loading;
+  const errors = [prof.error, owed.error, backlog.error, vend.error].filter(Boolean);
+  const refresh = () => { prof.refresh(); profCmp.refresh(); owed.refresh(); backlog.refresh(); vend.refresh(); ctx.reload && ctx.reload(); };
+  // A figure that is loading or failed shows a placeholder, never a false $0.
+  const ph = (st, v) => (st.loading ? "…" : st.error ? "—" : v);
+  const period = (RP_PERIODS.find((x) => x.key === route.period) || {}).label || "";
+
+  return (
+    <div className="td-view td-rp-page">
+      <div className="td-panel td-report">
+        <div className="td-panel-head">
+          <h2 className="td-rp-question">Where the business stands</h2>
+          <div className="td-report-actions">
+            <button className="td-btn" disabled={loadingAny} onClick={refresh}><RefreshCw size={13} /> Refresh</button>
+          </div>
+        </div>
+        <RpPeriodControl route={route} setRoute={setRoute} withCompare asOf={asOf} />
+        {errors.length > 0 && (
+          <div className="td-sync-banner"><AlertTriangle size={15} /><span>Some figures didn't load: {errors[0]}</span>
+            <button type="button" onClick={refresh}>Reload</button></div>
+        )}
+
+        <h3 className="td-rp-group">{period === "Custom dates" ? "In this period" : period} <span>{rpRangeText(r)}</span></h3>
+        <div className="td-stat-row td-rp-stats">
+          <RpStat label="Sold (contracts signed)" value={money(sales.total)} icon={ClipboardList} accent="#B8860B"
+            delta={salesCmp && rpDelta(sales.total, salesCmp.total, cr)}
+            foot={rpPlural(sales.rows.length, "contract") + (sales.held.length ? " · " + sales.held.length + " on hold not counted" : "")}
+            onClick={() => openReport("sales", route)} />
+          <RpStat label="Cash collected" value={money(cash.total)} icon={Wallet} accent="#3F8EA6"
+            delta={cashCmp && rpDelta(cash.total, cashCmp.total, cr)}
+            foot={rpPlural(cash.rows.length, "client payment")}
+            onClick={() => openReport("cash", route)} />
+          <RpStat label="Jobs completed" value={ph(prof, money(p.completed))} icon={Check} accent="#6B5B95"
+            delta={pc && !profCmp.loading && !prof.error && rpDelta(p.completed, pc.completed, cr)}
+            foot={prof.loading || prof.error ? "" : rpPlural(p.jobs, "job") + " with a Completed date in the period"}
+            onClick={() => openReport("profit", route)} />
+          <RpStat label="Gross profit" value={ph(prof, money(p.gp))} icon={Percent} accent="#3F7D58"
+            delta={pc && !profCmp.loading && !prof.error && rpDelta(p.gp, pc.gp, cr)}
+            foot={prof.loading || prof.error ? "" : (p.pct === null ? "—" : pct(p.pct)) + " margin on " + rpPlural(p.costed, "job") + " with vendor costs" +
+              (p.jobs - p.costed > 0 ? " · " + (p.jobs - p.costed) + " without costs left out" : "")}
+            onClick={() => openReport("profit", route)} />
+        </div>
+
+        <h3 className="td-rp-group">Right now <span>{asOf}</span></h3>
+        <div className="td-stat-row td-rp-stats">
+          <RpStat label="Owed on finished jobs" value={ph(owed, money(rpSum(fin, "balance")))} icon={AlertTriangle} accent="#C1440E"
+            foot={owed.loading || owed.error ? "" : rpPlural(fin.length, "job") + " · " + money(rpSum(over90, "balance")) + " over 90 days"}
+            onClick={() => openReport("owed", route)} />
+          <RpStat label="Left to collect on open jobs" value={ph(owed, money(rpSum(open, "balance")))} icon={HandCoins} accent="#B8860B"
+            foot={owed.loading || owed.error ? "" : rpPlural(open.length, "job") + " not finished yet"}
+            onClick={() => openReport("owed", route)} />
+          <RpStat label="Signed, not finished" value={ph(backlog, money(rpSum(blLive, "contract")))} icon={Hammer} accent="#6B5B95"
+            foot={backlog.loading || backlog.error ? "" : rpPlural(blLive.length, "job") + (bl.length > blLive.length ? " · " + (bl.length - blLive.length) + " on hold not counted" : "")}
+            onClick={() => openReport("backlog", route)} />
+          <RpStat label="Owed to vendors" value={ph(vend, money(rpSum(vRows, "owed")))} icon={Truck} accent="#B23A2E"
+            foot={vend.loading || vend.error ? "" : rpPlural(vRows.length, "unpaid bill") + " · " + money(rpSum(vOver60, "owed")) + " over 60 days"}
+            onClick={() => openReport("vendors", route)} />
+        </div>
+
+        {missing.length > 0 && (
+          <div className="td-rp-notice">
+            <AlertTriangle size={14} />
+            <span>
+              {rpPlural(missing.length, "finished job")} {missing.length === 1 ? "has" : "have"} no Completed date, so{" "}
+              {missing.length === 1 ? "it is" : "they are"} left out of Jobs completed and Gross profit. Enter it on the job card:
+            </span>
+            <span className="td-rp-chips">
+              {missing.slice(0, 12).map((j) => (
+                <button key={j.id} type="button" className="td-rp-chip" onClick={() => ctx.setSelectedJobId(j.id)}>
+                  {jobNo(j.number)} · {j.customerName}
+                </button>
+              ))}
+              {missing.length > 12 && <span className="td-rp-more">and {missing.length - 12} more</span>}
+            </span>
+          </div>
+        )}
+        <p className="td-rp-source">Everything here comes from what is entered in TradeDesk. Click any figure to see the jobs behind it.</p>
+      </div>
+    </div>
+  );
+}
+
+/* =========================================================================
+   REPORTS — a list of questions, each opening one report
+   ========================================================================= */
+
+const RP_REPORTS = [
+  { group: "Sales", key: "sales", q: "How much did we sell?", blurb: "Contracts signed in a period, by job type." },
+  { group: "Sales", key: "backlog", q: "What's signed but not finished?", blurb: "Open jobs: contract, collected so far, left to collect, vendor costs so far." },
+  { group: "Money in", key: "cash", q: "How much cash came in?", blurb: "Client payments received in a period." },
+  { group: "Money in", key: "owed", q: "Who still owes us?", blurb: "Balance on every job: finished jobs by age, then open jobs." },
+  { group: "Profit", key: "profit", q: "Which jobs made money?", blurb: "Gross profit on each job completed in a period, lowest margin first." },
+  { group: "Profit", key: "scorecard", q: "How are we doing month by month?", blurb: "Sold, collected, completed and gross profit for each month." },
+  { group: "Vendors", key: "vendors", q: "What do we owe vendors?", blurb: "Unpaid vendor bills by vendor and job, with how old each one is." },
+  { group: "Credits", key: "credits", q: "What credits were given or received?", blurb: "Client credits and vendor credits in a period." },
+];
+const RP_DATED = new Set(["sales", "cash", "profit", "credits"]);
+
+function ReportsView({ ctx, route, setRoute }) {
+  const report = RP_REPORTS.find((x) => x.key === route.report);
+  const openJob = ctx.setSelectedJobId;
+  if (!report) {
+    const groups = [...new Set(RP_REPORTS.map((x) => x.group))];
+    return (
+      <div className="td-view td-rp-page">
+        <p className="td-rp-intro">Pick a question. Every report uses only what is entered in TradeDesk; click a row to open the job.</p>
+        <div className="td-rp-list">
+          {groups.map((g) => (
+            <section key={g} className="td-rp-list-group">
+              <h3>{g}</h3>
+              {RP_REPORTS.filter((x) => x.group === g).map((x) => (
+                <button key={x.key} type="button" className="td-rp-list-item" onClick={() => setRoute({ ...route, report: x.key })}>
+                  <span className="td-rp-list-q">{x.q}</span>
+                  <span className="td-rp-list-blurb">{x.blurb}</span>
+                  <ChevronRight size={16} />
+                </button>
+              ))}
+            </section>
+          ))}
+        </div>
+      </div>
+    );
+  }
+  const r = rpRange(route.period, route.from, route.to);
+  const controls = RP_DATED.has(report.key) ? <RpPeriodControl route={route} setRoute={setRoute} /> : null;
+  const common = { ctx, r, controls, question: report.q, openJob };
+  return (
+    <div className="td-view td-rp-page">
+      <button type="button" className="td-rp-back" onClick={() => setRoute({ ...route, report: "" })}>
+        <ChevronLeft size={14} /> All reports
+      </button>
+      {report.key === "sales" && <RpSalesReport {...common} />}
+      {report.key === "backlog" && <RpBacklogReport {...common} />}
+      {report.key === "cash" && <RpCashReport {...common} />}
+      {report.key === "owed" && <RpOwedReport {...common} />}
+      {report.key === "profit" && <RpProfitReport {...common} />}
+      {report.key === "scorecard" && <ScorecardReport onOpen={(key) => setRoute({ ...route, report: key })} />}
+      {report.key === "vendors" && <RpVendorReport {...common} />}
+      {report.key === "credits" && <RpCreditsReport {...common} />}
+    </div>
+  );
+}
+
+function RpSalesReport({ ctx, r, controls, question, openJob }) {
+  const s = rpSales(ctx.jobs, r);
+  const rows = s.rows.map((j) => ({ id: j.id, job_id: j.id, number: j.number, customer: j.customerName, job_type: j.jobType,
+    trade: j.trade, signed: j.contractSignedDate, contract: Number(j.contractAmount || 0), stage: j.stage }))
+    .sort((a, b) => (a.signed < b.signed ? 1 : a.signed > b.signed ? -1 : 0));
+  const types = [...new Set(rows.map((x) => x.job_type))].map((k) => {
+    const t = rows.filter((x) => x.job_type === k);
+    return { key: k, label: rpTypeLabel(k), total: rpSum(t, "contract"), n: t.length };
+  }).sort((a, b) => b.total - a.total);
+  const columns = [
+    { key: "signed", header: "Signed", get: (x) => x.signed, render: (x) => rpFmt(x.signed) },
+    rpJobCol, rpCustCol, rpTypeCol,
+    { key: "trade", header: "Trade", get: (x) => rpTradeLabel(x.trade) },
+    { key: "contract", header: "Contract", money: true },
+  ];
+  const heldTotal = rpSum(s.held, "contractAmount");
+  return (
+    <RpShell question={question} controls={controls}
+      answer={money(s.total) + " sold on " + rpPlural(rows.length, "contract") + ", " + rpRangeText(r) + "."}
+      onExport={() => rpExport("sold_" + r.from + "_to_" + r.to + ".xlsx", [{ name: "Sold", columns, rows }])}>
+      {types.length > 0 && (
+        <div className="td-report-totals">
+          {types.map((t) => (
+            <div key={t.key}><span className="td-field-label">{t.label}</span><strong>{money(t.total)}</strong>
+              <span className="td-cell-sub">{rpPlural(t.n, "contract")}{s.total ? ", " + pct(t.total / s.total) : ""}</span></div>
+          ))}
+        </div>
+      )}
+      <RpTable columns={columns} rows={rows} onOpenJob={openJob} foot={{ contract: s.total }} empty="No contracts signed in this period" />
+      {s.held.length > 0 && (
+        <p className="td-sc-key">Not counted: {rpPlural(s.held.length, "job")} on hold ({money(heldTotal)}) signed in this period. They count again when the hold is lifted.</p>
+      )}
+    </RpShell>
+  );
+}
+
+function RpCashReport({ ctx, r, controls, question, openJob }) {
+  const c = rpCash(ctx.jobs, r);
+  const byType = [...new Set(c.rows.map((x) => x.type))].map((k) => ({ k, total: rpSum(c.rows.filter((x) => x.type === k), "amount") }))
+    .sort((a, b) => b.total - a.total);
+  const columns = [
+    { key: "day", header: "Date", get: (x) => x.day, render: (x) => rpFmt(x.day) },
+    rpJobCol, rpCustCol,
+    { key: "type", header: "Payment", get: (x) => x.type },
+    { key: "method", header: "Method", get: (x) => x.method },
+    { key: "amount", header: "Amount", money: true },
+  ];
+  const withLost = columns.map((col) => col.key === "customer"
+    ? { ...col, render: (x) => <>{x.customer}{x.lost && <span className="td-bal-src">Lost</span>}</> } : col);
+  return (
+    <RpShell question={question} controls={controls}
+      answer={money(c.total) + " collected in " + rpPlural(c.rows.length, "client payment") + ", " + rpRangeText(r) + "."}
+      onExport={() => rpExport("cash_collected_" + r.from + "_to_" + r.to + ".xlsx", [{ name: "Cash collected", columns, rows: c.rows }])}>
+      {byType.length > 1 && (
+        <div className="td-report-totals">
+          {byType.map((t) => <div key={t.k}><span className="td-field-label">{t.k}</span><strong>{money(t.total)}</strong></div>)}
+        </div>
+      )}
+      <RpTable columns={withLost} rows={c.rows} onOpenJob={openJob} foot={{ amount: c.total }} empty="No client payments in this period" />
+    </RpShell>
+  );
+}
+
+const RP_AGE = [
+  { key: "a0", label: "0–30 days", max: 30 },
+  { key: "a1", label: "31–60 days", max: 60 },
+  { key: "a2", label: "61–90 days", max: 90 },
+  { key: "a3", label: "Over 90 days", max: Infinity },
+];
+const rpAgeLabel = (days) => (days === null || days === undefined ? "No Completed date" : (RP_AGE.find((b) => days <= b.max) || RP_AGE[3]).label);
+
+function RpOwedReport({ question, openJob }) {
+  const d = useRpData(() => repo.reportBalancesOwed(), []);
+  const [search, setSearch] = useState("");
+  const all = (d.data && d.data.rows) || [];
+  const q = search.trim().toLowerCase();
+  const match = (x) => !q || [x.customer, x.address, x.project_ref, jobNo(x.number)].some((v) => String(v || "").toLowerCase().includes(q));
+  const fin = all.filter((x) => x.finished && x.balance >= 1 && match(x))
+    .sort((a, b) => (b.days_since_complete ?? 99999) - (a.days_since_complete ?? 99999));
+  const open = all.filter((x) => !x.finished && x.balance >= 1 && match(x)).sort((a, b) => b.balance - a.balance);
+  const over = all.filter((x) => x.balance <= -1 && match(x)).sort((a, b) => a.balance - b.balance);
+  const ages = RP_AGE.map((b) => ({ ...b, rows: fin.filter((x) => x.days_since_complete !== null && x.days_since_complete !== undefined && rpAgeLabel(x.days_since_complete) === b.label) }));
+  const noDate = fin.filter((x) => x.days_since_complete === null || x.days_since_complete === undefined);
+  const money3 = [
+    { key: "contract", header: "Contract", money: true },
+    { key: "client_credited", header: "Credits", money: true },
+    { key: "collected", header: "Collected", money: true },
+  ];
+  const finCols = [rpJobCol, rpCustCol, rpTypeCol,
+    { key: "completed_date", header: "Completed", get: (x) => x.completed_date || "", render: (x) => (x.completed_date ? rpFmt(x.completed_date) : <span className="td-text-red">No date</span>) },
+    { key: "days_since_complete", header: "Days", num: true, get: (x) => x.days_since_complete ?? "" },
+    ...money3, { key: "balance", header: "Owed", money: true }];
+  const openCols = [rpJobCol, rpCustCol, rpTypeCol, { key: "stage_label", header: "Stage", get: (x) => x.stage_label + (x.on_hold ? " (on hold)" : "") },
+    ...money3, { key: "balance", header: "Left to collect", money: true }];
+  const overCols = [rpJobCol, rpCustCol, rpTypeCol, ...money3, { key: "balance", header: "Overpaid", money: true, get: (x) => -x.balance }];
+  const totals = (rows) => ({ contract: rpSum(rows, "contract"), client_credited: rpSum(rows, "client_credited"), collected: rpSum(rows, "collected"), balance: rpSum(rows, "balance") });
+  return (
+    <RpShell question={question} loading={d.loading} error={d.error} onRefresh={d.refresh} asOf={rpAsOf(d.data && d.data.generated_at)}
+      answer={money(rpSum(fin, "balance")) + " owed on " + rpPlural(fin.length, "finished job") + "; " + money(rpSum(open, "balance")) +
+        " left to collect on " + rpPlural(open.length, "open job") + "."}
+      controls={
+        <div className="td-report-controls td-rp-controls">
+          <label className="td-deal-field td-report-search">
+            <span className="td-field-label">Find a job</span>
+            <input className="td-input" placeholder="Customer, address, job #, project #" value={search} onChange={(e) => setSearch(e.target.value)} />
+          </label>
+        </div>
+      }
+      onExport={() => rpExport("who_owes_us.xlsx", [
+        { name: "Finished jobs owing", columns: finCols, rows: fin },
+        { name: "Open jobs", columns: openCols, rows: open },
+        { name: "Overpaid", columns: overCols, rows: over },
+      ])}>
+      <div className="td-report-totals">
+        {ages.map((b) => <div key={b.key}><span className="td-field-label">{b.label}</span><strong>{money(rpSum(b.rows, "balance"))}</strong><span className="td-cell-sub">{rpPlural(b.rows.length, "job")}</span></div>)}
+        {noDate.length > 0 && <div><span className="td-field-label">No Completed date</span><strong>{money(rpSum(noDate, "balance"))}</strong><span className="td-cell-sub">{rpPlural(noDate.length, "job")}</span></div>}
+        {d.data && Number(d.data.client_credited_total) > 0 && <div><span className="td-field-label">Client credits given</span><strong>{money(d.data.client_credited_total)}</strong><span className="td-cell-sub">already off these balances</span></div>}
+      </div>
+      <h3 className="td-rp-section">Finished jobs still owing <span>oldest first</span></h3>
+      <RpTable columns={finCols} rows={fin} onOpenJob={openJob} foot={totals(fin)} empty="No finished job owes anything" />
+      <h3 className="td-rp-section">Open jobs: left to collect <span>largest first</span></h3>
+      <RpTable columns={openCols} rows={open} onOpenJob={openJob} foot={totals(open)} empty="Nothing left to collect on open jobs" />
+      {over.length > 0 && (
+        <>
+          <h3 className="td-rp-section">Overpaid <span>collected more than the contract</span></h3>
+          <RpTable columns={overCols} rows={over} onOpenJob={openJob} />
+        </>
+      )}
+    </RpShell>
+  );
+}
+
+function RpProfitReport({ r, controls, question, openJob }) {
+  const d = useRpData(() => repo.reportJobProfitability(r.from, r.to), [r.from, r.to]);
+  const rows = (d.data && d.data.rows) || [];
+  const costed = rows.filter((x) => x.has_costs);
+  const noCost = rows.filter((x) => !x.has_costs);
+  const rev = rpSum(costed, "revenue"), gp = rpSum(costed, "gp");
+  const columns = [
+    { key: "completed_date", header: "Completed", get: (x) => x.completed_date, render: (x) => rpFmt(x.completed_date) },
+    rpJobCol, rpCustCol, rpTypeCol,
+    { key: "revenue", header: "Revenue", money: true },
+    { key: "vendor_cost", header: "Vendor costs", money: true },
+    { key: "gp", header: "Gross profit", money: true },
+    { key: "gp_pct", header: "Margin", num: true, get: (x) => (x.gp_pct === null ? "" : Number(x.gp_pct)),
+      render: (x) => <span className={x.gp_pct < 0 ? "td-text-red" : undefined}>{x.gp_pct === null ? "—" : pct(x.gp_pct)}</span> },
+    { key: "finalized", header: "GP", get: (x) => (x.finalized ? "Finalized" : "Provisional"),
+      render: (x) => (x.finalized ? "Finalized" : <span className="td-sc-prov">Provisional</span>) },
+  ];
+  const noCostCols = [columns[0], rpJobCol, rpCustCol, rpTypeCol, { key: "revenue", header: "Revenue", money: true }];
+  return (
+    <RpShell question={question} controls={controls} loading={d.loading} error={d.error} onRefresh={d.refresh} asOf={rpAsOf(d.data && d.data.generated_at)}
+      answer={rows.length ? money(gp) + " gross profit (" + (rev > 0 ? pct(gp / rev) : "—") + " margin) on " + rpPlural(costed.length, "completed job") +
+        " with vendor costs." + (noCost.length ? " " + rpPlural(noCost.length, "job") + " without vendor costs " + (noCost.length === 1 ? "is" : "are") + " listed separately." : "") : ""}
+      onExport={() => rpExport("job_profit_" + r.from + "_to_" + r.to + ".xlsx", [
+        { name: "Jobs with costs", columns, rows: costed },
+        { name: "No vendor costs", columns: noCostCols, rows: noCost },
+      ])}>
+      <RpTable columns={columns} rows={costed} onOpenJob={openJob} foot={{ revenue: rev, vendor_cost: rpSum(costed, "vendor_cost"), gp, gp_pct: rev > 0 ? pct(gp / rev) : "—" }}
+        empty="No completed jobs with vendor costs in this period" />
+      <p className="td-sc-key">Lowest margin first. Provisional GP is the live margin and moves as vendor bills land; Finalized is locked on the job card.</p>
+      {noCost.length > 0 && (
+        <>
+          <h3 className="td-rp-section">Completed, no vendor costs entered <span>left out of the totals, since their margin would read 100%</span></h3>
+          <RpTable columns={noCostCols} rows={noCost} onOpenJob={openJob} foot={{ revenue: rpSum(noCost, "revenue") }} />
+        </>
+      )}
+    </RpShell>
+  );
+}
+
+function RpBacklogReport({ question, openJob }) {
+  const d = useRpData(() => repo.reportBacklog(), []);
+  const rows = (d.data && d.data.rows) || [];
+  const live = rows.filter((x) => !x.on_hold), held = rows.filter((x) => x.on_hold);
+  const columns = [
+    { key: "contract_signed_date", header: "Signed", get: (x) => x.contract_signed_date || "", render: (x) => rpFmt(x.contract_signed_date) },
+    { key: "days_since_signed", header: "Days", num: true, get: (x) => x.days_since_signed ?? "" },
+    rpJobCol, rpCustCol, rpTypeCol,
+    { key: "stage_label", header: "Stage", get: (x) => x.stage_label },
+    { key: "contract", header: "Contract", money: true },
+    { key: "collected", header: "Collected", money: true },
+    { key: "left_to_collect", header: "Left to collect", money: true },
+    { key: "vendor_cost", header: "Vendor costs so far", money: true },
+  ];
+  const foot = (rs) => ({ contract: rpSum(rs, "contract"), collected: rpSum(rs, "collected"), left_to_collect: rpSum(rs, "left_to_collect"), vendor_cost: rpSum(rs, "vendor_cost") });
+  return (
+    <RpShell question={question} loading={d.loading} error={d.error} onRefresh={d.refresh} asOf={rpAsOf(d.data && d.data.generated_at)}
+      answer={rpPlural(live.length, "job") + " signed and not finished: " + money(rpSum(live, "contract")) + " in contracts, " +
+        money(rpSum(live, "left_to_collect")) + " still to collect."}
+      onExport={() => rpExport("signed_not_finished.xlsx", [{ name: "Open jobs", columns, rows: live }, { name: "On hold", columns, rows: held }])}>
+      <RpTable columns={columns} rows={live} onOpenJob={openJob} foot={foot(live)} empty="No open jobs" />
+      <p className="td-sc-key">Oldest signed first. Whether a job is over- or under-billed needs a cost budget per job, which TradeDesk doesn't hold yet.</p>
+      {held.length > 0 && (
+        <>
+          <h3 className="td-rp-section">On hold <span>not counted above</span></h3>
+          <RpTable columns={columns} rows={held} onOpenJob={openJob} foot={foot(held)} />
+        </>
+      )}
+    </RpShell>
+  );
+}
+
+function RpVendorReport({ question, openJob }) {
+  const d = useRpData(() => repo.reportVendorOwed(), []);
+  const rows = (d.data && d.data.rows) || [];
+  const vendors = [...new Set(rows.map((x) => x.vendor))].map((v) => {
+    const rs = rows.filter((x) => x.vendor === v);
+    return { vendor: v, rows: rs, owed: rpSum(rs, "owed"), oldest: Math.max(0, ...rs.map((x) => x.days_old || 0)) };
+  }).sort((a, b) => b.owed - a.owed);
+  const columns = [
+    { key: "bill_date", header: "Bill date", get: (x) => x.bill_date || "", render: (x) => rpFmt(x.bill_date) },
+    { key: "days_old", header: "Days", num: true, get: (x) => x.days_old ?? "" },
+    rpJobCol,
+    { key: "customer", header: "Customer", get: (x) => x.customer || "", render: (x) => <>{x.customer}{x.job_lost && <span className="td-bal-src">Lost</span>}</> },
+    { key: "category", header: "Category", get: (x) => x.category || "—" },
+    { key: "amount", header: "Bill", money: true },
+    { key: "credited", header: "Credits", money: true },
+    { key: "owed", header: "Owed", money: true },
+  ];
+  const exportCols = [{ key: "vendor", header: "Vendor", get: (x) => x.vendor }, ...columns];
+  const total = rpSum(rows, "owed");
+  return (
+    <RpShell question={question} loading={d.loading} error={d.error} onRefresh={d.refresh} asOf={rpAsOf(d.data && d.data.generated_at)}
+      answer={money(total) + " owed to " + rpPlural(vendors.length, "vendor") + " on " + rpPlural(rows.length, "unpaid bill") + "."}
+      onExport={() => rpExport("owed_to_vendors.xlsx", [{ name: "Unpaid bills", columns: exportCols, rows: vendors.flatMap((v) => v.rows) }])}>
+      <div className="td-report-totals">
+        {[{ l: "0–30 days", f: (x) => (x.days_old ?? 0) <= 30 }, { l: "31–60 days", f: (x) => x.days_old > 30 && x.days_old <= 60 },
+          { l: "Over 60 days", f: (x) => x.days_old > 60 }].map((b) => (
+          <div key={b.l}><span className="td-field-label">{b.l}</span><strong>{money(rpSum(rows.filter(b.f), "owed"))}</strong></div>
         ))}
       </div>
-      {tab === "balances" && <BalancesOwedReport onOpenJob={ctx.setSelectedJobId} />}
-      {tab === "payments" && <TransactionReport jobs={ctx.jobs} />}
+      {vendors.length === 0 ? <EmptyState icon={Truck} title="No unpaid vendor bills" sub="Pending vendor payments on jobs show up here." /> : vendors.map((v) => (
+        <div key={v.vendor} className="td-rp-vendor">
+          <h3 className="td-rp-section">{v.vendor} <span>{money(v.owed)} · {rpPlural(v.rows.length, "bill")} · oldest {v.oldest} days</span></h3>
+          <RpTable columns={columns} rows={v.rows} onOpenJob={openJob} foot={{ amount: rpSum(v.rows, "amount"), credited: rpSum(v.rows, "credited"), owed: v.owed }} />
+        </div>
+      ))}
+    </RpShell>
+  );
+}
+
+function RpCreditsReport({ ctx, r, controls, question, openJob }) {
+  const c = rpCredits(ctx.jobs, r);
+  const columns = [
+    { key: "day", header: "Date", get: (x) => x.day, render: (x) => rpFmt(x.day) },
+    { key: "kind", header: "Kind", get: (x) => (x.kind === "client" ? "Client credit" : "Vendor credit") },
+    rpJobCol, rpCustCol,
+    { key: "party", header: "From / to", get: (x) => x.party },
+    { key: "settlement", header: "How applied", get: (x) => x.settlement },
+    { key: "reason", header: "Reason", get: (x) => x.reason || "" },
+    { key: "amount", header: "Amount", money: true },
+  ];
+  return (
+    <RpShell question={question} controls={controls}
+      answer={money(c.client) + " credited to clients and " + money(c.vendor) + " credited by vendors, " + rpRangeText(r) + "."}
+      onExport={() => rpExport("credits_" + r.from + "_to_" + r.to + ".xlsx", [{ name: "Credits", columns, rows: c.rows }])}>
+      <div className="td-report-totals">
+        <div><span className="td-field-label">Client credits</span><strong>{money(c.client)}</strong><span className="td-cell-sub">off what clients owe</span></div>
+        <div><span className="td-field-label">Vendor credits</span><strong>{money(c.vendor)}</strong><span className="td-cell-sub">off vendor costs</span></div>
+      </div>
+      <RpTable columns={columns} rows={c.rows} onOpenJob={openJob} foot={{ amount: c.client + c.vendor }} empty="No credits in this period" />
+    </RpShell>
+  );
+}
+
+function LedgerView({ ctx }) {
+  // Balances owed moved to Reports ("Who still owes us?"); the Ledger is the
+  // payment query tool for digging.
+  return (
+    <div className="td-view">
+      <TransactionReport jobs={ctx.jobs} />
     </div>
   );
 }
@@ -3955,7 +4759,7 @@ const scMonthLabel = (m) => new Date(m + "T00:00:00").toLocaleString("en-US", { 
 // One definition per column, shared by the table and both exports so the
 // spreadsheet always says what the screen says.
 const SC_COLUMNS = [
-  { key: "booked", header: "Booked (signed)", money: true },
+  { key: "booked", header: "Sold (contracts signed)", money: true },
   { key: "booked_jobs", header: "Jobs signed" },
   { key: "collected", header: "Collected (cash)", money: true },
   { key: "completed", header: "Completed", money: true },
@@ -3981,11 +4785,10 @@ function scTotals(months) {
 
 function scCoverageLines(c) {
   if (!c) return [];
-  const since = c.stage_log_since ? fmtDate(c.stage_log_since) : "today (no stage moves logged yet)";
   return [
-    ["Booked", c.jobs_with_signed_date + " of " + c.jobs_live + " live jobs have a contract signed date. Jobs without one are not in any month."],
-    ["Completed", "Stage history started " + since + ". " + c.complete_with_completion_date + " of " + c.complete_stage_jobs +
-      " completed/closed jobs have a completion date, from the Completion Log sheet or, failing that, the first move into a done stage. The rest are left out."],
+    ["Sold", c.jobs_with_signed_date + " of " + c.jobs_live + " live jobs have a contract signed date. Jobs without one are not in any month."],
+    ["Completed", c.complete_with_completion_date + " jobs have a Completed date entered in TradeDesk; " + c.complete_stage_jobs +
+      " jobs are in a done stage. A finished job with no Completed date is left out until one is entered on the job card."],
     ["GP finalized", c.finalized_jobs + " job" + (c.finalized_jobs === 1 ? "" : "s") + " finalized. Each finalization counts in the month it was made, so past months do not move."],
     ["GP provisional", "Live margin on completed jobs not yet finalized: " + c.provisional_by_completion + " dated by completion, " +
       c.provisional_by_signed + " by signed date. " + c.provisional_undated + " more (" + money(c.provisional_undated_revenue) +
@@ -4039,7 +4842,7 @@ async function exportScorecard(data, kind) {
   downloadBlob(new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), base + ".xlsx");
 }
 
-function ScorecardReport() {
+function ScorecardReport({ onOpen }) {
   const [period, setPeriod] = useState("last12");
   const now = new Date();
   const [customFrom, setCustomFrom] = useState(monthInput(new Date(now.getFullYear(), now.getMonth() - 11, 1)));
@@ -4085,7 +4888,7 @@ function ScorecardReport() {
     <div className="td-sc">
       <div className="td-panel td-report">
         <div className="td-panel-head">
-          <span><TrendingUp size={14} style={{ verticalAlign: -2, marginRight: 6 }} />Monthly scorecard</span>
+          <h2 className="td-rp-question">How are we doing month by month?</h2>
           <div className="td-report-actions">
             <button className="td-btn" disabled={!months.length || !!busy} onClick={() => doExport("csv")}>
               <Download size={13} /> {busy === "csv" ? "Exporting…" : "CSV"}
@@ -4114,7 +4917,7 @@ function ScorecardReport() {
               </label>
             </>
           )}
-          <span className="td-report-range">{fmtDate(range.from + "T00:00:00")} – {fmtDate(range.to + "T00:00:00")}</span>
+          <span className="td-report-range">{fmtDate(range.from + "T00:00:00")} – {fmtDate(range.to + "T00:00:00")}{data ? " · " + rpAsOf(data.generated_at) : ""}</span>
         </div>
 
         {error && <div className="td-sync-banner"><AlertTriangle size={15} /><span>{error}</span></div>}
@@ -4123,20 +4926,20 @@ function ScorecardReport() {
         {data && (
           <>
             <div className="td-stat-row">
-              <TicketStat label="Booked (contracts signed)" value={money(t.booked)} icon={ClipboardList} accent="#B8860B"
-                footnote={t.booked_jobs + " jobs" + (data.coverage ? " · only " + data.coverage.jobs_with_signed_date + " of " +
-                  data.coverage.jobs_live + " live jobs have a signed date" : "")} />
-              <TicketStat label="Collected (cash in)" value={money(t.collected)} icon={Wallet} accent="#3F8EA6" />
-              <TicketStat label="Completed" value={money(t.completed)} icon={Check} accent="#6B5B95"
-                footnote={t.completed_jobs + " jobs"} />
-              <TicketStat label="Gross profit — costed jobs only" value={money(t.gp_total)} icon={Percent} accent="#3F7D58"
-                footnote={(t.gp_pct === null ? "—" : pct(t.gp_pct)) + " on " + money(t.gp_revenue) + " revenue · " +
-                  t.gp_jobs + " of " + t.completed_jobs_n + " completed jobs have vendor costs"} />
+              <RpStat label="Sold (contracts signed)" value={money(t.booked)} icon={ClipboardList} accent="#B8860B"
+                foot={t.booked_jobs + " contracts"} onClick={onOpen && (() => onOpen("sales"))} />
+              <RpStat label="Cash collected" value={money(t.collected)} icon={Wallet} accent="#3F8EA6"
+                onClick={onOpen && (() => onOpen("cash"))} />
+              <RpStat label="Jobs completed" value={money(t.completed)} icon={Check} accent="#6B5B95"
+                foot={t.completed_jobs + " jobs"} onClick={onOpen && (() => onOpen("profit"))} />
+              <RpStat label="Gross profit — jobs with vendor costs" value={money(t.gp_total)} icon={Percent} accent="#3F7D58"
+                foot={(t.gp_pct === null ? "—" : pct(t.gp_pct)) + " on " + money(t.gp_revenue) + " revenue · " +
+                  t.gp_jobs + " of " + t.completed_jobs_n + " completed jobs have vendor costs"} onClick={onOpen && (() => onOpen("profit"))} />
             </div>
 
             {byType && byType.totals && (
               <div className="td-sc-types">
-                <span className="td-sc-types-head">Booked by job type</span>
+                <span className="td-sc-types-head">Sold by job type</span>
                 {(byType.types || []).map((tp) => {
                   const v = byType.totals.by_type[tp.key] || { booked: 0, jobs: 0 };
                   return (
@@ -4162,7 +4965,7 @@ function ScorecardReport() {
 
             <div className="td-sc-chart">
               <TrendChart months={months} series={[
-                { key: "booked", label: "Booked", color: "#B8860B" },
+                { key: "booked", label: "Sold", color: "#B8860B" },
                 { key: "collected", label: "Collected", color: "#3F8EA6" },
                 { key: "gp_total", label: "Gross profit", color: "#3F7D58" },
               ]} />
@@ -4172,7 +4975,7 @@ function ScorecardReport() {
               <table className="td-table td-sc-table">
                 <thead>
                   <tr>
-                    <th>Month</th><th className="td-num">Booked</th><th className="td-num">Collected</th>
+                    <th>Month</th><th className="td-num">Sold</th><th className="td-num">Collected</th>
                     <th className="td-num">Completed</th><th className="td-num">GP finalized</th>
                     <th className="td-num">GP provisional</th><th className="td-num">GP total</th><th className="td-num">GP %</th>
                   </tr>
@@ -4227,6 +5030,17 @@ const shortMoney = (v) => {
   return s + Math.round(a);
 };
 
+/** One sentence for screen readers: the latest month of each series and its change. */
+function trendSummary(months, series) {
+  if (!months.length) return "Monthly trend: no data";
+  const last = months[months.length - 1], prev = months[months.length - 2];
+  return "Monthly trend. " + scMonthLabel(last.m) + ": " + series.map((s) => {
+    const v = Number(last[s.key]) || 0;
+    const d = prev ? v - (Number(prev[s.key]) || 0) : null;
+    return s.label + " " + money(v) + (d === null ? "" : " (" + (d >= 0 ? "up " : "down ") + money(Math.abs(d)) + " from the month before)");
+  }).join("; ") + ". The table below lists every month.";
+}
+
 function TrendChart({ months, series }) {
   if (!months.length) return null;
   const W = 760, H = 230, P = { l: 52, r: 14, t: 12, b: 26 };
@@ -4238,7 +5052,7 @@ function TrendChart({ months, series }) {
   const ticks = [0, 1, 2, 3, 4].map((i) => min + ((max - min) * i) / 4);
   return (
     <div>
-      <svg viewBox={`0 0 ${W} ${H}`} className="td-sc-svg" role="img" aria-label="Monthly trend">
+      <svg viewBox={`0 0 ${W} ${H}`} className="td-sc-svg" role="img" aria-label={trendSummary(months, series)}>
         {ticks.map((v, i) => (
           <g key={i}>
             <line x1={P.l} x2={W - P.r} y1={y(v)} y2={y(v)} stroke="#EBE6DC" />
@@ -4255,7 +5069,8 @@ function TrendChart({ months, series }) {
             <polyline fill="none" stroke={s.color} strokeWidth="2.2" strokeLinejoin="round"
               points={months.map((m, i) => x(i) + "," + y(Number(m[s.key]) || 0)).join(" ")} />
             {months.map((m, i) => (
-              <circle key={m.m} cx={x(i)} cy={y(Number(m[s.key]) || 0)} r="3.2" fill={s.color}>
+              <circle key={m.m} cx={x(i)} cy={y(Number(m[s.key]) || 0)} r="3.2" fill={s.color} tabIndex={0}
+                aria-label={s.label + ", " + scMonthLabel(m.m) + ": " + money(m[s.key])} className="td-sc-point">
                 <title>{s.label} · {scMonthLabel(m.m)}: {money(m[s.key])}</title>
               </circle>
             ))}
@@ -4264,455 +5079,6 @@ function TrendChart({ months, series }) {
       </svg>
       <div className="td-sc-legend">
         {series.map((s) => <span key={s.key}><i style={{ background: s.color }} />{s.label}</span>)}
-      </div>
-    </div>
-  );
-}
-
-/* =========================================================================
-   BALANCES OWED — what is still owed on each job
-   =========================================================================
-   Computed in the database by report_balances_owed() (admin only). Per job:
-     balance   = contract - collected - client_credited
-     (contract stays the signed amount; client credits come from their own
-     table and are never counted as collected)
-     collected = the larger of the TradeDesk client payments and the amount the
-                 Completion Log sheet says was collected. Older jobs often have
-                 no payments entered in TradeDesk, and the sheet is the office's
-                 record of them; `collected_source` says which figure won.
-   Finished jobs (a complete stage) are true receivables. Open jobs are the
-   contract still to be collected as the work proceeds — kept as a separate
-   total so the two are never added together by accident. */
-
-const BAL_SCOPES = [
-  { key: "finished", label: "Finished jobs (receivables)" },
-  { key: "open", label: "Open jobs (left to collect)" },
-  { key: "all", label: "All jobs" },
-];
-const BAL_SHOW = [
-  { key: "owing", label: "Still owing" },
-  { key: "credit", label: "Overpaid (negative balance)" },
-  { key: "all", label: "Everything" },
-];
-const BAL_GROUPS = [
-  { key: "none", label: "No grouping" },
-  { key: "age", label: "By age since completion" },
-  { key: "stage", label: "By stage" },
-  { key: "trade", label: "By trade" },
-  { key: "source", label: "By where 'collected' came from" },
-];
-const BAL_AGE = [
-  { key: "a0", label: "0–30 days", max: 30 },
-  { key: "a1", label: "31–60 days", max: 60 },
-  { key: "a2", label: "61–90 days", max: 90 },
-  { key: "a3", label: "Over 90 days", max: Infinity },
-];
-const BAL_SOURCE_LABEL = {
-  tradedesk: "TradeDesk payments",
-  sheet: "Completion Log sheet",
-  none: "Nothing collected",
-};
-
-const balAgeKey = (r) => {
-  if (!r.finished) return "open";
-  if (r.days_since_complete === null || r.days_since_complete === undefined) return "nodate";
-  return (BAL_AGE.find((b) => r.days_since_complete <= b.max) || BAL_AGE[3]).key;
-};
-const balAgeLabel = (k) =>
-  k === "open" ? "Not finished" : k === "nodate" ? "No completion date" : (BAL_AGE.find((b) => b.key === k) || {}).label || k;
-
-/** The things worth a second look on one row, as short labels. */
-function balFlags(r) {
-  const f = [];
-  if (r.collected_source === "sheet") f.push({ tone: "amber", text: "Sheet shows " + money(r.paid_sheet - r.paid_tradedesk) + " more collected than TradeDesk" });
-  if (r.sheet_awaiting) f.push({ tone: "red", text: "Sheet: awaiting payment" });
-  if (r.finished && !r.tradedesk_payments && r.collected_source !== "sheet") f.push({ tone: "red", text: "No payments in TradeDesk" + (r.in_sheet ? "" : " or the sheet") });
-  if (!Number(r.contract)) f.push({ tone: "amber", text: "No contract amount" });
-  if (r.contract_sheet !== null && r.contract_sheet !== undefined && Math.abs(Number(r.contract_sheet) - Number(r.contract)) >= 1)
-    f.push({ tone: "grey", text: "Sheet contract " + money(r.contract_sheet) });
-  return f;
-}
-
-const BAL_EXPORT = [
-  { key: "job", header: "Job #", get: (r) => jobNo(r.number) },
-  { key: "project", header: "GHL Project #", get: (r) => r.project_ref || "" },
-  { key: "customer", header: "Customer", get: (r) => r.customer || "" },
-  { key: "address", header: "Address", get: (r) => r.address || "" },
-  { key: "trade", header: "Trade", get: (r) => (TRADES[r.trade] ? TRADES[r.trade].label : r.trade || "") },
-  { key: "stage", header: "Stage", get: (r) => r.stage_label || r.stage || "" },
-  { key: "kind", header: "Finished?", get: (r) => (r.finished ? "Finished" : "Open") },
-  { key: "contract", header: "Contract", money: true, get: (r) => Number(r.contract || 0) },
-  { key: "paid_td", header: "Paid (TradeDesk)", money: true, get: (r) => Number(r.paid_tradedesk || 0) },
-  { key: "paid_sheet", header: "Collected (sheet)", money: true, get: (r) => (r.paid_sheet === null || r.paid_sheet === undefined ? "" : Number(r.paid_sheet)) },
-  { key: "collected", header: "Collected (used)", money: true, get: (r) => Number(r.collected || 0) },
-  { key: "credited", header: "Client credited", money: true, get: (r) => Number(r.client_credited || 0) },
-  { key: "source", header: "Collected from", get: (r) => BAL_SOURCE_LABEL[r.collected_source] || r.collected_source },
-  { key: "balance", header: "Balance owed", money: true, get: (r) => Number(r.balance || 0) },
-  { key: "completed", header: "Completed", get: (r) => (r.completed_at ? isoDay(r.completed_at) : "") },
-  { key: "days", header: "Days since completed", get: (r) => (r.days_since_complete === null || r.days_since_complete === undefined ? "" : r.days_since_complete) },
-  { key: "last_td", header: "Last TradeDesk payment", get: (r) => (r.last_paid_tradedesk ? isoDay(r.last_paid_tradedesk) : "") },
-  { key: "last_sheet", header: "Sheet collected date", get: (r) => r.last_paid_sheet || "" },
-  { key: "flags", header: "Check", get: (r) => balFlags(r).map((f) => f.text).join("; ") },
-];
-
-function exportBalancesCsv(rows, filename) {
-  const cell = (v) => {
-    let s = v === null || v === undefined ? "" : String(v);
-    if (/^[=+\-@\t\r]/.test(s) && !/^-?\d+(\.\d+)?$/.test(s)) s = "'" + s;
-    return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-  };
-  const lines = [BAL_EXPORT.map((c) => cell(c.header)).join(",")];
-  rows.forEach((r) => lines.push(BAL_EXPORT.map((c) => cell(c.get(r))).join(",")));
-  downloadBlob(new Blob(["﻿" + lines.join("\r\n")], { type: "text/csv;charset=utf-8;" }), filename);
-}
-
-async function exportBalancesXlsx(rows, groups, filename) {
-  const XLSX = await import("xlsx");
-  const fmt = '"$"#,##0.00;[Red]-"$"#,##0.00';
-  const aoa = [BAL_EXPORT.map((c) => c.header)];
-  rows.forEach((r) => aoa.push(BAL_EXPORT.map((c) => c.get(r))));
-  const sum = (k) => rows.reduce((s, r) => s + Number(r[k] || 0), 0);
-  aoa.push([]);
-  const tot = BAL_EXPORT.map(() => "");
-  tot[0] = "TOTAL";
-  tot[BAL_EXPORT.findIndex((c) => c.key === "contract")] = sum("contract");
-  tot[BAL_EXPORT.findIndex((c) => c.key === "collected")] = sum("collected");
-  tot[BAL_EXPORT.findIndex((c) => c.key === "credited")] = sum("client_credited");
-  tot[BAL_EXPORT.findIndex((c) => c.key === "balance")] = sum("balance");
-  aoa.push(tot);
-  const ws = XLSX.utils.aoa_to_sheet(aoa);
-  BAL_EXPORT.forEach((c, ci) => {
-    if (!c.money) return;
-    for (let i = 1; i < aoa.length; i++) {
-      const ref = XLSX.utils.encode_cell({ r: i, c: ci });
-      if (ws[ref] && typeof ws[ref].v === "number") ws[ref].z = fmt;
-    }
-  });
-  ws["!cols"] = BAL_EXPORT.map((c) => ({ wch: c.key === "address" || c.key === "flags" ? 32 : c.key === "customer" ? 22 : 14 }));
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, "Balances");
-
-  const sAoa = [["Group", "Jobs", "Contract", "Collected", "Balance owed"]];
-  groups.forEach((g) => sAoa.push([g.label, g.count, g.contract, g.collected, g.balance]));
-  const sws = XLSX.utils.aoa_to_sheet(sAoa);
-  for (let i = 1; i < sAoa.length; i++) [2, 3, 4].forEach((c) => {
-    const ref = XLSX.utils.encode_cell({ r: i, c });
-    if (sws[ref] && typeof sws[ref].v === "number") sws[ref].z = fmt;
-  });
-  sws["!cols"] = [{ wch: 28 }, { wch: 8 }, { wch: 14 }, { wch: 14 }, { wch: 14 }];
-  XLSX.utils.book_append_sheet(wb, sws, "Summary");
-  const out = XLSX.write(wb, { bookType: "xlsx", type: "array" });
-  downloadBlob(new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), filename);
-}
-
-function BalancesOwedReport({ onOpenJob }) {
-  const [data, setData] = useState(null);
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [reloadKey, setReloadKey] = useState(0);
-  const [scope, setScope] = useState("finished");
-  const [show, setShow] = useState("owing");
-  const [groupBy, setGroupBy] = useState("age");
-  const [fTrade, setFTrade] = useState("");
-  const [fStage, setFStage] = useState("");
-  const [fSource, setFSource] = useState("");
-  const [search, setSearch] = useState("");
-  const [busy, setBusy] = useState("");
-
-  useEffect(() => {
-    let live = true;
-    setLoading(true); setError("");
-    repo.reportBalancesOwed()
-      .then((d) => { if (live) setData(d); })
-      .catch((e) => { if (live) { setData(null); setError(e.message || String(e)); } })
-      .finally(() => { if (live) setLoading(false); });
-    return () => { live = false; };
-  }, [reloadKey]);
-
-  const all = useMemo(() => ((data && data.rows) || []).map((r) => ({
-    ...r,
-    contract: Number(r.contract || 0), collected: Number(r.collected || 0), balance: Number(r.balance || 0),
-    client_credited: Number(r.client_credited || 0), client_credits_count: Number(r.client_credits_count || 0),
-    paid_tradedesk: Number(r.paid_tradedesk || 0),
-    paid_sheet: r.paid_sheet === null || r.paid_sheet === undefined ? null : Number(r.paid_sheet),
-  })), [data]);
-
-  // Headline figures ignore the filters on purpose: they are the answer to
-  // "how much is owed", and should read the same however the table is cut.
-  const head = useMemo(() => {
-    const owing = (r) => r.balance >= 1;
-    const fin = all.filter((r) => r.finished && owing(r));
-    const open = all.filter((r) => !r.finished && owing(r));
-    const sheetOnly = all.filter((r) => r.finished && r.collected_source === "sheet");
-    const credits = all.filter((r) => r.balance <= -1);
-    const s = (xs, k = "balance") => xs.reduce((t, r) => t + r[k], 0);
-    return {
-      finished: s(fin), finishedJobs: fin.length,
-      over90: s(fin.filter((r) => r.days_since_complete > 90)),
-      open: s(open), openJobs: open.length,
-      sheetOnlyJobs: sheetOnly.length, sheetOnlyGap: sheetOnly.reduce((t, r) => t + (r.paid_sheet - r.paid_tradedesk), 0),
-      credits: -s(credits), creditJobs: credits.length,
-      // Straight from the server, across every job, like the other headlines.
-      clientCredited: Number((data && data.client_credited_total) || 0),
-      clientCreditedJobs: all.filter((r) => r.client_credited > 0).length,
-    };
-  }, [all, data]);
-
-  const rows = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return all.filter((r) => {
-      if (scope === "finished" && !r.finished) return false;
-      if (scope === "open" && r.finished) return false;
-      if (show === "owing" && !(r.balance >= 1)) return false;
-      if (show === "credit" && !(r.balance <= -1)) return false;
-      if (fTrade && r.trade !== fTrade) return false;
-      if (fStage && r.stage !== fStage) return false;
-      if (fSource && r.collected_source !== fSource) return false;
-      if (q && ![r.customer, r.address, r.project_ref, jobNo(r.number)].some((v) => String(v || "").toLowerCase().includes(q))) return false;
-      return true;
-    }).sort((a, b) => (show === "credit" ? a.balance - b.balance : b.balance - a.balance));
-  }, [all, scope, show, fTrade, fStage, fSource, search]);
-
-  const groups = useMemo(() => {
-    const keyOf = {
-      none: () => "all",
-      age: balAgeKey,
-      stage: (r) => r.stage,
-      trade: (r) => r.trade || "",
-      source: (r) => r.collected_source,
-    }[groupBy];
-    const labelOf = {
-      none: () => "All jobs shown",
-      age: balAgeLabel,
-      stage: (k, r) => r.stage_label || k,
-      trade: (k) => (TRADES[k] ? TRADES[k].label : k || "—"),
-      source: (k) => BAL_SOURCE_LABEL[k] || k,
-    }[groupBy];
-    const order = { a0: 0, a1: 1, a2: 2, a3: 3, nodate: 4, open: 5 };
-    const map = new Map();
-    rows.forEach((r) => {
-      const k = keyOf(r);
-      const e = map.get(k) || { key: k, label: labelOf(k, r), count: 0, contract: 0, collected: 0, balance: 0 };
-      e.count += 1; e.contract += r.contract; e.collected += r.collected; e.balance += r.balance;
-      map.set(k, e);
-    });
-    return [...map.values()].sort((a, b) =>
-      groupBy === "age" ? (order[a.key] ?? 9) - (order[b.key] ?? 9) : Math.abs(b.balance) - Math.abs(a.balance));
-  }, [rows, groupBy]);
-
-  const tot = rows.reduce((t, r) => ({ contract: t.contract + r.contract, collected: t.collected + r.collected, balance: t.balance + r.balance }),
-    { contract: 0, collected: 0, balance: 0 });
-
-  const tradeKeys = useMemo(() => [...new Set(all.map((r) => r.trade).filter(Boolean))].sort(), [all]);
-  const stageOpts = useMemo(() => {
-    const m = new Map();
-    all.forEach((r) => { if (!m.has(r.stage)) m.set(r.stage, r.stage_label || r.stage); });
-    return [...m.entries()];
-  }, [all]);
-
-  const activeFilters = [fTrade, fStage, fSource, search].filter(Boolean).length;
-  const reset = () => { setFTrade(""); setFStage(""); setFSource(""); setSearch(""); };
-  const filenameBase = "tradedesk_balances-owed_" + scope + "_" + isoDay(new Date());
-  const doExport = async (kind) => {
-    if (!rows.length) return;
-    setBusy(kind);
-    try {
-      if (kind === "csv") exportBalancesCsv(rows, filenameBase + ".csv");
-      else await exportBalancesXlsx(rows, groups, filenameBase + ".xlsx");
-    } catch (e) { setError("Export failed: " + (e.message || e)); }
-    finally { setBusy(""); }
-  };
-
-  return (
-    <div className="td-sc td-bal">
-      <div className="td-panel td-report">
-        <div className="td-panel-head">
-          <span><Wallet size={14} style={{ verticalAlign: -2, marginRight: 6 }} />Balances owed</span>
-          <div className="td-report-actions">
-            <button className="td-btn" disabled={loading} onClick={() => setReloadKey((k) => k + 1)} title="Reload from the database">
-              <RefreshCw size={13} /> Refresh
-            </button>
-            <button className="td-btn" disabled={!rows.length || !!busy} onClick={() => doExport("csv")}>
-              <Download size={13} /> {busy === "csv" ? "Exporting…" : "CSV"}
-            </button>
-            <button className="td-btn" disabled={!rows.length || !!busy} onClick={() => doExport("xlsx")}>
-              <FileSpreadsheet size={13} /> {busy === "xlsx" ? "Building…" : "Excel"}
-            </button>
-          </div>
-        </div>
-
-        {error && <div className="td-sync-banner"><AlertTriangle size={15} /><span>{error}</span></div>}
-        {loading && !data && <div className="td-sc-loading">Loading…</div>}
-
-        {data && (
-          <>
-            <div className="td-stat-row">
-              <TicketStat label="Owed on finished jobs" value={money(head.finished)} icon={Wallet} accent="#C1440E"
-                footnote={head.finishedJobs + " jobs · " + money(head.over90) + " over 90 days"} />
-              <TicketStat label="Left to collect on open jobs" value={money(head.open)} icon={ClipboardList} accent="#B8860B"
-                footnote={head.openJobs + " jobs not finished yet"} />
-              <TicketStat label="Paid per sheet, not in TradeDesk" value={String(head.sheetOnlyJobs)} icon={AlertTriangle} accent="#8A5A12"
-                footnote={money(head.sheetOnlyGap) + " of payments to enter"} />
-              <TicketStat label="Overpaid" value={money(head.credits)} icon={HandCoins} accent="#3F7D58"
-                footnote={head.creditJobs + " jobs with a negative balance"} />
-              <TicketStat label="Client Credited Total" value={money(head.clientCredited)} icon={Minus} accent="#6A4C93"
-                footnote={head.clientCreditedJobs + " job" + (head.clientCreditedJobs === 1 ? "" : "s") + " · taken off balances, not refunds"} />
-            </div>
-
-            <div className="td-report-controls">
-              <label className="td-deal-field">
-                <span className="td-field-label">Jobs</span>
-                <select className="td-select" value={scope} onChange={(e) => setScope(e.target.value)}>
-                  {BAL_SCOPES.map((o) => <option key={o.key} value={o.key}>{o.label}</option>)}
-                </select>
-              </label>
-              <label className="td-deal-field">
-                <span className="td-field-label">Show</span>
-                <select className="td-select" value={show} onChange={(e) => setShow(e.target.value)}>
-                  {BAL_SHOW.map((o) => <option key={o.key} value={o.key}>{o.label}</option>)}
-                </select>
-              </label>
-              <label className="td-deal-field">
-                <span className="td-field-label">Group</span>
-                <select className="td-select" value={groupBy} onChange={(e) => setGroupBy(e.target.value)}>
-                  {BAL_GROUPS.map((o) => <option key={o.key} value={o.key}>{o.label}</option>)}
-                </select>
-              </label>
-              <label className="td-deal-field">
-                <span className="td-field-label">Trade</span>
-                <select className="td-select" value={fTrade} onChange={(e) => setFTrade(e.target.value)}>
-                  <option value="">All trades</option>
-                  {tradeKeys.map((k) => <option key={k} value={k}>{TRADES[k] ? TRADES[k].label : k}</option>)}
-                </select>
-              </label>
-              <label className="td-deal-field">
-                <span className="td-field-label">Stage</span>
-                <select className="td-select" value={fStage} onChange={(e) => setFStage(e.target.value)}>
-                  <option value="">All stages</option>
-                  {stageOpts.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
-                </select>
-              </label>
-              <label className="td-deal-field">
-                <span className="td-field-label">Collected from</span>
-                <select className="td-select" value={fSource} onChange={(e) => setFSource(e.target.value)}>
-                  <option value="">Any source</option>
-                  {Object.entries(BAL_SOURCE_LABEL).map(([k, l]) => <option key={k} value={k}>{l}</option>)}
-                </select>
-              </label>
-              <label className="td-deal-field td-report-search">
-                <span className="td-field-label">Search</span>
-                <input className="td-input" placeholder="Customer, address, job #, project #" value={search}
-                  onChange={(e) => setSearch(e.target.value)} />
-              </label>
-              {activeFilters > 0 && (
-                <button className="td-btn td-report-reset" onClick={reset}>
-                  <X size={13} /> Clear {activeFilters} filter{activeFilters === 1 ? "" : "s"}
-                </button>
-              )}
-            </div>
-
-            {rows.length === 0 ? (
-              <EmptyState icon={Wallet} title="Nothing matches" sub="Change the job scope or clear a filter." />
-            ) : (
-              <>
-                <div className="td-table-wrap">
-                  <table className="td-table td-sc-table">
-                    <thead>
-                      <tr>
-                        <th>{(BAL_GROUPS.find((g) => g.key === groupBy) || {}).label.replace(/^By /, "").replace(/^No grouping$/, "Total")}</th>
-                        <th className="td-num">Jobs</th><th className="td-num">Contract</th>
-                        <th className="td-num">Collected</th><th className="td-num">Balance owed</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {groups.map((g) => (
-                        <tr key={g.key}>
-                          <td>{g.label}</td>
-                          <td className="td-num">{g.count}</td>
-                          <td className="td-num">{money(g.contract)}</td>
-                          <td className="td-num">{money(g.collected)}</td>
-                          <td className={"td-num " + (g.balance < 0 ? "td-text-green" : "td-text-red")}><strong>{money(g.balance)}</strong></td>
-                        </tr>
-                      ))}
-                    </tbody>
-                    <tfoot>
-                      <tr>
-                        <td><strong>Total</strong></td>
-                        <td className="td-num"><strong>{rows.length}</strong></td>
-                        <td className="td-num"><strong>{money(tot.contract)}</strong></td>
-                        <td className="td-num"><strong>{money(tot.collected)}</strong></td>
-                        <td className="td-num"><strong>{money(tot.balance)}</strong></td>
-                      </tr>
-                    </tfoot>
-                  </table>
-                </div>
-
-                <div className="td-table-wrap td-bal-jobs">
-                  <table className="td-table">
-                    <thead>
-                      <tr>
-                        <th>Job</th><th>Customer</th><th>Stage</th>
-                        <th className="td-num">Contract</th><th className="td-num">Collected</th>
-                        <th className="td-num">Credited</th><th className="td-num">Balance</th>
-                        <th>Completed</th><th>Last payment</th><th>Check</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {rows.map((r) => {
-                        const flags = balFlags(r);
-                        return (
-                          <tr key={r.job_id} className="td-bal-row" onClick={() => onOpenJob && onOpenJob(r.job_id)} title="Open this job">
-                            <td>
-                              <div className="td-bal-job">{jobNo(r.number)}</div>
-                              {r.project_ref && <div className="td-bal-sub">GHL #{r.project_ref}</div>}
-                            </td>
-                            <td>
-                              <div>{r.customer}</div>
-                              <div className="td-bal-sub">{String(r.address || "").split(",")[0]}</div>
-                            </td>
-                            <td>{r.stage_label}</td>
-                            <td className="td-num">{money(r.contract)}</td>
-                            <td className="td-num">
-                              {money(r.collected)}
-                              {r.collected_source === "sheet" && <span className="td-bal-src" title={"TradeDesk has " + money(r.paid_tradedesk) + "; the Completion Log says " + money(r.paid_sheet)}>sheet</span>}
-                            </td>
-                            <td className="td-num">
-                              {r.client_credited > 0
-                                ? <span className="td-credit-text" title={r.client_credits_count + " client credit" + (r.client_credits_count === 1 ? "" : "s")}>{"\u2212" + money(r.client_credited)}</span>
-                                : <span className="td-bal-sub">—</span>}
-                            </td>
-                            <td className={"td-num " + (r.balance < 0 ? "td-text-green" : r.balance >= 1 ? "td-text-red" : "")}><strong>{money(r.balance)}</strong></td>
-                            <td>
-                              {r.completed_at ? fmtDate(r.completed_at) : <span className="td-bal-sub">—</span>}
-                              {r.days_since_complete !== null && r.days_since_complete !== undefined &&
-                                <div className={cls("td-bal-sub", r.days_since_complete > 90 && r.balance >= 1 && "td-text-red")}>{r.days_since_complete} days</div>}
-                            </td>
-                            <td>
-                              {r.last_paid_tradedesk ? fmtDate(r.last_paid_tradedesk)
-                                : r.last_paid_sheet ? <span>{fmtDate(r.last_paid_sheet + "T00:00:00")} <span className="td-bal-sub">(sheet)</span></span>
-                                : <span className="td-bal-sub">none</span>}
-                            </td>
-                            <td>
-                              <div className="td-bal-flags">
-                                {flags.map((f, i) => <span key={i} className={"td-bal-flag td-bal-flag-" + f.tone}>{f.text}</span>)}
-                              </div>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              </>
-            )}
-            <p className="td-sc-key">
-              Balance = contract − collected. Collected is the larger of the payments entered in TradeDesk and the
-              Completion Log's AMOUNT COLLECTED; rows marked <em>sheet</em> took the sheet's figure, so those payments
-              still need entering in TradeDesk. Change orders not yet added to a job's contract show up as credits.
-              Lost and abandoned jobs are left out. Click a row to open the job.
-            </p>
-          </>
-        )}
       </div>
     </div>
   );
@@ -6411,6 +6777,54 @@ function GlobalStyle() {
       .td-bal-flag-amber { background: #F6E7C8; color: #7A4F0E; }
       .td-bal-flag-grey { background: #EFEBE3; color: #5E594F; }
       .td-sc-loading { padding: 24px 0; color: var(--td-muted); font-size: 13px; }
+
+      /* ---------- Snapshot + Reports (question list) ---------- */
+      .td-rp-question { margin: 0; font-family: 'Oswald', sans-serif; font-size: 16px; font-weight: 600; letter-spacing: 0.01em; }
+      .td-report-controls.td-rp-controls { grid-template-columns: repeat(auto-fit, minmax(165px, 220px)); }
+      .td-rp-stat { display: block; width: 100%; text-align: left; font: inherit; color: inherit; cursor: pointer; transition: border-color .12s, box-shadow .12s; }
+      .td-rp-stat:hover { border-color: var(--tc); box-shadow: 0 1px 0 rgba(0,0,0,.04); }
+      .td-rp-stat:focus-visible { outline: 2px solid var(--tc); outline-offset: 2px; }
+      .td-rp-open { display: flex; align-items: center; gap: 2px; margin-top: 8px; font-size: 11.5px; font-weight: 600; color: var(--tc); }
+      .td-rp-delta { margin-top: 6px; font-size: 11.5px; color: var(--td-muted); }
+      .td-rp-delta-up { color: var(--td-green); }
+      .td-rp-delta-down { color: var(--td-red); }
+      .td-rp-group { margin: 16px 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--td-muted); font-weight: 700; }
+      .td-rp-group span { margin-left: 8px; text-transform: none; letter-spacing: 0; font-weight: 500; font-family: 'IBM Plex Mono', monospace; }
+      .td-rp-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 14px; padding: 10px 12px; border-radius: var(--td-radius);
+        background: #F6E7C8; color: #6B4510; font-size: 12.5px; }
+      .td-rp-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+      .td-rp-chip { border: 1px solid #E3CC98; background: #FFF8E8; border-radius: 999px; padding: 3px 9px; font-size: 12px; cursor: pointer; color: inherit; }
+      .td-rp-chip:hover { background: #fff; }
+      .td-rp-more { font-size: 12px; }
+      .td-rp-source { margin: 14px 0 0; font-size: 12px; color: var(--td-muted); }
+      .td-rp-intro { margin: 0 0 12px; font-size: 13px; color: var(--td-muted); }
+      .td-rp-list { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+      .td-rp-list-group { background: var(--td-card); border: 1px solid var(--td-border); border-radius: var(--td-radius); padding: 12px 12px 6px; }
+      .td-rp-list-group h3 { margin: 0 0 6px 4px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--td-muted); }
+      .td-rp-list-item { display: grid; grid-template-columns: 1fr auto; grid-template-rows: auto auto; column-gap: 10px; align-items: center; width: 100%;
+        padding: 10px; margin-bottom: 6px; border: none; border-radius: 4px; background: none; text-align: left; cursor: pointer; color: inherit; font: inherit; }
+      .td-rp-list-item:hover, .td-rp-list-item:focus-visible { background: var(--td-paper); }
+      .td-rp-list-item svg { grid-row: 1 / span 2; grid-column: 2; color: var(--td-muted); }
+      .td-rp-list-q { font-weight: 650; font-size: 14px; }
+      .td-rp-list-blurb { font-size: 12px; color: var(--td-muted); margin-top: 2px; }
+      .td-rp-back { display: inline-flex; align-items: center; gap: 4px; margin: 0 0 10px; padding: 4px 2px; border: none; background: none;
+        color: var(--td-muted); font: inherit; font-size: 13px; cursor: pointer; }
+      .td-rp-back:hover { color: inherit; }
+      .td-rp-answer { margin: 2px 0 12px; font-size: 14px; }
+      .td-rp-asof { font-size: 12px; color: var(--td-muted); }
+      .td-rp-section { margin: 20px 0 8px; font-family: 'Oswald', sans-serif; font-size: 13.5px; font-weight: 600; }
+      .td-rp-section span { margin-left: 8px; font-family: inherit; font-weight: 400; font-size: 12px; color: var(--td-muted); font-family: 'IBM Plex Sans', sans-serif; }
+      .td-rp-table td, .td-rp-table th { white-space: nowrap; }
+      .td-rp-skeleton { display: grid; gap: 10px; padding: 12px 0; }
+      .td-rp-skeleton span { display: block; height: 14px; border-radius: 4px; background: var(--td-track); animation: td-rp-pulse 1.2s ease-in-out infinite; }
+      .td-rp-skeleton span:nth-child(1) { width: 45%; } .td-rp-skeleton span:nth-child(2) { width: 100%; height: 120px; } .td-rp-skeleton span:nth-child(3) { width: 70%; }
+      @keyframes td-rp-pulse { 50% { opacity: .55; } }
+      @media (prefers-reduced-motion: reduce) { .td-rp-skeleton span { animation: none; } }
+      .td-rp-vendor + .td-rp-vendor { margin-top: 4px; }
+      .td-sc-point:focus { outline: none; stroke: #2B2A27; stroke-width: 2; }
+      .td-input-missing { border-color: var(--td-red); background: #FDF3F1; }
+      .td-field-missing { display: block; margin-top: 3px; font-size: 11px; color: var(--td-red); font-weight: 600; }
+      @media (max-width: 900px) { .td-rp-list { grid-template-columns: 1fr; } }
       .td-sc-coverage dl { display: grid; grid-template-columns: max-content 1fr; gap: 8px 16px; margin: 0; font-size: 13px; }
       .td-sc-coverage dt { font-weight: 650; }
       .td-sc-coverage dd { margin: 0; color: #4A463F; }

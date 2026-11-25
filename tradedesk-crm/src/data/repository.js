@@ -76,6 +76,9 @@ const jobFromRow = (r) => ({
   // via toIso(), which would make them timezone-sensitive and shift the day.
   contractSignedDate: r.contract_signed_date || null,
   materialsOrderedDate: r.materials_ordered_date || null,
+  // Entered by hand (date picker on the job card). The only completion date
+  // the reports read; seeded once on 2026-11-25 from the old sources.
+  completedDate: r.completed_date || null,
   // When the opportunity was created in GoHighLevel. Read-only here; it is what
   // the signed date was seeded from.
   ghlCreatedAt: toIso(r.ghl_created_at),
@@ -133,6 +136,7 @@ const jobToRow = (j) => {
   // column has no timezone, and converting would move it a day.
   if (j.contractSignedDate !== undefined) row.contract_signed_date = j.contractSignedDate || null;
   if (j.materialsOrderedDate !== undefined) row.materials_ordered_date = j.materialsOrderedDate || null;
+  if (j.completedDate !== undefined) row.completed_date = j.completedDate || null;
   if (j.notes !== undefined) row.notes = j.notes || "";
   return row;
 };
@@ -821,10 +825,28 @@ const supabaseRepo = {
   },
 
   // Admin-only (report_balances_owed raises 42501 for anyone else). One row per
-  // live job: contract, collected (larger of TradeDesk payments and the
-  // Completion Log sheet), balance, and which source the collected figure used.
+  // live job: contract, client credits, collected (TradeDesk client payments
+  // only) and balance. No sheet is read.
   async reportBalancesOwed() {
     return await supabase.rpc("report_balances_owed").then(unwrap);
+  },
+
+  // Jobs whose completed date falls in the range, with revenue, vendor cost
+  // and GP (the latest finalization where there is one). Admin-only.
+  async reportJobProfitability(from, to) {
+    return await supabase.rpc("report_job_profitability", { p_from: from, p_to: to }).then(unwrap);
+  },
+
+  // Live jobs not in a done stage: contract, collected, left to collect,
+  // vendor cost so far. Admin-only.
+  async reportBacklog() {
+    return await supabase.rpc("report_backlog").then(unwrap);
+  },
+
+  // Pending vendor payments (unpaid bills) less open-bill credits, with age.
+  // Admin-only.
+  async reportVendorOwed() {
+    return await supabase.rpc("report_vendor_owed").then(unwrap);
   },
 
   // Admin-only in the database. Links two jobs into one project group (merging
